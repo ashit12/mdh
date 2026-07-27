@@ -1,0 +1,216 @@
+# Wire Protocol Specification (through Milestone 2)
+
+This is a simulated, ITCH/OUCH-inspired binary market-data protocol built
+for a portfolio project. It is not a real exchange spec, and no claim is
+made that it matches any production feed byte-for-byte.
+
+## Byte order
+
+**Big-endian ("network byte order")**, throughout -- for both the file
+replay format and UDP transport. There is exactly one wire format: a
+replay file is a raw capture of the same bytes a UDP receiver would see,
+not a separate on-disk encoding.
+
+This was little-endian in milestone 1, when the protocol was file-only
+with no wire transport and there was no interoperability requirement to
+justify network byte order. Milestone 2 added UDP, which is exactly the
+situation network byte order exists for -- it's the same reason `htons`/
+`htonl` exist in the sockets API: intermediate routers and receivers on
+different architectures can't assume anything about the sender's
+endianness. Switching was a one-file change confined entirely to
+`include/common/byte_io.hpp` -- `encoder.cpp`/`decoder.cpp` only ever call
+`io::put_u16()`/`io::get_u16()` etc. and never depended on which byte
+order those functions used internally, so nothing outside that one file
+needed to change. All 44 tests from milestone 1 passed unmodified after
+the switch, which is exactly the point of that abstraction boundary.
+
+Every multi-byte field is encoded/decoded via explicit bit shifts (see
+`include/common/byte_io.hpp`), never via `memcpy`-ing a struct onto the
+wire. That sidesteps three separate hazards at once: struct padding
+(compiler-dependent, not part of the wire contract), alignment (a `uint64_t`
+read via `reinterpret_cast` on an odd byte offset is undefined behaviour),
+and host endianness (a `memcpy` approach silently breaks on a big-endian
+host). The byte-shift approach is correct on any host, at the cost of being
+one field-width switch statement instead of a single `memcpy` call.
+
+## Frame layout
+
+A frame is `header || payload`, with no separator and no outer file
+header/footer -- an event file is simply frames concatenated back to back.
+
+### Header (20 bytes, always present)
+
+| Offset | Field | Type | Notes |
+|---|---|---|---|
+| 0 | `type` | `u8` | one of `MessageType` below |
+| 1 | `reserved` | `u8` | must be `0`; reserved for future flags |
+| 2 | `payload_size` | `u16` | byte length of the payload that follows |
+| 4 | `sequence_number` | `u64` | feed-wide, monotonically increasing |
+| 12 | `timestamp_ns` | `u64` | nanoseconds, arbitrary epoch |
+
+`payload_size` is redundant with `type` today (every milestone-1 type has a
+fixed payload size) -- it exists as an independent corruption cross-check:
+the decoder rejects a frame whose declared `payload_size` doesn't match the
+fixed size for its `type`, which catches a class of bit-flip corruption
+that a `type`-only check would miss. It also means adding a variable-length
+message type later doesn't require a header format change.
+
+`sequence_number` and `timestamp_ns` live in the header once, not in each
+payload, even though the spec describes them as fields of every message
+type. Decoded in-memory message structs (`AddOrder`, `CancelOrder`, ...)
+still expose both fields, copied from the header at decode time -- so a
+decoded message is self-contained, without duplicating 16 bytes across five
+different payload encodings on the wire.
+
+### Payloads
+
+**AddOrder** (29 bytes): `order_id:u64, instrument_id:u32, price:i64, quantity:u64, side:u8`
+
+**CancelOrder** (12 bytes): `order_id:u64, instrument_id:u32`
+
+**ModifyOrder** (28 bytes): `order_id:u64, instrument_id:u32, new_price:i64, new_quantity:u64`
+
+**Trade** (21 bytes): `instrument_id:u32, price:i64, quantity:u64, aggressor_side:u8`
+
+**ClearBook** (4 bytes): `instrument_id:u32`
+
+`side` / `aggressor_side` are one byte: `0 = Buy`, `1 = Sell`. Any other
+value is rejected by the decoder as `DecodeError::InvalidSide`.
+
+## Price scale
+
+`Price` is `int64_t`, scaled integer ticks -- never floating point. This
+milestone fixes the scale at **1 tick = 0.0001 currency unit** (4 implied
+decimal places). That scale is a convention, not something carried on the
+wire; the encoder and every consumer must agree on it out of band, the same
+way real fixed-point feeds do. Floating point was ruled out because
+`0.1 + 0.2 != 0.3` in IEEE 754 -- unreliable for price-level equality and
+routing in a book.
+
+`Quantity` is `uint64_t`. `OrderId` is `uint64_t`. `InstrumentId` is
+`uint32_t`.
+
+## Decode error taxonomy
+
+| Error | Meaning |
+|---|---|
+| `TruncatedHeader` | fewer than 20 bytes available where a header was expected |
+| `TruncatedPayload` | header decoded, but fewer than `payload_size` bytes followed |
+| `InvalidReserved` | header's reserved byte was non-zero |
+| `InvalidMessageType` | `type` byte didn't match any `MessageType` enumerator |
+| `InvalidMessageSize` | `payload_size` didn't match the fixed size for `type` |
+| `InvalidSide` | a side byte was neither `0` nor `1` |
+
+Decode errors are returned as `std::variant<T, DecodeError>` rather than
+thrown as exceptions or terminating the process -- decoding untrusted bytes
+is exactly the situation where a caller needs to inspect *what* went wrong
+and decide what to do next (in milestone 1: stop replay), not unwind a
+call stack. `std::expected<T, E>` was the more obviously-named alternative
+but is a C++23 feature; this project targets C++20.
+
+## Sequence validation
+
+Sequencing is validated feed-wide (one counter across all instruments), not
+per instrument -- matching how ITCH-style feeds sequence a single physical
+channel that happens to carry multiple instruments. `SequenceValidator`
+(see `include/common/sequence_validator.hpp` -- moved there in milestone 2
+since it is now reused for packet-level tracking too, see below)
+classifies every sequence number relative to the last one it accepted:
+
+- **InOrder** -- exactly `last + 1`.
+- **Duplicate** -- exactly equal to `last` (a repeat of the immediately
+  preceding message).
+- **OutOfOrder** -- less than `last`, but not the immediately preceding
+  value.
+- **Missing** -- greater than `last + 1` (a gap of one or more sequence
+  numbers).
+
+The validator does not remember every sequence number it has ever seen --
+only the last one. That means it cannot distinguish "a duplicate of
+sequence 40" from "an out-of-order arrival of sequence 40" once the feed
+has already moved on to sequence 90; both are reported as `OutOfOrder`.
+Tracking full history would fix that at the cost of unbounded memory for
+an unbounded replay -- a trade-off not worth making for milestone 1's
+requirement to just detect and stop.
+
+Replay always stops on the first non-`InOrder` classification
+(`ReplayOptions::stop_on_sequence_error`, defaulted `true`), for both
+transports -- file replay (`run_replay`) and UDP (`net::run_udp_listen`)
+both funnel through the shared `replay::apply_frame_result()`, which is
+where this policy is applied. The validator itself has no opinion on this
+-- it only classifies -- so a later milestone can add a skip-and-continue
+or buffer-and-reorder policy at that one call site without touching
+`SequenceValidator`.
+
+## Packet framing (UDP, milestone 2)
+
+UDP is a datagram protocol: each `sendto()`/`recvfrom()` pair transfers one
+packet, either whole or not at all (no partial-packet delivery the way a
+file read can hand back a truncated frame). To let one datagram carry more
+than one event frame (batching), packets get their own framing, wrapping
+one or more event frames:
+
+```
+PacketHeader (20 bytes) || event frame 1 || event frame 2 || ...
+```
+
+This is a second, separate header from the 20-byte event-frame header
+above -- packet framing is a transport-level batching concern (how many
+messages fit in one datagram), while the event-frame header/payload is the
+application-level message format. Keeping them separate means
+`decode_event()`/`SequenceValidator`/`BookManager` never need to know or
+care whether a frame arrived via file or was unpacked from a UDP packet.
+
+### Packet header (20 bytes)
+
+| Offset | Field | Type | Notes |
+|---|---|---|---|
+| 0 | `magic` | `u32` | `0x4D444831` (ASCII `"MDH1"`); rejects non-mdh traffic early |
+| 4 | `version` | `u16` | `1`; rejects a future incompatible packet format |
+| 6 | `frame_count` | `u16` | how many event frames follow |
+| 8 | `packet_sequence` | `u64` | transport-level sequence, distinct from any event's `sequence_number` |
+| 16 | `payload_length` | `u32` | bytes of packed event frames that follow the packet header |
+
+`payload_length` is the same kind of redundant cross-check as an event
+frame's `payload_size`: it must exactly match the bytes actually present
+after the packet header, independent of walking the contained frames'
+own lengths.
+
+### Unpacking
+
+Each contained event frame carries its own `payload_size` (in its own
+20-byte header), so the unpacker walks the packet payload one frame at a
+time: decode a frame's header to learn its total length, slice that many
+bytes off as the frame, advance, repeat -- exactly analogous to how
+`EventFileReader` walks a file one frame at a time. `frame_count` bounds
+how many frames to expect; if walking frames doesn't consume exactly
+`payload_length` bytes by the time `frame_count` is reached, that's a
+`FrameCountMismatch`.
+
+### Two-tier error model
+
+Packet-level errors (`PacketError`: bad `magic`/`version`, truncated
+packet header, `payload_length` mismatch, an inner frame whose own header
+is unreadable so its length -- and therefore the next frame's start --
+can't be determined) invalidate the **whole datagram**: framing itself
+couldn't be trusted, so nothing inside it can be safely extracted.
+
+Event-level errors (`DecodeError`, e.g. `InvalidSide` on one contained
+frame) do **not** invalidate the rest of the packet: framing succeeded
+(frame boundaries were all locatable), only that one frame's content was
+invalid. `net::unpack_frames()` returns one `std::variant<Event,
+DecodeError>` per contained frame in this case, and callers (see
+`net::run_udp_listen`) apply each independently via
+`replay::apply_frame_result()`.
+
+## Packet-level sequence tracking (observational only)
+
+Every packet carries its own `packet_sequence`, tracked by a second,
+independent `SequenceValidator` instance (`net::PacketSequenceTracker`)
+purely for diagnostics -- packets received, in-order, duplicate,
+out-of-order, and gap counts. This does **not** gate book reconstruction.
+UDP packets can legitimately arrive out of order or duplicated for reasons
+unrelated to data correctness (different network paths, retransmits,
+redundant feeds); the actual correctness gate remains the event-level
+`SequenceValidator` used inside `apply_frame_result()`, which validates
+each event's own `sequence_number` regardless of which packet carried it.
