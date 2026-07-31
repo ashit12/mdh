@@ -5,12 +5,18 @@
 // Usage:
 //   market_data_replay --input events.bin [--top-levels 5]
 //   market_data_replay --listen <port> [--top-levels 5] [--idle-timeout-ms 1000]
+//                       [--queue-capacity 1024] [--consumer-delay-us 0]
 //
 // --listen mode has no signal-handling / graceful-shutdown story (no
 // Ctrl+C handler) -- it stops itself once no packets have arrived for
 // --idle-timeout-ms, on the assumption that the sender (see udp_sender)
 // finished and isn't coming back. A real long-running service would need
 // proper shutdown handling; that's out of scope here.
+//
+// --consumer-delay-us artificially slows book reconstruction (sleeps that
+// long after each event) -- a way to deliberately trigger and observe the
+// producer/consumer queue's backpressure (drops, high-water mark) without
+// needing a naturally slow workload or a lucky timing race to see it happen.
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
@@ -31,6 +37,8 @@ struct Args {
     std::optional<std::uint16_t> listen_port;
     std::size_t top_levels = 5;
     std::uint64_t idle_timeout_ms = 1000;
+    std::size_t queue_capacity = 1024;
+    std::uint64_t consumer_delay_us = 0;
 };
 
 std::optional<Args> parse_args(int argc, char** argv) {
@@ -59,6 +67,14 @@ std::optional<Args> parse_args(int argc, char** argv) {
             auto v = next();
             if (!v) return std::nullopt;
             args.idle_timeout_ms = std::stoull(*v);
+        } else if (flag == "--queue-capacity") {
+            auto v = next();
+            if (!v) return std::nullopt;
+            args.queue_capacity = std::stoull(*v);
+        } else if (flag == "--consumer-delay-us") {
+            auto v = next();
+            if (!v) return std::nullopt;
+            args.consumer_delay_us = std::stoull(*v);
         } else {
             std::cerr << "unrecognized argument: " << flag << "\n";
             return std::nullopt;
@@ -74,7 +90,8 @@ std::optional<Args> parse_args(int argc, char** argv) {
 
 void print_usage() {
     std::cerr << "Usage: market_data_replay --input <path> [--top-levels <N>]\n"
-              << "   or: market_data_replay --listen <port> [--top-levels <N>] [--idle-timeout-ms <N>]\n";
+              << "   or: market_data_replay --listen <port> [--top-levels <N>] [--idle-timeout-ms <N>]\n"
+              << "                           [--queue-capacity <N>] [--consumer-delay-us <N>]\n";
 }
 
 void print_levels(const char* label, const std::vector<book::PriceLevelView>& levels) {
@@ -102,15 +119,24 @@ int main(int argc, char** argv) {
     std::uint64_t packets_received = 0;
     std::uint64_t packet_errors = 0;
     std::optional<net::PacketSequenceStats> packet_seq_stats;
+    std::size_t queue_dropped_count = 0;
+    std::size_t queue_high_water_mark = 0;
 
     if (args->input) {
         outcome = run_replay(*args->input, options);
     } else {
-        auto result = net::run_udp_listen(*args->listen_port, options, std::chrono::milliseconds(args->idle_timeout_ms));
+        const net::UdpListenOptions listen_options{
+            .idle_timeout = std::chrono::milliseconds(args->idle_timeout_ms),
+            .queue_capacity = args->queue_capacity,
+            .consumer_delay = std::chrono::microseconds(args->consumer_delay_us),
+        };
+        auto result = net::run_udp_listen(*args->listen_port, options, listen_options);
         outcome = std::move(result.outcome);
         packets_received = result.packets_received;
         packet_errors = result.packet_errors;
         packet_seq_stats = result.packet_seq_stats;
+        queue_dropped_count = result.queue_dropped_count;
+        queue_high_water_mark = result.queue_high_water_mark;
     }
 
     std::cout << "=== Replay Summary ===\n";
@@ -126,6 +152,8 @@ int main(int argc, char** argv) {
                        << " out_of_order=" << packet_seq_stats->out_of_order
                        << " gaps=" << packet_seq_stats->missing_events << "\n";
         }
+        std::cout << "queue dropped:       " << queue_dropped_count << "\n";
+        std::cout << "queue high water:    " << queue_high_water_mark << "\n";
     }
     std::cout << "messages processed:  " << outcome.stats.messages_processed << "\n";
     std::cout << "decode failures:     " << outcome.stats.decode_failures << "\n";

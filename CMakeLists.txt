@@ -8,6 +8,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(MDH_ENABLE_ASAN "Build with AddressSanitizer" OFF)
 option(MDH_ENABLE_UBSAN "Build with UndefinedBehaviorSanitizer" OFF)
+option(MDH_ENABLE_TSAN "Build with ThreadSanitizer" OFF)
+
+if(MDH_ENABLE_TSAN AND (MDH_ENABLE_ASAN OR MDH_ENABLE_UBSAN))
+    message(FATAL_ERROR "MDH_ENABLE_TSAN cannot be combined with ASan/UBSan in the same binary -- build it separately.")
+endif()
 
 set(MDH_WARNING_FLAGS -Wall -Wextra -Wpedantic -Wshadow -Wconversion)
 
@@ -49,6 +54,11 @@ if(MDH_ENABLE_UBSAN)
     target_link_options(mdh_core PUBLIC -fsanitize=undefined)
 endif()
 
+if(MDH_ENABLE_TSAN)
+    target_compile_options(mdh_core PUBLIC -fsanitize=thread -fno-omit-frame-pointer)
+    target_link_options(mdh_core PUBLIC -fsanitize=thread)
+endif()
+
 # ── Apps ───────────────────────────────────────────────────────────────────
 add_executable(feed_generator apps/feed_generator/main.cpp)
 target_link_libraries(feed_generator PRIVATE mdh_core)
@@ -77,6 +87,9 @@ add_executable(mdh_tests
     tests/test_packet_sequence_tracker.cpp
     tests/test_udp_receiver.cpp
     tests/test_udp_replay_e2e.cpp
+    tests/test_spsc_queue.cpp
+    tests/test_dropping_queue.cpp
+    tests/test_backpressure_integration.cpp
 )
 target_link_libraries(mdh_tests PRIVATE mdh_core gtest gtest_main)
 target_compile_options(mdh_tests PRIVATE ${MDH_WARNING_FLAGS})

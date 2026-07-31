@@ -12,81 +12,109 @@ out of scope for now (see *Planned Milestones*).
 
 ---
 
-## Current Milestone: 2 of 6
+## Current Milestone: 3 of 6
 
 Milestone 1 was a complete, self-contained vertical slice: binary message
 definitions, an encoder/decoder, a binary event-file writer, deterministic
 file replay, sequence-number validation, and limit-order-book
 reconstruction.
 
-Milestone 2 adds UDP as a second transport, on top of (not instead of)
+Milestone 2 added UDP as a second transport, on top of (not instead of)
 file replay: a `udp_sender` app, packet framing/batching, network byte
 order, and packet-level duplicate/out-of-order tracking. `market_data_replay`
-now has two mutually exclusive modes — `--input <file>` and `--listen
+gained two mutually exclusive modes — `--input <file>` and `--listen
 <port>` — that both funnel through the exact same decode/sequence-validate
 /book-apply logic.
 
-Not yet implemented (by design, deferred to later milestones): a
-queue-based ingestion pipeline, sequence-gap *recovery* (only *detection*
-exists so far), snapshotting, throughput/latency benchmarking, and fault
-injection.
+Milestone 3 decouples UDP ingestion from book reconstruction with a
+lock-free SPSC queue: `--listen` now runs a producer thread (receive +
+decode) and a consumer thread (validate + apply) connected by a bounded
+queue, with an explicit drop-newest backpressure policy, occupancy metrics
+(current size, high-water mark, dropped count), and a `--consumer-delay-us`
+flag to deterministically simulate a slow consumer and observe backpressure
+kick in on demand, rather than relying on it happening to occur under load.
+
+Not yet implemented (by design, deferred to later milestones): sequence-gap
+*recovery* (only *detection* exists so far), snapshotting, throughput/latency
+benchmarking, and fault injection.
 
 ---
 
 ## Architecture
 
 ```
- events.bin ──► EventFileReader ──┐
-                                   │
- UDP packets ──► UdpReceiver ──► unpack_frames() ──┘
-                 (batched recv,     (packet framing;
-                  local recv         PacketSequenceTracker
-                  timestamps)        observes packet_sequence,
-                                     purely as a stat)
-                                   │
-                                   ▼ std::variant<Event, DecodeError>
-                          decode_event() -- validates type/size/
-                          truncation/side; never reinterpret_casts
-                                   │
-                                   ▼
-                    replay::apply_frame_result()
-                    -- SequenceValidator classifies InOrder /
-                       Duplicate / OutOfOrder / Missing on the
-                       EVENT's own sequence_number (the actual
-                       correctness gate, regardless of transport)
-                                   │
-                                   ▼
-                          BookManager -- one OrderBook per
-                          InstrumentId, created lazily; trade
-                          stats tracked separately
-                                   │
-                                   ▼
-                    ReplayStats / console summary -- measured
-                    counts + wall-clock duration
+ events.bin ──► EventFileReader ──────────────────────────────────────┐
+   (run_replay(): single-threaded, no queue)                          │
+                                                                       ▼
+ ── net::run_udp_listen(): two threads, connected by a DroppingQueue ──
+                                                                       │
+ UDP packets ──► UdpReceiver ──► unpack_frames() ──► DroppingQueue.push()
+   [PRODUCER    (batched recv,     (packet framing;      (drop-newest on
+    thread]      local recv         PacketSequenceTracker  full; counted,
+                 timestamps)        observes packet_seq,   not fatal --
+                                    purely as a stat)       see below)
+                                                                       │
+                                                    DroppingQueue.try_pop()
+                                                                       │
+                                                                       ▼ std::variant<Event, DecodeError>
+                                              decode_event() already ran on
+   [CONSUMER                                 the producer side -- this is
+    thread]                                  just handing the decoded result
+                                              (or a DecodeError) onward
+                                                                       │
+                                                                       ▼
+                                                replay::apply_frame_result()
+                                                -- SequenceValidator classifies
+                                                   InOrder / Duplicate /
+                                                   OutOfOrder / Missing on the
+                                                   EVENT's own sequence_number
+                                                   (the actual correctness
+                                                   gate, regardless of
+                                                   transport OR whether a
+                                                   queue sits in front of it)
+                                                                       │
+                                                                       ▼
+                                                BookManager -- one OrderBook
+                                                per InstrumentId, created
+                                                lazily; trade stats tracked
+                                                separately
+                                                                       │
+                                                                       ▼
+                                                ReplayStats / console summary
+                                                -- measured counts + wall-
+                                                   clock duration + (UDP only)
+                                                   queue high-water mark /
+                                                   dropped count
 ```
 
-`replay::apply_frame_result()` is the single piece of logic both transports
-share: `run_replay()` (file) and `net::run_udp_listen()` (UDP) each have
-their own frame-sourcing loop, but both call the same function to decide
-what a decoded frame means for the book and the stats. Only "where do
-frames come from" differs between them.
+`replay::apply_frame_result()` is the single piece of logic all three paths
+share: `run_replay()` (file, single-threaded) and the consumer half of
+`net::run_udp_listen()` (UDP, two threads) each have their own
+frame-sourcing loop, but both call the same function to decide what a
+decoded frame means for the book and the stats. A dropped queue item is,
+from `apply_frame_result()`'s point of view, indistinguishable from a
+dropped UDP packet -- both just manifest as a gap in the sequence numbers
+it sees.
 
 ### Directory layout
 
 ```
 include/          public headers, mirrors src/
-  common/          shared primitive types, endian-safe byte I/O, SequenceValidator
+  common/          shared primitive types, endian-safe byte I/O,
+                   SequenceValidator, SpscQueue (lock-free ring buffer),
+                   DroppingQueue (adds the drop-on-full backpressure policy)
   protocol/        wire format: messages, encoder, decoder, errors
   replay/          file writer/reader, replay engine (transport-agnostic)
   book/            price level, order book, book manager
   net/             UDP socket, packet framing, batched receiver, packet-
-                   level sequence tracking, the UDP↔replay bridge
+                   level sequence tracking, the UDP↔replay bridge (now a
+                   two-thread producer/consumer pipeline, see Architecture)
 src/               implementations for the above
 apps/
   feed_generator/      generates a deterministic binary event file
   udp_sender/          streams an event file over UDP, batched into packets
   market_data_replay/  replays a file OR listens live on a UDP port
-tests/             GoogleTest suite (70 tests as of milestone 2)
+tests/             GoogleTest suite (90 tests as of milestone 3)
 docs/
   protocol.md      detailed wire-format spec (byte offsets, error taxonomy,
                    packet header layout)
@@ -185,6 +213,10 @@ cmake --build build -j
 # AddressSanitizer + UndefinedBehaviorSanitizer build
 cmake -S . -B build-asan -DMDH_ENABLE_ASAN=ON -DMDH_ENABLE_UBSAN=ON
 cmake --build build-asan -j
+
+# ThreadSanitizer build (separate binary -- can't combine with ASan/UBSan)
+cmake -S . -B build-tsan -DMDH_ENABLE_TSAN=ON
+cmake --build build-tsan -j
 ```
 
 Compiled with `-Wall -Wextra -Wpedantic -Wshadow -Wconversion`; the build
@@ -198,14 +230,27 @@ ctest --test-dir build --output-on-failure
 ./build/mdh_tests
 ```
 
-70 tests across protocol round-trip/error-handling, sequence validation,
+90 tests across protocol round-trip/error-handling, sequence validation,
 event-file I/O, order-book behavior, end-to-end file replay (including a
 determinism check), UDP sockets (a genuine loopback round-trip, not
 mocked), packet framing (including "one bad frame doesn't invalidate an
 otherwise-valid packet"), packet-level sequence tracking, batched UDP
-receive, and end-to-end UDP replay (send over a real loopback socket,
-assert reconstructed book state — including a corrupt-packet-mixed-with-
-good-packets case and a cross-packet sequence-gap case).
+receive, end-to-end UDP replay (send over a real loopback socket, assert
+reconstructed book state — including a corrupt-packet-mixed-with-good-
+packets case and a cross-packet sequence-gap case), `SpscQueue` (including
+a genuine multi-threaded producer/consumer stress test, checked clean
+under ThreadSanitizer), `DroppingQueue`'s drop-and-count policy, and the
+full two-thread UDP pipeline including a deterministic backpressure test
+(tiny queue + artificially slowed consumer forces drops on demand, no
+timing luck required).
+
+A deterministic backpressure test replaced an earlier one that turned out
+to be flaky (~1-in-15 runs): `SequenceValidator` only detects a gap
+*retrospectively*, when a later sequence number actually arrives, so a
+drop landing on the tail end of a burst with nothing surviving afterward
+is genuinely undetectable, not a bug. That limitation is now pinned down
+as two explicit tests
+(`test_backpressure_integration.cpp`) rather than an intermittent failure.
 
 ## Example Commands
 
@@ -219,41 +264,83 @@ good-packets case and a cross-packet sequence-gap case).
 # ...or stream it over UDP and have market_data_replay listen live instead:
 ./build/market_data_replay --listen 9000 --top-levels 5 &
 ./build/udp_sender --input events.bin --host 127.0.0.1 --port 9000
+
+# Force and observe backpressure on demand: a tiny queue + an artificially
+# slowed consumer (5ms/event) guarantees drops, rather than hoping a real
+# workload happens to be slow enough to trigger it:
+./build/market_data_replay --listen 9001 --queue-capacity 8 --consumer-delay-us 5000 &
+./build/udp_sender --input events.bin --host 127.0.0.1 --port 9001
 ```
 
 Sample `market_data_replay --listen` output (truncated), from an actual
-run streaming 5,000 orders' worth of events (7,141 total, batched into 358
-packets) over loopback:
+run streaming 5,000 orders' worth of events (7,082 total, batched into 355
+packets) over loopback, default queue settings:
 
 ```
 === Replay Summary ===
 listened on port:    9123
-packets received:    358
+packets received:    355
 packet errors:       0
-packet sequencing:   in_order=358 duplicate=0 out_of_order=0 gaps=0
-messages processed:  7141
+packet sequencing:   in_order=355 duplicate=0 out_of_order=0 gaps=0
+queue dropped:       0
+queue high water:    51
+messages processed:  7082
 decode failures:     0
 sequence failures:   0
 book errors:         0
 adds:                5000
-cancels:             1086
-modifies:            676
-trades:              307
-clears:              72
-replay duration:     1376.04 ms
-messages/sec:        5189.5
+cancels:             1061
+modifies:            664
+trades:              293
+clears:              64
+replay duration:     1353.06 ms
+messages/sec:        5234.1
 
 instruments seen:    10
 
 -- instrument 1 --
-    bid 100826 x 49 (1 orders)
-    bid 100803 x 19 (1 orders)
-    bid 100800 x 43 (1 orders)
-    ask 100689 x 41 (1 orders)
-    ask 100721 x 33 (1 orders)
-    ask 100756 x 7 (1 orders)
-    trades: 29, volume: 1873, last price: 100764
+    bid 101348 x 17 (1 orders)
+    ask 101096 x 64 (1 orders)
+    trades: 24, volume: 1097, last price: 101308
 ```
+
+Even with no artificial slowdown and a generous default capacity (1024),
+the queue's high-water mark of 51 shows the consumer (book reconstruction)
+genuinely does fall behind the producer (raw receive+decode) at times --
+just not by enough to ever hit the cap and drop anything here.
+
+Now the same feed against a deliberately tiny, slow configuration
+(`--queue-capacity 8 --consumer-delay-us 5000`), forcing backpressure on
+demand instead of hoping for it:
+
+```
+=== Replay Summary ===
+listened on port:    9789
+packets received:    36
+packet errors:       0
+packet sequencing:   in_order=36 duplicate=0 out_of_order=0 gaps=0
+queue dropped:       707
+queue high water:    8
+messages processed:  9
+decode failures:     0
+sequence failures:   1
+book errors:         0
+adds:                7
+cancels:             0
+modifies:            2
+trades:              0
+clears:              0
+replay duration:     593.339 ms
+messages/sec:        15.2
+
+replay stopped early: missing sequence(s) [10..360]
+```
+
+707 of 717 events were dropped (the queue never grows past its 8-slot
+cap), the high-water mark is pinned exactly at that cap, and the resulting
+gap (sequences 10 through 360 never arrived) was caught by the same
+`SequenceValidator` that gates file replay -- a dropped queue item and a
+dropped UDP packet look identical from its point of view.
 
 All numbers above are from actual runs on the development machine, not
 invented figures — they will vary by hardware and are not a benchmark
@@ -318,6 +405,47 @@ claim (see *Milestone 5* below for planned formal benchmarking).
   There is no `SIGINT`/graceful-shutdown story for a true "run until told
   to stop" server — out of scope for this milestone.
 
+**Milestone 3:**
+- **Lock-free `SpscQueue<T>`, no CAS loop.** The producer only ever writes
+  `head_`, the consumer only ever writes `tail_` — since neither atomic
+  ever has concurrent writers, a plain atomic load (acquire)/store
+  (release) pair per operation is sufficient. A CAS loop is what a true
+  MPMC queue needs (multiple threads racing to write the *same* atomic);
+  SPSC rules that out by contract, so it would just be unused generality.
+- **Raw storage + `std::construct_at`/`std::destroy_at`, not
+  `std::vector<T>`.** Avoids requiring `T` to be default-constructible
+  just so a slot can represent "nothing here yet" — a slot only comes
+  into existence when an element is actually constructed into it.
+- **`SpscQueue` itself stays policy-free; `DroppingQueue<T>` wraps it to
+  add the drop-newest backpressure policy** (plus a counter for how often
+  it kicked in). Mirrors how `PacketSequenceTracker` wraps
+  `SequenceValidator` — a classifier/mechanism stays reusable for any
+  policy, and turning its result into a decision lives one layer up.
+- **`std::jthread` + a single shared `std::stop_source`, not
+  `std::thread` + a hand-rolled atomic bool.** `jthread`'s destructor
+  joins automatically (no `std::terminate` risk from a forgotten `.join()`
+  after an early return), and `stop_source`/`stop_token` is the standard
+  mechanism for telling *both* threads to stop — used instead of each
+  `jthread`'s own private per-object token, since this needs one signal
+  both sides observe.
+- **Only decoded frames cross the queue; packet-level bookkeeping
+  (`PacketSequenceTracker`, `packet_errors`) stays entirely on the
+  producer thread.** It's tied to receiving a datagram, not to anything
+  the consumer does, so there's no reason for it to cross a thread
+  boundary at all.
+- **A flaky test taught a real lesson about the design, not just about
+  the test.** An initial backpressure test asserted a dropped frame
+  always shows up as a detected sequence gap; it failed ~1-in-15 runs.
+  `SequenceValidator` only detects a gap *retrospectively* (a later
+  sequence number has to actually arrive), so a drop with nothing
+  surviving after it is genuinely invisible downstream — not a bug, an
+  inherent limit of retrospective detection. Fixed by asserting only what
+  a real end-to-end run actually guarantees (drops happen; the
+  drop/processed accounting balances exactly), and adding a fully
+  deterministic test (no sockets, no threads, no timing) that drives the
+  same real components directly to prove both sides of that limitation
+  as explicit, tested facts.
+
 ## Current Limitations
 
 - `SequenceValidator` only remembers the last accepted sequence number, so
@@ -344,13 +472,19 @@ claim (see *Milestone 5* below for planned formal benchmarking).
   syscall-level fast path seemed worse than not having it. `UdpReceiver`
   instead batches via a `recvfrom()` loop over a non-blocking socket,
   which is portable and is what's actually tested.
-- No SPSC queue yet — the UDP receive loop and book reconstruction run
-  synchronously in one thread (milestone 3 territory).
+- **`SpscQueue`'s capacity is fixed at construction** — no dynamic
+  resizing if a workload's needs change at runtime. Given how cheap it is
+  to just start with a larger capacity, this hasn't been a real
+  constraint, but it's a real one if memory footprint mattered more than
+  it does for a portfolio project.
+- **A drop is still just a drop** — there's no way to recover, replay, or
+  even know *which* sequence numbers were lost beyond the gap range the
+  next successful frame reveals (see the *drop-with-no-later-survivor* case
+  above). Sequence-gap *recovery* is milestone 4 territory, same as the
+  gaps caused by a genuinely dropped UDP packet.
 
 ## Planned Milestones
 
-3. SPSC queue between ingestion and book reconstruction, backpressure
-   policy, queue occupancy metrics, slow-consumer simulation.
 4. Sequence-gap *recovery*, snapshot generation/loading, buffered
    incremental messages, resume after recovery.
 5. Allocation profiling, decode throughput benchmarks, end-to-end latency

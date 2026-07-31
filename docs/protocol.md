@@ -1,4 +1,4 @@
-# Wire Protocol Specification (through Milestone 2)
+# Wire Protocol Specification (through Milestone 3)
 
 This is a simulated, ITCH/OUCH-inspired binary market-data protocol built
 for a portfolio project. It is not a real exchange spec, and no claim is
@@ -214,3 +214,30 @@ unrelated to data correctness (different network paths, retransmits,
 redundant feeds); the actual correctness gate remains the event-level
 `SequenceValidator` used inside `apply_frame_result()`, which validates
 each event's own `sequence_number` regardless of which packet carried it.
+
+## A dropped queue item looks identical to a dropped packet (milestone 3)
+
+`net::run_udp_listen()` (milestone 3) decodes on a producer thread and
+applies on a consumer thread, connected by a bounded queue
+(`common/spsc_queue.hpp`) with a drop-newest policy under backpressure
+(`common/dropping_queue.hpp`). Nothing about that queue is part of the
+wire protocol -- it's purely an internal pipeline detail -- but it's worth
+being explicit about its effect on sequencing: from
+`apply_frame_result()`'s point of view, an event dropped by the queue and
+an event lost because the underlying UDP packet never arrived are
+*exactly the same thing*. Both simply never reach the validator, so both
+show up identically as a gap in `sequence_number` once a later event
+arrives. This is deliberate, not incidental -- see the README's Milestone
+3 design notes for why drop-newest was chosen specifically because it
+degrades into the same, already-handled failure mode as ordinary packet
+loss, rather than introducing a second kind of gap the validator would
+need to reason about differently.
+
+One consequence worth calling out precisely: `SequenceValidator` detects a
+gap *retrospectively*, only once a higher sequence number actually
+arrives to reveal it. If a drop (queue-induced or packet-induced) happens
+to be the last thing that would have arrived in a session -- nothing
+comes after it -- the gap is never observed at all. That's not a bug in
+the validator; it has no way to know how many messages *should* have
+followed. It does mean "sequence_failures == 0" is not, on its own, proof
+that nothing was ever dropped.

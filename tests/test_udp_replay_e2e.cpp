@@ -26,12 +26,18 @@ constexpr std::uint16_t PORT_BASIC = 58231;
 constexpr std::uint16_t PORT_MULTI_PACKET = 58232;
 constexpr std::uint16_t PORT_BAD_PACKET_MIXED_WITH_GOOD = 58233;
 constexpr std::uint16_t PORT_SEQUENCE_GAP_STOPS_LISTENER = 58234;
+constexpr std::uint16_t PORT_CUSTOM_QUEUE_CAPACITY = 58235;
+constexpr std::uint16_t PORT_SLOW_CONSUMER = 58236;
 
 constexpr auto IDLE_TIMEOUT = std::chrono::milliseconds(300);
 constexpr auto SETTLE_BEFORE_SEND = std::chrono::milliseconds(50);
 
-std::future<UdpListenResult> start_listener(std::uint16_t port, const ReplayOptions& options = {}) {
-    return std::async(std::launch::async, [port, options] { return run_udp_listen(port, options, IDLE_TIMEOUT); });
+std::future<UdpListenResult> start_listener(std::uint16_t port, const ReplayOptions& options = {},
+                                             std::size_t queue_capacity = 1024,
+                                             std::chrono::microseconds consumer_delay = {}) {
+    const UdpListenOptions listen_options{
+        .idle_timeout = IDLE_TIMEOUT, .queue_capacity = queue_capacity, .consumer_delay = consumer_delay};
+    return std::async(std::launch::async, [port, options, listen_options] { return run_udp_listen(port, options, listen_options); });
 }
 
 } // namespace
@@ -53,6 +59,13 @@ TEST(UdpReplayE2E, SingleFrameOverLoopbackReconstructsBookState) {
     EXPECT_EQ(result.packet_errors, 0u);
     EXPECT_EQ(result.packet_seq_stats.in_order, 1u);
     EXPECT_EQ(result.outcome.stats.messages_processed, 1u);
+    // The producer/consumer queue introduced in milestone 3: on this
+    // uncontended happy path the consumer easily keeps up, so nothing
+    // should ever have been dropped, and the peak occupancy should be
+    // small (at most the one frame sent).
+    EXPECT_EQ(result.queue_dropped_count, 0u);
+    EXPECT_GE(result.queue_high_water_mark, 1u);
+    EXPECT_LE(result.queue_high_water_mark, 1u);
 
     const auto* book = result.outcome.books.find_book(1);
     ASSERT_NE(book, nullptr);
@@ -137,4 +150,82 @@ TEST(UdpReplayE2E, SequenceGapAcrossPacketsStopsListenerByDefault) {
     EXPECT_TRUE(result.outcome.stopped_early);
     EXPECT_EQ(result.outcome.stats.sequence_failures, 1u);
     EXPECT_EQ(result.outcome.stats.messages_processed, 1u); // only the first event applied before the gap halted it
+}
+
+TEST(UdpReplayE2E, CustomQueueCapacityIsHonoredWithNoDropsUnderLightLoad) {
+    // Not a backpressure/drop test (see
+    // SlowConsumerCausesDropsThatShowUpAsSequenceGaps below for that) --
+    // just confirms UdpListenOptions::queue_capacity actually reaches
+    // DroppingQueue's constructor rather than being ignored, via a
+    // capacity far larger than this trickle of traffic could ever fill.
+    auto listen_future = start_listener(PORT_CUSTOM_QUEUE_CAPACITY, ReplayOptions{}, /*queue_capacity=*/8);
+    std::this_thread::sleep_for(SETTLE_BEFORE_SEND);
+
+    UdpSocket sender;
+    std::vector<Event> events = {
+        Event{AddOrder{.sequence_number = 1, .timestamp_ns = 1, .order_id = 1, .instrument_id = 1, .price = 100, .quantity = 1, .side = Side::Buy}},
+        Event{AddOrder{.sequence_number = 2, .timestamp_ns = 2, .order_id = 2, .instrument_id = 1, .price = 101, .quantity = 1, .side = Side::Sell}},
+    };
+    ASSERT_TRUE(sender.send_to(pack_frames(1, events), "127.0.0.1", PORT_CUSTOM_QUEUE_CAPACITY));
+
+    auto result = listen_future.get();
+
+    EXPECT_FALSE(result.outcome.stopped_early);
+    EXPECT_EQ(result.queue_dropped_count, 0u);
+    EXPECT_EQ(result.outcome.stats.messages_processed, 2u);
+}
+
+TEST(UdpReplayE2E, SlowConsumerForcesDrops) {
+    // Deterministic backpressure: a tiny queue (capacity 4) plus a
+    // consumer artificially slowed to 20ms/event guarantees drops
+    // regardless of machine speed or scheduling luck -- unlike the
+    // incidental backpressure a fast consumer might or might not hit
+    // under real load, this doesn't depend on timing.
+    //
+    // This test only asserts that drops happen and that the accounting
+    // balances exactly -- it deliberately does NOT assert
+    // sequence_failures > 0. SequenceValidator only detects a gap
+    // retrospectively, when a *later* sequence number actually arrives;
+    // if the drops land on the tail end of this burst with nothing
+    // surviving afterward, no gap is ever observed even though data was
+    // genuinely dropped -- confirmed empirically (~1-in-15 runs) when this
+    // test asserted that. See
+    // BackpressureIntegration.DroppedFrameIsRevealedAsGapByALaterSurvivor
+    // in test_backpressure_integration.cpp for a deterministic proof of
+    // that causal mechanism instead, using the real components without
+    // racing real OS thread scheduling to reproduce it.
+    ReplayOptions options;
+    options.stop_on_sequence_error = false; // keep processing through every gap so the whole burst gets inspected
+    options.stop_on_decode_error = false;
+    auto listen_future =
+        start_listener(PORT_SLOW_CONSUMER, options, /*queue_capacity=*/4, /*consumer_delay=*/std::chrono::milliseconds(20));
+    std::this_thread::sleep_for(SETTLE_BEFORE_SEND);
+
+    UdpSocket sender;
+    constexpr int kTotalEvents = 50;
+    constexpr int kEventsPerPacket = 10;
+    int seq = 1;
+    for (int packet_idx = 0; packet_idx < kTotalEvents / kEventsPerPacket; ++packet_idx) {
+        std::vector<Event> events;
+        for (int i = 0; i < kEventsPerPacket; ++i, ++seq) {
+            events.push_back(Event{AddOrder{.sequence_number = static_cast<std::uint64_t>(seq),
+                                             .timestamp_ns = static_cast<std::uint64_t>(seq),
+                                             .order_id = static_cast<std::uint64_t>(seq),
+                                             .instrument_id = 1,
+                                             .price = 100,
+                                             .quantity = 1,
+                                             .side = Side::Buy}});
+        }
+        ASSERT_TRUE(sender.send_to(pack_frames(static_cast<std::uint64_t>(packet_idx + 1), events), "127.0.0.1", PORT_SLOW_CONSUMER));
+    }
+
+    auto result = listen_future.get();
+
+    EXPECT_FALSE(result.outcome.stopped_early);
+    EXPECT_GT(result.queue_dropped_count, 0u) << "expected the tiny queue + slow consumer to force at least one drop";
+    EXPECT_LE(result.queue_high_water_mark, 4u);
+    // Exact accounting: every one of the kTotalEvents events was either
+    // processed by the consumer or dropped by the producer -- nothing
+    // silently vanishes or gets double-counted.
+    EXPECT_EQ(result.outcome.stats.messages_processed + result.queue_dropped_count, static_cast<std::uint64_t>(kTotalEvents));
 }

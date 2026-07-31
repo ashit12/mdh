@@ -3,40 +3,62 @@
 #include <chrono>
 #include <cstdint>
 
+#include "common/dropping_queue.hpp"
 #include "net/packet_sequence_tracker.hpp"
 #include "replay/replay_engine.hpp"
 
 namespace mdh::net {
+
+struct UdpListenOptions {
+    std::chrono::milliseconds idle_timeout{1000};
+
+    // Bounds how far the consumer (book reconstruction) can fall behind
+    // the producer (UDP receive + decode) before the producer starts
+    // dropping newly decoded frames -- see DroppingQueue. A dropped frame
+    // shows up downstream as a sequence gap, exactly like a dropped UDP
+    // packet would.
+    std::size_t queue_capacity = 1024;
+
+    // Artificial delay applied by the consumer after processing each
+    // popped item -- a deterministic way to simulate a slow consumer
+    // (e.g. a heavier book-reconstruction workload) without depending on
+    // incidental machine/OS-scheduling timing to ever exercise backpressure.
+    // Zero (the default) means no artificial delay at all.
+    std::chrono::microseconds consumer_delay{0};
+};
 
 struct UdpListenResult {
     replay::ReplayOutcome outcome;
     std::uint64_t packets_received = 0;
     std::uint64_t packet_errors = 0;
     PacketSequenceStats packet_seq_stats;
+    std::size_t queue_dropped_count = 0;
+    std::size_t queue_high_water_mark = 0;
 };
 
-// Listens on `port`, decoding and applying UDP-delivered events the same
-// way run_replay() applies file-delivered ones -- both funnel through
-// replay::apply_frame_result(), so decode-error/sequence-validation/book-
-// application behavior is identical regardless of transport. Only "where
-// do frames come from" differs (a UDP receive loop here vs. a file read
-// loop in run_replay()).
+// Listens on `port` using two threads connected by a DroppingQueue:
 //
-// Packet-level framing failures (couldn't even locate the frames inside a
-// datagram -- see net/packet.hpp's PacketError) are counted and that
-// datagram is skipped; they do not stop the listener. A stop-worthy
-// per-event error (per `options`) does stop it, exactly as in file replay.
+//   producer: UdpReceiver::receive_batch() -> unpack_frames() -> push
+//   consumer: pop -> replay::apply_frame_result() (validate + apply to book)
 //
-// Lives in net/ (depending on replay/) rather than replay/ (depending on
-// net/): replay_engine.hpp itself has zero knowledge of UDP or sockets;
-// this file is the one place that bridges the two, so that dependency
-// only exists here, not in the core replay module.
+// Both still funnel through apply_frame_result(), so decode-error/
+// sequence-validation/book-application behavior is identical to file
+// replay and to milestone 2's single-threaded listener -- only "how frames
+// get from the socket to apply_frame_result()" changed. Packet-level
+// bookkeeping (PacketSequenceTracker, packet_errors) stays entirely on the
+// producer thread, since it's tied to receiving a datagram, not to
+// anything the consumer does.
 //
-// Termination: stops once no packet has arrived for `idle_timeout` after
-// having received at least one -- there is no signal-handling/graceful-
-// shutdown mechanism (no SIGINT handler) for a true "run until told to
-// stop" server in this milestone.
+// Shutdown: a single std::stop_source shared by both threads (not each
+// jthread's own per-object token -- that's per-object, and this needs one
+// signal both sides observe). The producer requests stop on idle timeout;
+// the consumer requests stop on a stop-worthy error from
+// apply_frame_result(). Either way, the consumer always drains whatever is
+// still sitting in the queue before it exits -- std::stop_source's
+// request_stop()/stop_requested() pair has its own acquire/release
+// synchronization, so once the consumer observes the stop signal it's
+// guaranteed to see every push the producer made beforehand.
 [[nodiscard]] UdpListenResult run_udp_listen(std::uint16_t port, const replay::ReplayOptions& options,
-                                              std::chrono::milliseconds idle_timeout);
+                                              const UdpListenOptions& listen_options = {});
 
 } // namespace mdh::net
