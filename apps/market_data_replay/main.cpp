@@ -4,8 +4,10 @@
 //
 // Usage:
 //   market_data_replay --input events.bin [--top-levels 5]
+//                       [--snapshot-out <path>] [--snapshot-in <path>]
 //   market_data_replay --listen <port> [--top-levels 5] [--idle-timeout-ms 1000]
 //                       [--queue-capacity 1024] [--consumer-delay-us 0]
+//                       [--snapshot-out <path>] [--snapshot-in <path>]
 //
 // --listen mode has no signal-handling / graceful-shutdown story (no
 // Ctrl+C handler) -- it stops itself once no packets have arrived for
@@ -17,6 +19,15 @@
 // long after each event) -- a way to deliberately trigger and observe the
 // producer/consumer queue's backpressure (drops, high-water mark) without
 // needing a naturally slow workload or a lucky timing race to see it happen.
+//
+// --snapshot-out writes the final book state (tagged with the last
+// sequence number applied) to a file when this run ends, regardless of
+// how it ended (clean EOF/idle-timeout, or stopped early).
+//
+// --snapshot-in configures sequence-gap recovery: if a genuine gap is
+// detected during this run, the given snapshot is loaded and replaces
+// current book state instead of the run stopping. See
+// replay::ReplayOptions::recovery_snapshot_path for the full policy.
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
@@ -26,6 +37,7 @@
 
 #include "net/udp_listener.hpp"
 #include "replay/replay_engine.hpp"
+#include "replay/snapshot.hpp"
 
 using namespace mdh;
 using namespace mdh::replay;
@@ -39,6 +51,8 @@ struct Args {
     std::uint64_t idle_timeout_ms = 1000;
     std::size_t queue_capacity = 1024;
     std::uint64_t consumer_delay_us = 0;
+    std::optional<std::string> snapshot_out;
+    std::optional<std::string> snapshot_in;
 };
 
 std::optional<Args> parse_args(int argc, char** argv) {
@@ -75,6 +89,14 @@ std::optional<Args> parse_args(int argc, char** argv) {
             auto v = next();
             if (!v) return std::nullopt;
             args.consumer_delay_us = std::stoull(*v);
+        } else if (flag == "--snapshot-out") {
+            auto v = next();
+            if (!v) return std::nullopt;
+            args.snapshot_out = *v;
+        } else if (flag == "--snapshot-in") {
+            auto v = next();
+            if (!v) return std::nullopt;
+            args.snapshot_in = *v;
         } else {
             std::cerr << "unrecognized argument: " << flag << "\n";
             return std::nullopt;
@@ -90,8 +112,10 @@ std::optional<Args> parse_args(int argc, char** argv) {
 
 void print_usage() {
     std::cerr << "Usage: market_data_replay --input <path> [--top-levels <N>]\n"
+              << "                           [--snapshot-out <path>] [--snapshot-in <path>]\n"
               << "   or: market_data_replay --listen <port> [--top-levels <N>] [--idle-timeout-ms <N>]\n"
-              << "                           [--queue-capacity <N>] [--consumer-delay-us <N>]\n";
+              << "                           [--queue-capacity <N>] [--consumer-delay-us <N>]\n"
+              << "                           [--snapshot-out <path>] [--snapshot-in <path>]\n";
 }
 
 void print_levels(const char* label, const std::vector<book::PriceLevelView>& levels) {
@@ -114,7 +138,8 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    const ReplayOptions options;
+    ReplayOptions options;
+    options.recovery_snapshot_path = args->snapshot_in;
     ReplayOutcome outcome;
     std::uint64_t packets_received = 0;
     std::uint64_t packet_errors = 0;
@@ -139,6 +164,11 @@ int main(int argc, char** argv) {
         queue_high_water_mark = result.queue_high_water_mark;
     }
 
+    std::optional<bool> snapshot_write_succeeded;
+    if (args->snapshot_out) {
+        snapshot_write_succeeded = write_snapshot(*args->snapshot_out, outcome.last_sequence_number.value_or(0), outcome.books);
+    }
+
     std::cout << "=== Replay Summary ===\n";
     if (args->input) {
         std::cout << "input:               " << *args->input << "\n";
@@ -158,6 +188,7 @@ int main(int argc, char** argv) {
     std::cout << "messages processed:  " << outcome.stats.messages_processed << "\n";
     std::cout << "decode failures:     " << outcome.stats.decode_failures << "\n";
     std::cout << "sequence failures:   " << outcome.stats.sequence_failures << "\n";
+    std::cout << "recoveries:          " << outcome.stats.recoveries << "\n";
     std::cout << "book errors:         " << outcome.stats.book_errors << "\n";
     std::cout << "adds:                " << outcome.stats.adds << "\n";
     std::cout << "cancels:             " << outcome.stats.cancels << "\n";
@@ -168,6 +199,17 @@ int main(int argc, char** argv) {
     std::cout << std::fixed << std::setprecision(1);
     std::cout << "messages/sec:        " << outcome.stats.messages_per_second() << "\n";
     std::cout.unsetf(std::ios::fixed);
+
+    if (outcome.last_sequence_number) {
+        std::cout << "last sequence:       " << *outcome.last_sequence_number << "\n";
+    }
+    if (snapshot_write_succeeded) {
+        if (*snapshot_write_succeeded) {
+            std::cout << "wrote snapshot:      " << *args->snapshot_out << "\n";
+        } else {
+            std::cout << "failed to write snapshot to " << *args->snapshot_out << "\n";
+        }
+    }
 
     if (outcome.stopped_early) {
         std::cout << "\nreplay stopped early: " << outcome.stop_reason << "\n";

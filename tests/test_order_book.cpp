@@ -139,6 +139,44 @@ TEST(OrderBook, ClearBookRemovesAllOrdersAndAllowsIdReuse) {
     EXPECT_FALSE(book.add_order(1, 150, 1, Side::Buy).has_value());
 }
 
+TEST(OrderBook, AllBidsAndAllAsksEnumerateEveryOrderNotJustTopLevels) {
+    OrderBook book;
+    // Two orders at the same price (FIFO within a level) plus enough
+    // distinct price levels that top_bids/top_asks with a small n would
+    // miss some of these -- all_bids()/all_asks() must not.
+    ASSERT_FALSE(book.add_order(1, 100, 10, Side::Buy).has_value());
+    ASSERT_FALSE(book.add_order(2, 100, 5, Side::Buy).has_value()); // same price as order 1
+    ASSERT_FALSE(book.add_order(3, 105, 7, Side::Buy).has_value());
+    ASSERT_FALSE(book.add_order(4, 200, 3, Side::Sell).has_value());
+    ASSERT_FALSE(book.add_order(5, 205, 9, Side::Sell).has_value());
+
+    auto bids = book.all_bids();
+    ASSERT_EQ(bids.size(), 3u);
+    // Order within a level matches FIFO add order; levels are visited in
+    // the same price ordering as top_bids (highest first).
+    EXPECT_EQ(bids[0].order_id, 3u);
+    EXPECT_EQ(bids[0].price, 105);
+    EXPECT_EQ(bids[1].order_id, 1u);
+    EXPECT_EQ(bids[1].price, 100);
+    EXPECT_EQ(bids[1].quantity, 10u);
+    EXPECT_EQ(bids[2].order_id, 2u);
+    EXPECT_EQ(bids[2].price, 100);
+    EXPECT_EQ(bids[2].quantity, 5u);
+
+    auto asks = book.all_asks();
+    ASSERT_EQ(asks.size(), 2u);
+    EXPECT_EQ(asks[0].order_id, 4u);
+    EXPECT_EQ(asks[0].price, 200);
+    EXPECT_EQ(asks[1].order_id, 5u);
+    EXPECT_EQ(asks[1].price, 205);
+}
+
+TEST(OrderBook, AllBidsAndAllAsksAreEmptyForAnEmptyBook) {
+    OrderBook book;
+    EXPECT_TRUE(book.all_bids().empty());
+    EXPECT_TRUE(book.all_asks().empty());
+}
+
 TEST(BookManagerTest, InstrumentsAreIndependent) {
     BookManager mgr;
     ASSERT_FALSE(mgr.book_for(1).add_order(1, 100, 10, Side::Buy).has_value());

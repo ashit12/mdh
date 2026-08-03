@@ -46,6 +46,16 @@ class SequenceValidator {
 public:
     [[nodiscard]] SequenceCheck check(Sequence seq);
 
+    // Declares a new baseline directly, bypassing classification -- used
+    // by sequence-gap recovery (replay::apply_frame_result) after loading
+    // a snapshot: the event that triggered recovery becomes the new
+    // "last seen", so the *next* one is checked normally against it. This
+    // is not a classification decision (there is no outcome to report);
+    // it is the caller declaratively overriding the baseline, which
+    // check() has no way to express since it always classifies relative
+    // to prior state.
+    void reset(Sequence seq) { last_seen_ = seq; }
+
 private:
     std::optional<Sequence> last_seen_;
 };

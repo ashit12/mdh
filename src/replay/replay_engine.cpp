@@ -7,6 +7,7 @@
 #include "protocol/errors.hpp"
 #include "common/sequence_validator.hpp"
 #include "replay/event_file_reader.hpp"
+#include "replay/snapshot.hpp"
 
 namespace mdh::replay {
 
@@ -81,7 +82,21 @@ bool apply_frame_result(std::variant<protocol::Event, protocol::DecodeError> fra
     const auto check = validator.check(sequence_of(event));
     if (check.outcome != SequenceOutcome::InOrder) {
         outcome.stats.sequence_failures += 1;
-        if (options.stop_on_sequence_error) {
+
+        if (check.outcome == SequenceOutcome::Missing && options.recovery_snapshot_path) {
+            auto loaded = read_snapshot(*options.recovery_snapshot_path);
+            if (!loaded) {
+                outcome.stopped_early = true;
+                outcome.stop_reason = "sequence gap recovery failed: could not load snapshot " + *options.recovery_snapshot_path;
+                return true;
+            }
+            outcome.books = std::move(loaded->books);
+            outcome.stats.recoveries += 1;
+            // The event that revealed the gap becomes the new baseline --
+            // see this function's doc comment for why (no gap-fill service
+            // to reconstruct exactly what was missed in between).
+            validator.reset(sequence_of(event));
+        } else if (options.stop_on_sequence_error) {
             outcome.stopped_early = true;
             outcome.stop_reason = describe_sequence_error(check);
             return true;
@@ -89,6 +104,7 @@ bool apply_frame_result(std::variant<protocol::Event, protocol::DecodeError> fra
     }
 
     outcome.stats.messages_processed += 1;
+    outcome.last_sequence_number = sequence_of(event);
     apply_event(event, outcome.books, outcome.stats);
     return false;
 }

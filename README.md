@@ -12,7 +12,7 @@ out of scope for now (see *Planned Milestones*).
 
 ---
 
-## Current Milestone: 3 of 6
+## Current Milestone: 4 of 6
 
 Milestone 1 was a complete, self-contained vertical slice: binary message
 definitions, an encoder/decoder, a binary event-file writer, deterministic
@@ -26,17 +26,26 @@ gained two mutually exclusive modes — `--input <file>` and `--listen
 <port>` — that both funnel through the exact same decode/sequence-validate
 /book-apply logic.
 
-Milestone 3 decouples UDP ingestion from book reconstruction with a
-lock-free SPSC queue: `--listen` now runs a producer thread (receive +
-decode) and a consumer thread (validate + apply) connected by a bounded
-queue, with an explicit drop-newest backpressure policy, occupancy metrics
+Milestone 3 decoupled UDP ingestion from book reconstruction with a
+lock-free SPSC queue: `--listen` runs a producer thread (receive + decode)
+and a consumer thread (validate + apply) connected by a bounded queue,
+with an explicit drop-newest backpressure policy, occupancy metrics
 (current size, high-water mark, dropped count), and a `--consumer-delay-us`
 flag to deterministically simulate a slow consumer and observe backpressure
 kick in on demand, rather than relying on it happening to occur under load.
 
-Not yet implemented (by design, deferred to later milestones): sequence-gap
-*recovery* (only *detection* exists so far), snapshotting, throughput/latency
-benchmarking, and fault injection.
+Milestone 4 adds sequence-gap *recovery*: a detected gap can now load a
+snapshot (a saved point-in-time book state, `--snapshot-out`/
+`--snapshot-in`) and resume instead of always stopping. The snapshot format
+reuses the existing `AddOrder` wire frame as-is -- no new per-order
+encoding needed. Milestone 3's producer/consumer queue turns out to already
+be the "buffered incremental messages" this needed: while the consumer is
+busy loading a snapshot, the producer keeps receiving and enqueuing
+normally, with nothing new to build.
+
+Not yet implemented (by design, deferred to later milestones): a real
+gap-fill/retransmission service (recovery is snapshot-only, see *Current
+Limitations*), throughput/latency benchmarking, and fault injection.
 
 ---
 
@@ -73,7 +82,15 @@ benchmarking, and fault injection.
                                                    transport OR whether a
                                                    queue sits in front of it)
                                                                        │
-                                                                       ▼
+                                       Missing + a --snapshot-in configured?
+                                            │                         │
+                                            ▼ yes                     ▼ no (or Duplicate/OutOfOrder)
+                                 read_snapshot() replaces               stop, or continue per
+                                 outcome.books; this event               stop_on_sequence_error
+                                 becomes the new baseline                (unchanged since M1)
+                                            │                         │
+                                            └────────────┬────────────┘
+                                                          ▼
                                                 BookManager -- one OrderBook
                                                 per InstrumentId, created
                                                 lazily; trade stats tracked
@@ -94,7 +111,9 @@ frame-sourcing loop, but both call the same function to decide what a
 decoded frame means for the book and the stats. A dropped queue item is,
 from `apply_frame_result()`'s point of view, indistinguishable from a
 dropped UDP packet -- both just manifest as a gap in the sequence numbers
-it sees.
+it sees. That's why sequence-gap recovery (milestone 4) needed zero changes
+to `net::run_udp_listen()` -- it already calls `apply_frame_result()`,
+which is the only place recovery logic lives.
 
 ### Directory layout
 
@@ -104,20 +123,22 @@ include/          public headers, mirrors src/
                    SequenceValidator, SpscQueue (lock-free ring buffer),
                    DroppingQueue (adds the drop-on-full backpressure policy)
   protocol/        wire format: messages, encoder, decoder, errors
-  replay/          file writer/reader, replay engine (transport-agnostic)
+  replay/          file writer/reader, replay engine (transport-agnostic),
+                   snapshot writer/reader (book-state persistence for recovery)
   book/            price level, order book, book manager
   net/             UDP socket, packet framing, batched receiver, packet-
-                   level sequence tracking, the UDP↔replay bridge (now a
+                   level sequence tracking, the UDP↔replay bridge (a
                    two-thread producer/consumer pipeline, see Architecture)
 src/               implementations for the above
 apps/
   feed_generator/      generates a deterministic binary event file
   udp_sender/          streams an event file over UDP, batched into packets
-  market_data_replay/  replays a file OR listens live on a UDP port
-tests/             GoogleTest suite (90 tests as of milestone 3)
+  market_data_replay/  replays a file OR listens live on a UDP port;
+                       can write/load a book-state snapshot either way
+tests/             GoogleTest suite (103 tests as of milestone 4)
 docs/
   protocol.md      detailed wire-format spec (byte offsets, error taxonomy,
-                   packet header layout)
+                   packet header layout, snapshot format)
 ```
 
 ---
@@ -230,7 +251,7 @@ ctest --test-dir build --output-on-failure
 ./build/mdh_tests
 ```
 
-90 tests across protocol round-trip/error-handling, sequence validation,
+103 tests across protocol round-trip/error-handling, sequence validation,
 event-file I/O, order-book behavior, end-to-end file replay (including a
 determinism check), UDP sockets (a genuine loopback round-trip, not
 mocked), packet framing (including "one bad frame doesn't invalidate an
@@ -239,18 +260,24 @@ receive, end-to-end UDP replay (send over a real loopback socket, assert
 reconstructed book state — including a corrupt-packet-mixed-with-good-
 packets case and a cross-packet sequence-gap case), `SpscQueue` (including
 a genuine multi-threaded producer/consumer stress test, checked clean
-under ThreadSanitizer), `DroppingQueue`'s drop-and-count policy, and the
-full two-thread UDP pipeline including a deterministic backpressure test
-(tiny queue + artificially slowed consumer forces drops on demand, no
-timing luck required).
+under ThreadSanitizer), `DroppingQueue`'s drop-and-count policy, the full
+two-thread UDP pipeline including a deterministic backpressure test (tiny
+queue + artificially slowed consumer forces drops on demand, no timing
+luck required), snapshot round-trip/corruption handling, sequence-gap
+recovery (including that `Duplicate`/`OutOfOrder` correctly do *not*
+trigger it), and a UDP test proving the milestone-3 queue transparently
+buffers live traffic while the consumer is busy recovering from a
+snapshot.
 
 A deterministic backpressure test replaced an earlier one that turned out
 to be flaky (~1-in-15 runs): `SequenceValidator` only detects a gap
 *retrospectively*, when a later sequence number actually arrives, so a
 drop landing on the tail end of a burst with nothing surviving afterward
 is genuinely undetectable, not a bug. That limitation is now pinned down
-as two explicit tests
-(`test_backpressure_integration.cpp`) rather than an intermittent failure.
+as two explicit tests (`test_backpressure_integration.cpp`) rather than an
+intermittent failure -- and directly informed milestone 4's design: a
+snapshot-recovered book can have the exact same kind of invisible gap (see
+*Current Limitations*).
 
 ## Example Commands
 
@@ -270,6 +297,11 @@ as two explicit tests
 # workload happens to be slow enough to trigger it:
 ./build/market_data_replay --listen 9001 --queue-capacity 8 --consumer-delay-us 5000 &
 ./build/udp_sender --input events.bin --host 127.0.0.1 --port 9001
+
+# Write a snapshot of the final book state (tagged with the last sequence
+# applied), then use it to recover a run that starts with a sequence gap:
+./build/market_data_replay --input events.bin --snapshot-out snap.bin
+./build/market_data_replay --input events_with_a_gap.bin --snapshot-in snap.bin
 ```
 
 Sample `market_data_replay --listen` output (truncated), from an actual
@@ -283,18 +315,20 @@ packets received:    355
 packet errors:       0
 packet sequencing:   in_order=355 duplicate=0 out_of_order=0 gaps=0
 queue dropped:       0
-queue high water:    51
+queue high water:    505
 messages processed:  7082
 decode failures:     0
 sequence failures:   0
+recoveries:          0
 book errors:         0
 adds:                5000
 cancels:             1061
 modifies:            664
 trades:              293
 clears:              64
-replay duration:     1353.06 ms
-messages/sec:        5234.1
+replay duration:     1564.28 ms
+messages/sec:        4527.3
+last sequence:       7082
 
 instruments seen:    10
 
@@ -305,9 +339,10 @@ instruments seen:    10
 ```
 
 Even with no artificial slowdown and a generous default capacity (1024),
-the queue's high-water mark of 51 shows the consumer (book reconstruction)
-genuinely does fall behind the producer (raw receive+decode) at times --
-just not by enough to ever hit the cap and drop anything here.
+the queue's high-water mark of 505 shows the consumer (book reconstruction)
+genuinely does fall behind the producer (raw receive+decode) by a fair
+amount at times -- just not by enough to ever hit the 1024 cap and drop
+anything here.
 
 Now the same feed against a deliberately tiny, slow configuration
 (`--queue-capacity 8 --consumer-delay-us 5000`), forcing backpressure on
@@ -316,31 +351,74 @@ demand instead of hoping for it:
 ```
 === Replay Summary ===
 listened on port:    9789
-packets received:    36
+packets received:    355
 packet errors:       0
-packet sequencing:   in_order=36 duplicate=0 out_of_order=0 gaps=0
-queue dropped:       707
+packet sequencing:   in_order=355 duplicate=0 out_of_order=0 gaps=0
+queue dropped:       7066
 queue high water:    8
-messages processed:  9
+messages processed:  8
 decode failures:     0
 sequence failures:   1
+recoveries:          0
 book errors:         0
-adds:                7
+adds:                6
 cancels:             0
 modifies:            2
 trades:              0
 clears:              0
-replay duration:     593.339 ms
-messages/sec:        15.2
+replay duration:     379.754 ms
+messages/sec:        21.1
+last sequence:       8
 
-replay stopped early: missing sequence(s) [10..360]
+replay stopped early: missing sequence(s) [9..40]
+
+instruments seen:    6
 ```
 
-707 of 717 events were dropped (the queue never grows past its 8-slot
+7,066 of 7,082 events were dropped (the queue never grows past its 8-slot
 cap), the high-water mark is pinned exactly at that cap, and the resulting
-gap (sequences 10 through 360 never arrived) was caught by the same
-`SequenceValidator` that gates file replay -- a dropped queue item and a
-dropped UDP packet look identical from its point of view.
+gap was caught by the same `SequenceValidator` that gates file replay -- a
+dropped queue item and a dropped UDP packet look identical from its point
+of view.
+
+And here's the same kind of gap, but with `--snapshot-in` configured
+instead of the default stop-on-gap behavior. First, a snapshot is written
+from a completed run (`--snapshot-out`); then a small hand-crafted feed
+with sequences `1` and `50` (a gap: 2 through 49 never arrived) is
+replayed against that snapshot:
+
+```
+=== Replay Summary ===
+input:               events_with_a_gap.bin
+messages processed:  2
+decode failures:     0
+sequence failures:   1
+recoveries:          1
+book errors:         0
+adds:                2
+cancels:             0
+modifies:            0
+trades:              0
+clears:              0
+replay duration:     6.89187 ms
+messages/sec:        290.2
+last sequence:       50
+
+instruments seen:    10
+
+-- instrument 1 --
+    bid 101348 x 17 (1 orders)
+    bid 101329 x 92 (1 orders)
+    ask 200 x 1 (1 orders)
+    ask 101096 x 64 (1 orders)
+```
+
+Instead of stopping, the run loaded the snapshot (all 10 instruments'
+real book state from the earlier run reappear immediately), applied the
+sequence-50 event that revealed the gap on top of it (that's the `ask 200
+x 1` -- everything else in instrument 1's book came from the snapshot),
+and continued normally. Without `--snapshot-in`, this exact same gap feed
+just stops after message 1, the same way milestones 1-3 always have.
 
 All numbers above are from actual runs on the development machine, not
 invented figures — they will vary by hardware and are not a benchmark
@@ -446,13 +524,55 @@ claim (see *Milestone 5* below for planned formal benchmarking).
   same real components directly to prove both sides of that limitation
   as explicit, tested facts.
 
+**Milestone 4:**
+- **Snapshot format reuses the `AddOrder` wire frame as-is**, behind one
+  small new header (magic `"MDH2"`, version, sequence number, entry
+  count). A snapshot entry and a live `AddOrder` message are wire-identical
+  -- they just arrive from a different source -- so `encode_event()`/
+  `decode_event()` needed no changes at all to support snapshots.
+- **Recovery only triggers on `SequenceOutcome::Missing`, not `Duplicate`
+  or `OutOfOrder`.** A duplicate isn't evidence anything was lost --
+  reprocessing it would be wrong, and a full book reset would be pure
+  regression. A reordered-but-not-missing message calls for
+  buffer-and-reorder in a real system, not a snapshot reset. Neither is
+  what recovery is for; both keep their pre-milestone-4,
+  `stop_on_sequence_error`-governed behavior unchanged.
+- **`outcome.books` is wholesale replaced by the snapshot, not merged with
+  it.** Whatever was applied before the gap is discarded -- there is no
+  attempt to reconcile pre-gap state with the snapshot, which would
+  require knowing which parts of the pre-gap state are still valid. Stats
+  (`ReplayStats`) stay cumulative across the whole run regardless, since
+  they describe activity, not final book state.
+- **The event that revealed the gap becomes the new validator baseline**,
+  not the snapshot's own sequence number. There's no gap-fill/
+  retransmission service to reconstruct exactly what happened between the
+  snapshot's sequence and that event (out of scope, see *Current
+  Limitations*), so re-checking that event against the snapshot's sequence
+  would just immediately re-trigger the same gap. Treating it as the
+  resumption point is the maximally useful thing to do with what's
+  actually available.
+- **Milestone 3's queue needed zero changes to buffer live traffic during
+  recovery.** `net::run_udp_listen()`'s consumer thread already calls
+  `apply_frame_result()`, which is the only place recovery logic lives --
+  the producer thread, running independently, keeps receiving and
+  enqueuing exactly as it always has while the consumer is busy loading a
+  snapshot. "Buffered incremental messages" fell out of the milestone 3
+  architecture for free.
+- **A snapshot round-trip test used a hand-crafted feed file rather than a
+  synthetic tool.** Verifying `--snapshot-in` recovery end-to-end through
+  the CLI needed a feed file with an intentional, precise sequence gap --
+  something `feed_generator` deliberately doesn't produce (corruption
+  injection is milestone 6 scope). A short Python script writing the exact
+  documented wire format (two 49-byte `AddOrder` frames, sequences 1 and
+  50) was simpler than adding a "corrupt" mode to `feed_generator` just for
+  this one manual check.
+
 ## Current Limitations
 
 - `SequenceValidator` only remembers the last accepted sequence number, so
   it cannot distinguish "duplicate of an old sequence" from generic
   out-of-order arrival once the feed has moved past it — both are reported
   as `OutOfOrder`.
-- No sequence-gap *recovery* — replay just stops (milestone 4 territory).
 - `Trade` doesn't mutate book depth (no `order_id` to link it to a resting
   order — see *Order-Book Model* above).
 - `Modify` always loses time priority, even for a quantity-only decrease.
@@ -477,16 +597,32 @@ claim (see *Milestone 5* below for planned formal benchmarking).
   to just start with a larger capacity, this hasn't been a real
   constraint, but it's a real one if memory footprint mattered more than
   it does for a portfolio project.
-- **A drop is still just a drop** — there's no way to recover, replay, or
-  even know *which* sequence numbers were lost beyond the gap range the
-  next successful frame reveals (see the *drop-with-no-later-survivor* case
-  above). Sequence-gap *recovery* is milestone 4 territory, same as the
-  gaps caused by a genuinely dropped UDP packet.
+- **Recovery has no real gap-fill/retransmission service behind it** —
+  it's snapshot-only. Whatever happened strictly between the snapshot's
+  sequence and the event that triggered recovery is genuinely
+  unrecoverable; a reference that was added/cancelled/modified in that
+  window simply isn't reflected in the recovered book. A real system
+  would fetch a current snapshot and gap-fill the missing incrementals
+  from a retransmission service; this project doesn't model that
+  infrastructure.
+- **A drop with nothing surviving after it is still genuinely
+  undetectable**, snapshot recovery or not — `SequenceValidator` only
+  classifies a gap retrospectively (see the *drop-with-no-later-survivor*
+  case, and the milestone 3 flaky-test note above). Recovery doesn't
+  change this; it only changes what happens once a gap *is* detected.
+- **Recovery reloads the exact same static snapshot file every time it
+  triggers** within one run — if multiple gaps occur, each one recovers
+  from whatever was written to `--snapshot-in`'s path, not a fresher
+  post-recovery state. A real system would fetch/generate a current
+  snapshot per recovery event.
+- **Trade statistics (`InstrumentStats`) are not captured in a
+  snapshot** — only book depth (resting orders) is. Consistent with
+  `Trade` already being informational-only elsewhere in this project (see
+  *Order-Book Model*), but worth naming: `trade_count`/`traded_quantity`/
+  `last_trade_price` reset to zero across a recovery.
 
 ## Planned Milestones
 
-4. Sequence-gap *recovery*, snapshot generation/loading, buffered
-   incremental messages, resume after recovery.
 5. Allocation profiling, decode throughput benchmarks, end-to-end latency
    (p50/p99/p99.9), burst-load tests, CPU affinity where supported,
    comparison of alternative book representations.

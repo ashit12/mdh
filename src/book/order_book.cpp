@@ -120,4 +120,24 @@ std::vector<PriceLevelView> OrderBook::top_asks(std::size_t n) const {
     return result;
 }
 
+std::vector<OrderView> OrderBook::all_bids() const {
+    std::vector<OrderView> result;
+    for (const auto& [price, level] : bids_) {
+        for (const auto& order : level.orders()) {
+            result.push_back(OrderView{order.id, price, order.quantity});
+        }
+    }
+    return result;
+}
+
+std::vector<OrderView> OrderBook::all_asks() const {
+    std::vector<OrderView> result;
+    for (const auto& [price, level] : asks_) {
+        for (const auto& order : level.orders()) {
+            result.push_back(OrderView{order.id, price, order.quantity});
+        }
+    }
+    return result;
+}
+
 } // namespace mdh::book

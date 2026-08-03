@@ -54,3 +54,24 @@ TEST(SequenceValidator, ValidatorRecoversHighWaterMarkAfterGap) {
     auto r = v.check(6);
     EXPECT_EQ(r.outcome, SequenceOutcome::InOrder);
 }
+
+TEST(SequenceValidator, ResetDeclaresNewBaselineWithoutClassifying) {
+    SequenceValidator v;
+    (void)v.check(1);
+    (void)v.check(50); // a big gap, as if many messages were missed
+
+    v.reset(50); // e.g. sequence-gap recovery declaring "50" as the new baseline
+
+    // The next sequence is now checked against the RESET baseline, not
+    // against history from before the reset -- 51 is in order, and 2
+    // (which would have been in-order relative to the pre-reset state)
+    // is not.
+    auto after_reset = v.check(51);
+    EXPECT_EQ(after_reset.outcome, SequenceOutcome::InOrder);
+
+    SequenceValidator v2;
+    (void)v2.check(1);
+    v2.reset(50);
+    auto stale = v2.check(2);
+    EXPECT_NE(stale.outcome, SequenceOutcome::InOrder);
+}

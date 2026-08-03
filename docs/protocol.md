@@ -1,4 +1,4 @@
-# Wire Protocol Specification (through Milestone 3)
+# Wire Protocol Specification (through Milestone 4)
 
 This is a simulated, ITCH/OUCH-inspired binary market-data protocol built
 for a portfolio project. It is not a real exchange spec, and no claim is
@@ -241,3 +241,74 @@ comes after it -- the gap is never observed at all. That's not a bug in
 the validator; it has no way to know how many messages *should* have
 followed. It does mean "sequence_failures == 0" is not, on its own, proof
 that nothing was ever dropped.
+
+## Snapshot format (milestone 4)
+
+A snapshot (`replay/snapshot.hpp`) is a separate file format from both the
+event-file and packet formats above, but deliberately reuses as much of
+them as possible: every resting order becomes an ordinary `AddOrder` wire
+frame -- the exact same 20-byte event header + 29-byte payload described
+earlier in this document, encoded via the same `encode_event()` used
+everywhere else. A snapshot entry and a live `AddOrder` message are
+wire-identical; only the source (a book dump vs. an incoming message)
+differs, and neither `encode_event()` nor `decode_event()` needs to know
+which one they're looking at.
+
+### Snapshot header (24 bytes, once, before all entries)
+
+| Offset | Field | Type | Notes |
+|---|---|---|---|
+| 0 | `magic` | `u32` | `0x4D444832` (ASCII `"MDH2"`) -- distinct from `net::PACKET_MAGIC` (`"MDH1"`), so a snapshot file is never mistaken for a captured UDP packet |
+| 4 | `version` | `u16` | `1` |
+| 6 | `reserved` | `u16` | must be `0` |
+| 8 | `sequence_number` | `u64` | the sequence_number of the last event fully applied before this snapshot was taken |
+| 16 | `entry_count` | `u64` | how many `AddOrder` frames follow |
+
+`entry_count` is 64 bits, unlike `net::PacketHeader::frame_count` (16
+bits). A UDP packet's frame count is naturally bounded by how many frames
+fit under an MTU-sized datagram; a snapshot has no such bound (a book can
+hold arbitrarily many resting orders), so it needs the wider field.
+
+Because the header has to be written *before* any entries, and
+`entry_count` has to already be known at that point, `write_snapshot()`
+encodes every entry into an in-memory buffer first, counts them, then
+writes `[header][buffer]` in that order -- unlike `EventFileWriter`'s
+streaming per-message writes, which never needed to know a total count
+upfront since there is no header field depending on it.
+
+### Entries
+
+Each entry is a normal `AddOrder` frame: `order_id`, `instrument_id`,
+`price`, `quantity`, `side`, exactly as specified earlier in this
+document. `sequence_number` and `timestamp_ns` in each entry's header are
+both set to the snapshot's own `sequence_number` / `0` respectively --
+neither is meaningful for a snapshot entry (there is no real "when was
+this added" for a book dump), and `read_snapshot()` never reads them back
+out; it decodes each entry only for its `AddOrder` payload fields and
+applies them via `OrderBook::add_order()`.
+
+A snapshot only captures book depth (resting orders) -- not
+`book::InstrumentStats` (trade count/volume/last price). Those are
+already documented as informational-only elsewhere in this project (see
+*Trade messages* above), so losing them across a `read_snapshot()` is a
+named, deliberate simplification, not an oversight.
+
+### Recovery semantics
+
+`replay::apply_frame_result()` loads a snapshot only on a
+`SequenceOutcome::Missing` classification (a genuine gap) when
+`ReplayOptions::recovery_snapshot_path` is set -- not on `Duplicate` or
+`OutOfOrder`, which keep their pre-milestone-4 `stop_on_sequence_error`-
+governed behavior. On a Missing classification with a snapshot path
+configured: `outcome.books` is replaced wholesale by the snapshot's
+state (not merged with whatever was applied before the gap), and the
+event that revealed the gap becomes the new `SequenceValidator` baseline
+(via `SequenceValidator::reset()`) rather than the snapshot's own
+sequence number -- there is no gap-fill/retransmission service to
+reconstruct exactly what happened in between, so re-checking that event
+against the snapshot's sequence would just immediately re-trigger the
+same gap. That event is then applied normally on top of the freshly
+loaded state; if it references an order that only ever existed during the
+now-unrecoverable window, that surfaces as an ordinary `BookError`/
+`book_errors` count, not a crash -- the same machinery that already
+handles any "operating on an order the book doesn't know about" case.

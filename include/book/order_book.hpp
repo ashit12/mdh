@@ -17,6 +17,15 @@ struct PriceLevelView {
     std::size_t order_count;
 };
 
+// One resting order, with enough detail to reconstruct it via add_order()
+// -- unlike PriceLevelView, which aggregates a whole level for display.
+// Used for snapshotting (need every order, not just the top N levels).
+struct OrderView {
+    OrderId order_id;
+    Price price;
+    Quantity quantity;
+};
+
 // A single instrument's book. Bids ordered highest-first, asks ordered
 // lowest-first, each side a std::map<Price, PriceLevel> keyed for that
 // ordering. An OrderId -> location index lets cancel/modify find the right
@@ -44,6 +53,11 @@ public:
     [[nodiscard]] std::optional<PriceLevelView> best_ask() const;
     [[nodiscard]] std::vector<PriceLevelView> top_bids(std::size_t n) const;
     [[nodiscard]] std::vector<PriceLevelView> top_asks(std::size_t n) const;
+
+    // Every resting order on one side, across all price levels -- for
+    // snapshotting the whole book, not just the top N levels for display.
+    [[nodiscard]] std::vector<OrderView> all_bids() const;
+    [[nodiscard]] std::vector<OrderView> all_asks() const;
 
     [[nodiscard]] bool has_order(OrderId id) const { return order_index_.contains(id); }
 

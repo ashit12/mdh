@@ -34,6 +34,7 @@ add_library(mdh_core
     src/replay/event_file_writer.cpp
     src/common/sequence_validator.cpp
     src/replay/replay_engine.cpp
+    src/replay/snapshot.cpp
     src/book/order_book.cpp
     src/book/book_manager.cpp
     src/net/udp_socket.cpp
@@ -90,6 +91,8 @@ add_executable(mdh_tests
     tests/test_spsc_queue.cpp
     tests/test_dropping_queue.cpp
     tests/test_backpressure_integration.cpp
+    tests/test_snapshot.cpp
+    tests/test_sequence_recovery.cpp
 )
 target_link_libraries(mdh_tests PRIVATE mdh_core gtest gtest_main)
 target_compile_options(mdh_tests PRIVATE ${MDH_WARNING_FLAGS})
