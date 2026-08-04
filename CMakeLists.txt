@@ -24,7 +24,13 @@ FetchContent_Declare(
     DOWNLOAD_EXTRACT_TIMESTAMP ON
 )
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+# Keep vendored googletest sources out of compile_commands.json. A header has no
+# entry of its own in a compile database, so clangd infers flags from the
+# "closest" translation unit; gtest's _deps entries win that heuristic for
+# include/**/*.hpp and supply no -Iinclude, which breaks IntelliSense on headers.
+set(CMAKE_EXPORT_COMPILE_COMMANDS OFF)
 FetchContent_MakeAvailable(googletest)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ── Core library ───────────────────────────────────────────────────────────
 add_library(mdh_core
@@ -93,6 +99,8 @@ add_executable(mdh_tests
     tests/test_backpressure_integration.cpp
     tests/test_snapshot.cpp
     tests/test_sequence_recovery.cpp
+    tests/test_exchange_commands.cpp
+    tests/test_exchange_events.cpp
 )
 target_link_libraries(mdh_tests PRIVATE mdh_core gtest gtest_main)
 target_compile_options(mdh_tests PRIVATE ${MDH_WARNING_FLAGS})
