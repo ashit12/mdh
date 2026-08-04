@@ -47,6 +47,14 @@ add_library(mdh_core
     src/net/packet.cpp
     src/net/udp_receiver.cpp
     src/net/udp_listener.cpp
+    src/exchange/matching/matching_book.cpp
+    src/exchange/matching/matching_engine.cpp
+    src/exchange/persistence/command_encoder.cpp
+    src/exchange/persistence/command_decoder.cpp
+    src/exchange/persistence/command_journal_writer.cpp
+    src/exchange/persistence/command_journal_reader.cpp
+    src/exchange/persistence/state_hash.cpp
+    src/exchange/persistence/command_replay.cpp
 )
 target_include_directories(mdh_core PUBLIC include)
 target_compile_options(mdh_core PRIVATE ${MDH_WARNING_FLAGS})
@@ -101,6 +109,12 @@ add_executable(mdh_tests
     tests/test_sequence_recovery.cpp
     tests/test_exchange_commands.cpp
     tests/test_exchange_events.cpp
+    tests/test_matching_book.cpp
+    tests/test_matching_engine.cpp
+    tests/test_command_codec.cpp
+    tests/test_command_decode_errors.cpp
+    tests/test_command_journal.cpp
+    tests/test_exchange_replay.cpp
 )
 target_link_libraries(mdh_tests PRIVATE mdh_core gtest gtest_main)
 target_compile_options(mdh_tests PRIVATE ${MDH_WARNING_FLAGS})

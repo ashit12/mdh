@@ -14,6 +14,11 @@
 // gateway (a later milestone) or a test constructing them directly -- is
 // entirely decoupled from this type's definition; nothing here has been
 // decoded from wire bytes.
+//
+// Every struct below also defines a defaulted operator== (Milestone 3): the
+// command journal's roundtrip tests need to assert a decoded command equals
+// the original one that was encoded. Purely additive -- does not affect
+// aggregate-ness or existing designated-initializer construction.
 namespace mdh::exchange {
 
 struct NewOrderCommand {
@@ -26,6 +31,8 @@ struct NewOrderCommand {
     Quantity quantity;
     OrderType order_type;
     TimeInForce time_in_force;
+
+    bool operator==(const NewOrderCommand&) const = default;
 };
 
 struct CancelOrderCommand {
@@ -38,6 +45,8 @@ struct CancelOrderCommand {
     // unneeded complexity for the current milestones.
     ClientOrderId client_order_id;
     InstrumentId instrument_id;
+
+    bool operator==(const CancelOrderCommand&) const = default;
 };
 
 struct ReplaceOrderCommand {
@@ -52,6 +61,8 @@ struct ReplaceOrderCommand {
     InstrumentId instrument_id;
     Price new_price;
     Quantity new_quantity;
+
+    bool operator==(const ReplaceOrderCommand&) const = default;
 };
 
 using ExchangeCommand = std::variant<NewOrderCommand, CancelOrderCommand, ReplaceOrderCommand>;

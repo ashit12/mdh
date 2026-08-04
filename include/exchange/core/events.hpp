@@ -26,6 +26,15 @@
 // now is what lets Milestone 6's market-data publisher forward the Book*
 // events (and only those) without a filtering step that could otherwise leak
 // private data by omission.
+//
+// Every struct below also defines a defaulted operator== (Milestone 3):
+// replaying the same command journal twice must produce byte-for-byte
+// identical event streams, and the most direct way to assert that in a test
+// is std::vector<ExchangeEvent> equality, which requires each alternative
+// (and std::variant itself) to support ==. Purely additive -- no behavior
+// changes, and defaulted comparison operators do not disqualify these types
+// from remaining aggregates (designated-initializer construction throughout
+// the existing tests is unaffected).
 namespace mdh::exchange {
 
 struct OrderAccepted {
@@ -40,6 +49,8 @@ struct OrderAccepted {
     Quantity quantity;
     OrderType order_type;
     TimeInForce time_in_force;
+
+    bool operator==(const OrderAccepted&) const = default;
 };
 
 struct OrderRejected {
@@ -49,6 +60,8 @@ struct OrderRejected {
     ClientOrderId client_order_id;
     InstrumentId instrument_id;
     RejectReason reason;
+
+    bool operator==(const OrderRejected&) const = default;
 };
 
 struct OrderCancelled {
@@ -58,6 +71,8 @@ struct OrderCancelled {
     ClientOrderId client_order_id;
     ExchangeOrderId exchange_order_id;
     InstrumentId instrument_id;
+
+    bool operator==(const OrderCancelled&) const = default;
 };
 
 struct OrderReplaced {
@@ -70,6 +85,8 @@ struct OrderReplaced {
     InstrumentId instrument_id;
     Price new_price;
     Quantity new_quantity;
+
+    bool operator==(const OrderReplaced&) const = default;
 };
 
 // One resting-order counterparty to a trade. TradeExecuted carries one of
@@ -83,6 +100,8 @@ struct TradeCounterparty {
     // filled) -- lets a consumer distinguish a partial from a complete fill
     // without re-deriving it from prior state.
     Quantity remaining_quantity;
+
+    bool operator==(const TradeCounterparty&) const = default;
 };
 
 struct TradeExecuted {
@@ -94,6 +113,8 @@ struct TradeExecuted {
     Side aggressor_side;
     TradeCounterparty buyer;
     TradeCounterparty seller;
+
+    bool operator==(const TradeExecuted&) const = default;
 };
 
 struct BookOrderAdded {
@@ -103,6 +124,8 @@ struct BookOrderAdded {
     Side side;
     Price price;
     Quantity quantity;
+
+    bool operator==(const BookOrderAdded&) const = default;
 };
 
 struct BookOrderReduced {
@@ -112,6 +135,8 @@ struct BookOrderReduced {
     Side side;
     Price price;
     Quantity new_remaining_quantity;
+
+    bool operator==(const BookOrderReduced&) const = default;
 };
 
 struct BookOrderRemoved {
@@ -120,6 +145,8 @@ struct BookOrderRemoved {
     ExchangeOrderId exchange_order_id;
     Side side;
     Price price;
+
+    bool operator==(const BookOrderRemoved&) const = default;
 };
 
 using ExchangeEvent = std::variant<OrderAccepted, OrderRejected, OrderCancelled, OrderReplaced, TradeExecuted,
