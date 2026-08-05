@@ -129,16 +129,28 @@ include/          public headers, mirrors src/
   net/             UDP socket, packet framing, batched receiver, packet-
                    level sequence tracking, the UDP↔replay bridge (a
                    two-thread producer/consumer pipeline, see Architecture)
+  exchange/        the exchange side: authoritative matching engine, command
+                   journal + replay, command sequencer + matching pipeline,
+                   ledger + pre-trade risk -- see docs/exchange_flow.md
 src/               implementations for the above
 apps/
   feed_generator/      generates a deterministic binary event file
   udp_sender/          streams an event file over UDP, batched into packets
   market_data_replay/  replays a file OR listens live on a UDP port;
                        can write/load a book-state snapshot either way
-tests/             GoogleTest suite (103 tests as of milestone 4)
+tests/             GoogleTest suite (103 tests as of milestone 4; plus a
+                   separate, growing exchange-side suite -- see
+                   docs/exchange_flow.md)
 docs/
-  protocol.md      detailed wire-format spec (byte offsets, error taxonomy,
-                   packet header layout, snapshot format)
+  protocol.md               detailed wire-format spec (byte offsets, error
+                             taxonomy, packet header layout, snapshot format)
+  exchange_flow.md          exchange-side code walkthrough: architecture,
+                             a worked end-to-end order trace, and a
+                             component-by-component reference
+  end_to_end_architecture.md  the planned trader-side + exchange-side
+                             system shape, and why the two books can't
+                             share a class
+  current_system_assessment.md  point-in-time gap analysis snapshot
 ```
 
 ---

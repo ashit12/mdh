@@ -58,6 +58,15 @@ enum class RejectReason {
     InsufficientLiquidity, // FOK: could not be fully filled immediately
     InvalidReplacement,
     InternalError,
+    // Milestone 5 (exchange/risk/): pre-trade checks performed before a
+    // command is allowed to reach the matching engine at all -- distinct
+    // from InsufficientLiquidity above, which is a book-depth concept
+    // (not enough resting quantity to fill against), not an account-balance
+    // one (not enough of the account's own funds/holdings to attempt the
+    // order in the first place).
+    InsufficientFunds,    // buy: account's available (unreserved) cash can't cover price * quantity
+    InsufficientPosition, // sell: account's available (unreserved) instrument holdings are short
+    OrderTooLarge,        // exceeds RiskLimits::max_order_quantity
 };
 
 [[nodiscard]] constexpr std::string_view to_string(RejectReason r) {
@@ -71,6 +80,9 @@ enum class RejectReason {
         case RejectReason::InsufficientLiquidity: return "InsufficientLiquidity";
         case RejectReason::InvalidReplacement:    return "InvalidReplacement";
         case RejectReason::InternalError:         return "InternalError";
+        case RejectReason::InsufficientFunds:     return "InsufficientFunds";
+        case RejectReason::InsufficientPosition:  return "InsufficientPosition";
+        case RejectReason::OrderTooLarge:         return "OrderTooLarge";
     }
     return "UnknownRejectReason";
 }

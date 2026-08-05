@@ -149,6 +149,9 @@ TEST(ExchangeEvents, RejectReasonToStringCoversEveryEnumerator) {
     EXPECT_EQ(to_string(RejectReason::InsufficientLiquidity), "InsufficientLiquidity");
     EXPECT_EQ(to_string(RejectReason::InvalidReplacement), "InvalidReplacement");
     EXPECT_EQ(to_string(RejectReason::InternalError), "InternalError");
+    EXPECT_EQ(to_string(RejectReason::InsufficientFunds), "InsufficientFunds");
+    EXPECT_EQ(to_string(RejectReason::InsufficientPosition), "InsufficientPosition");
+    EXPECT_EQ(to_string(RejectReason::OrderTooLarge), "OrderTooLarge");
 }
 
 TEST(ExchangeEvents, OrderTypeAndTimeInForceToString) {

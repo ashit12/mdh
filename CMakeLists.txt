@@ -55,6 +55,11 @@ add_library(mdh_core
     src/exchange/persistence/command_journal_reader.cpp
     src/exchange/persistence/state_hash.cpp
     src/exchange/persistence/command_replay.cpp
+    src/exchange/sequencing/command_sequencer.cpp
+    src/exchange/sequencing/matching_pipeline.cpp
+    src/exchange/ledger/ledger.cpp
+    src/exchange/risk/risk_engine.cpp
+    src/exchange/risk/risk_gated_engine.cpp
 )
 target_include_directories(mdh_core PUBLIC include)
 target_compile_options(mdh_core PRIVATE ${MDH_WARNING_FLAGS})
@@ -115,6 +120,11 @@ add_executable(mdh_tests
     tests/test_command_decode_errors.cpp
     tests/test_command_journal.cpp
     tests/test_exchange_replay.cpp
+    tests/test_command_sequencer.cpp
+    tests/test_matching_pipeline.cpp
+    tests/test_ledger.cpp
+    tests/test_risk_engine.cpp
+    tests/test_risk_gated_engine.cpp
 )
 target_link_libraries(mdh_tests PRIVATE mdh_core gtest gtest_main)
 target_compile_options(mdh_tests PRIVATE ${MDH_WARNING_FLAGS})

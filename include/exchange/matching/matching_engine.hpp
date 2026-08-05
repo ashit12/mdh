@@ -41,6 +41,18 @@ class MatchingEngine {
 public:
     void process(const ExchangeCommand& command, const EventSink& sink);
 
+    // Emits an OrderRejected for `command` using this engine's own
+    // event_sequence counter, without touching any book state (Milestone
+    // 5): for a pre-trade rejection decided *before* a command is even
+    // handed to process() (exchange/risk/'s RiskEngine) -- so that
+    // event_sequence numbering stays globally gapless and strictly
+    // increasing across every event this engine has ever produced,
+    // regardless of whether a given rejection happened inside or outside
+    // process() itself. Does not, by itself, decide *whether* to reject --
+    // that policy question belongs entirely to the caller (RiskEngine); this
+    // is purely "emit the event using the right counter."
+    void reject_new_order(const NewOrderCommand& command, RejectReason reason, const EventSink& sink);
+
     // A canonical, deterministically-ordered dump of every resting order
     // across every instrument (Milestone 3) -- see state_snapshot.hpp for
     // why this is safe to compare with == across two independently-built
