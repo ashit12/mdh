@@ -10,7 +10,7 @@ namespace; neither depends on the other's types. If you're looking for how
 `market_data_replay` or `udp_sender` work, see the top-level `README.md`
 instead — this document is scoped entirely to `mdh::exchange`.
 
-It walks through the five milestones built so far in the order they were
+It walks through the six milestones built so far in the order they were
 built, then traces one order through the whole stack end to end, then gives
 a directory-by-directory component reference.
 
@@ -68,6 +68,24 @@ for buys, position for sells) against the ledger's *available* (unreserved)
 balances. `RiskGatedEngine` composes `RiskEngine` + `Ledger` +
 `MatchingEngine` behind `MatchingEngine::process()`'s exact signature, so it
 can drop in anywhere a bare engine is used.
+
+**Milestone 6 — Market-data publisher** (`exchange/market_data/`).
+`MarketDataPublisher` translates the four *public* `ExchangeEvent`s
+(`BookOrderAdded`/`Reduced`/`Removed`, `TradeExecuted`) into the trader
+side's own, pre-existing wire format (`protocol::AddOrder`/`ModifyOrder`/
+`CancelOrder`/`Trade`) — the same format `feed_generator` has always
+produced synthetically. The four private, account-addressed events never
+cross this boundary. Owns its own `Sequence`/`Timestamp` stream (distinct
+from `EventSequence`/`CommandSequence`) and captures wall-clock time at
+publish time — a deliberate, narrow exception to the "no wall-clock time"
+rule that protects the matcher itself, not the feed-publish boundary. This
+is the milestone that closes the loop for real: an end-to-end test
+(`test_market_data_e2e.cpp`) runs commands through a real `MatchingEngine`,
+publishes the resulting events through `MarketDataPublisher`, writes them
+with the trader side's *unmodified* `EventFileWriter`, and replays them
+back through the trader side's *unmodified* `replay::run_replay()` —
+asserting the reconstructed `book::BookManager` agrees with the
+authoritative `MatchingEngine::snapshot()`.
 
 ---
 
@@ -146,6 +164,34 @@ journal file ──CommandJournalReader::next()──► decode_command() ──
 share state with whatever process originally produced the journal. Calling
 it twice on the same file is the actual determinism proof: identical event
 vectors and `EngineStateSnapshot::operator==` both hold.
+
+### Closing the loop: publishing to the trader side (Milestone 6)
+
+A third path, also not (yet) wired to the two above, but tied together by
+`test_market_data_e2e.cpp`:
+
+```
+ExchangeEvent ──MarketDataPublisher::publish()──► protocol::Event   (only the
+        │                                          four public event types;
+        │                                          private ones produce
+        │                                          nothing, see events.hpp)
+        ▼
+encode_event() ──► EventFileWriter ──► event file   <- trader side's OWN,
+                                                        unmodified code
+event file ──EventFileReader──► decode_event() ──► replay::run_replay()
+                                                            │
+                                                            ▼
+                                          book::BookManager  <- trader side's
+                                          OWN, unmodified reconstruction
+```
+
+Every box below `encode_event()` already existed before this milestone and
+needed zero changes — `MarketDataPublisher` is a drop-in producer of
+exactly the feed `feed_generator` has always produced synthetically. The
+end-to-end test asserts the reconstructed `book::BookManager` (built purely
+from wire bytes) agrees with the authoritative `MatchingEngine::snapshot()`
+(e.g. a partially-filled order resting at the same reduced quantity on both
+sides, or a book both sides agree is now empty after a cancel).
 
 ---
 
@@ -354,6 +400,24 @@ same event stream with no extra coordination between `MatchingEngine` and
   (as the architecture diagram's box ordering alone would suggest) would
   reopen the exact double-spend race reservations exist to prevent.
 
+### `exchange/market_data/` — translating to the trader-side wire format
+- **`market_data_publisher.hpp`/`.cpp`** — `MarketDataPublisher::publish(event,
+  sink)`: `std::visit`-dispatches to one helper per public event type
+  (`BookOrderAdded` → `protocol::AddOrder`, `BookOrderReduced` →
+  `protocol::ModifyOrder`, `BookOrderRemoved` → `protocol::CancelOrder`,
+  `TradeExecuted` → `protocol::Trade`, stripping both legs'
+  account/order-id fields); the four private event types match no branch
+  and produce nothing. `sink(downstream)` binds a `MarketDataSink` into an
+  `EventSink`-shaped callable, the same composable shape `Ledger::sink()`
+  uses, so a publisher can be fanned out alongside one. Owns its own
+  monotonic `Sequence` counter, incremented only when a wire message is
+  actually emitted (a private event must not consume a sequence number,
+  the same reasoning `MatchingPipeline::submit()` applies to
+  `CommandSequence`) — and an injectable `clock` (defaults to real
+  `std::chrono::system_clock`) for `timestamp_ns`, so tests aren't at the
+  mercy of wall-clock time despite this being the one place in `exchange/`
+  that's allowed to read it.
+
 ---
 
 ## Design decisions worth knowing before reading the code
@@ -424,6 +488,7 @@ Exchange-side test files, by milestone:
 | 3 — journal & replay | `test_command_codec.cpp`, `test_command_decode_errors.cpp`, `test_command_journal.cpp`, `test_exchange_replay.cpp` |
 | 4 — sequencer & pipeline | `test_command_sequencer.cpp`, `test_matching_pipeline.cpp` |
 | 5 — ledger & risk | `test_ledger.cpp`, `test_risk_engine.cpp`, `test_risk_gated_engine.cpp` |
+| 6 — market-data publisher | `test_market_data_publisher.cpp` (unit-level translation), `test_market_data_e2e.cpp` (loop-closing round-trip through the trader side's own replay pipeline) |
 
 `test_matching_pipeline.cpp` and `test_risk_gated_engine.cpp` are the two
 that most benefit from running under TSan — both exercise real threading
@@ -450,10 +515,18 @@ or app:
   `main.cpp` — no app wires a `CommandSequencer` + `MatchingPipeline` +
   `RiskGatedEngine` + `CommandJournalWriter` together and runs it against
   real input (a file, a socket, or a TCP order-entry session).
+- `MarketDataPublisher` (Milestone 6) is proven correct both in isolation
+  and, via `test_market_data_e2e.cpp`, end to end against the trader side's
+  real replay pipeline — but nothing currently binds it into
+  `MatchingPipeline`'s matching thread either. A live system would fan the
+  matching thread's events out to `Ledger::sink()` *and*
+  `MarketDataPublisher::sink()` *and* `CommandJournalWriter::write()`
+  simultaneously; today each of those three only ever receives events from
+  its own tests.
 
 This is intentional, incremental milestone scope, not an oversight — each
-piece is built and proven correct on its own before being composed. See
-`docs/end_to_end_architecture.md` for the target composition and the
-still-to-come milestones (a wire-level order-entry protocol, a live gateway,
-market-data publication of the `Book*` events). This document should be
-updated once that wiring happens.
+piece is built and proven correct on its own (and, as of Milestone 6, proven
+correct in combination with the trader side specifically) before being
+composed. See `docs/end_to_end_architecture.md` for the target composition
+and the still-to-come milestones (a wire-level order-entry protocol, a live
+gateway). This document should be updated once that wiring happens.

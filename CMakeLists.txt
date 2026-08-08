@@ -60,6 +60,7 @@ add_library(mdh_core
     src/exchange/ledger/ledger.cpp
     src/exchange/risk/risk_engine.cpp
     src/exchange/risk/risk_gated_engine.cpp
+    src/exchange/market_data/market_data_publisher.cpp
 )
 target_include_directories(mdh_core PUBLIC include)
 target_compile_options(mdh_core PRIVATE ${MDH_WARNING_FLAGS})
@@ -125,6 +126,8 @@ add_executable(mdh_tests
     tests/test_ledger.cpp
     tests/test_risk_engine.cpp
     tests/test_risk_gated_engine.cpp
+    tests/test_market_data_publisher.cpp
+    tests/test_market_data_e2e.cpp
 )
 target_link_libraries(mdh_tests PRIVATE mdh_core gtest gtest_main)
 target_compile_options(mdh_tests PRIVATE ${MDH_WARNING_FLAGS})
