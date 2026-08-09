@@ -183,6 +183,10 @@ void OrderEntryGateway::connection_writer_loop(Connection& conn, std::stop_token
 }
 
 void OrderEntryGateway::route_event(const ExchangeEvent& event) {
+    if (options_.extra_event_sink) {
+        options_.extra_event_sink(event); // e.g. market-data publishing -- see its own doc comment
+    }
+
     auto reports = to_execution_reports(event);
     if (reports.empty()) {
         return; // e.g. a Book* event -- see to_execution_reports()'s own doc comment

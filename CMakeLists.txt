@@ -32,6 +32,55 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS OFF)
 FetchContent_MakeAvailable(googletest)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# ── cpp-httplib + nlohmann/json (Milestone 12: UI gateway only) ────────────
+# Both are single-header, MIT-licensed, and used nowhere except
+# include/ui_gateway/ + apps/trading_server/ -- every earlier milestone's
+# hand-rolled TCP/UDP wire protocols are completely untouched by this;
+# see include/ui_gateway/ui_gateway.hpp's own class comment for why a
+# library was chosen here instead of hand-rolling HTTP/WebSocket framing
+# the way this project hand-rolled everything else.
+set(CMAKE_EXPORT_COMPILE_COMMANDS OFF) # same _deps/clangd reasoning as googletest above
+FetchContent_Declare(
+    httplib
+    URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.18.5.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP ON
+)
+FetchContent_MakeAvailable(httplib)
+
+FetchContent_Declare(
+    nlohmann_json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+    DOWNLOAD_EXTRACT_TIMESTAMP ON
+)
+FetchContent_MakeAvailable(nlohmann_json)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# ── Google Benchmark (Milestone 13: benchmarks/ only) ──────────────────────
+# Same FetchContent pattern as googletest/httplib/json above, and same
+# rationale as httplib: microbenchmark harness/statistics (warm-up,
+# repetition counts, mean/median/stddev) is not this milestone's teaching
+# point -- measuring the matching core, codecs, book, and SPSC queue that
+# milestones 1-12 already hand-rolled is -- so a small, standard,
+# well-regarded library is used instead of hand-rolling percentile/timing
+# machinery a second time (bench_end_to_end_latency.cpp below hand-rolls
+# only the one thing Google Benchmark's fixed-iteration model can't express
+# well: a real socket round trip's own latency distribution).
+option(MDH_BUILD_BENCHMARKS "Build benchmarks/ (requires Google Benchmark via FetchContent)" ON)
+if(MDH_BUILD_BENCHMARKS)
+    set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+    set(CMAKE_EXPORT_COMPILE_COMMANDS OFF) # same _deps/clangd reasoning as googletest above
+    FetchContent_Declare(
+        benchmark
+        URL https://github.com/google/benchmark/archive/refs/tags/v1.9.1.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP ON
+    )
+    FetchContent_MakeAvailable(benchmark)
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+endif()
+
 # ── Core library ───────────────────────────────────────────────────────────
 add_library(mdh_core
     src/protocol/encoder.cpp
@@ -92,6 +141,31 @@ if(MDH_ENABLE_TSAN)
     target_link_options(mdh_core PUBLIC -fsanitize=thread)
 endif()
 
+# ── UI gateway library (Milestone 12) ───────────────────────────────────────
+# Kept as its own target, separate from mdh_core, so that httplib/json are
+# only ever compiled into the two things that actually need them
+# (trading_server, mdh_tests) -- every other app (feed_generator,
+# market_data_replay, udp_sender) still links mdh_core alone, unchanged.
+add_library(mdh_ui_gateway
+    src/ui_gateway/ui_gateway.cpp
+)
+target_include_directories(mdh_ui_gateway PUBLIC include)
+target_link_libraries(mdh_ui_gateway PUBLIC mdh_core PRIVATE httplib nlohmann_json::nlohmann_json)
+target_compile_options(mdh_ui_gateway PRIVATE ${MDH_WARNING_FLAGS})
+
+if(MDH_ENABLE_ASAN)
+    target_compile_options(mdh_ui_gateway PUBLIC -fsanitize=address -fno-omit-frame-pointer)
+    target_link_options(mdh_ui_gateway PUBLIC -fsanitize=address)
+endif()
+if(MDH_ENABLE_UBSAN)
+    target_compile_options(mdh_ui_gateway PUBLIC -fsanitize=undefined -fno-omit-frame-pointer)
+    target_link_options(mdh_ui_gateway PUBLIC -fsanitize=undefined)
+endif()
+if(MDH_ENABLE_TSAN)
+    target_compile_options(mdh_ui_gateway PUBLIC -fsanitize=thread -fno-omit-frame-pointer)
+    target_link_options(mdh_ui_gateway PUBLIC -fsanitize=thread)
+endif()
+
 # ── Apps ───────────────────────────────────────────────────────────────────
 add_executable(feed_generator apps/feed_generator/main.cpp)
 target_link_libraries(feed_generator PRIVATE mdh_core)
@@ -104,6 +178,19 @@ target_compile_options(market_data_replay PRIVATE ${MDH_WARNING_FLAGS})
 add_executable(udp_sender apps/udp_sender/main.cpp)
 target_link_libraries(udp_sender PRIVATE mdh_core)
 target_compile_options(udp_sender PRIVATE ${MDH_WARNING_FLAGS})
+
+add_executable(trading_server apps/trading_server/main.cpp)
+target_link_libraries(trading_server PRIVATE mdh_ui_gateway)
+target_compile_options(trading_server PRIVATE ${MDH_WARNING_FLAGS})
+
+# Milestone 14's final demonstration -- links httplib/json directly (like
+# mdh_ui_gateway does) rather than through that target, since this app
+# only needs an httplib::Client to poll trading_server's REST API, never
+# the UI gateway's own server-side code -- see apps/live_strategy_demo/
+# main.cpp's own top comment.
+add_executable(live_strategy_demo apps/live_strategy_demo/main.cpp)
+target_link_libraries(live_strategy_demo PRIVATE mdh_core httplib nlohmann_json::nlohmann_json)
+target_compile_options(live_strategy_demo PRIVATE ${MDH_WARNING_FLAGS})
 
 # ── Tests ──────────────────────────────────────────────────────────────────
 enable_testing()
@@ -156,9 +243,50 @@ add_executable(mdh_tests
     tests/test_market_maker_strategy_e2e.cpp
     tests/test_cross_venue_arbitrage_strategy.cpp
     tests/test_cross_venue_arbitrage_strategy_e2e.cpp
+    tests/test_ui_gateway.cpp
+    tests/test_failure_injection_gateway.cpp
+    tests/test_failure_injection_market_data.cpp
 )
-target_link_libraries(mdh_tests PRIVATE mdh_core gtest gtest_main)
+target_link_libraries(mdh_tests PRIVATE mdh_ui_gateway httplib nlohmann_json::nlohmann_json gtest gtest_main)
 target_compile_options(mdh_tests PRIVATE ${MDH_WARNING_FLAGS})
 
 include(GoogleTest)
 gtest_discover_tests(mdh_tests)
+
+# ── Benchmarks (Milestone 13) ───────────────────────────────────────────────
+# Every number these produce is meaningless in a Debug build (see
+# docs/benchmarks.md's own note on this) -- they link exactly like mdh_tests
+# (mdh_core/mdh_ui_gateway, unmodified) but are meant to be *run* from a
+# `-DCMAKE_BUILD_TYPE=Release` build tree, never compared across build types.
+if(MDH_BUILD_BENCHMARKS)
+    # Each bench_*.cpp below ends with its own BENCHMARK_MAIN() (consistent
+    # with wanting one self-contained .cpp per benchmark, mirroring this
+    # project's one-file-per-component test convention), so link against
+    # benchmark::benchmark (the library only) rather than
+    # benchmark::benchmark_main (which supplies its own main() and would
+    # collide with BENCHMARK_MAIN()'s).
+    add_executable(bench_protocol_codec benchmarks/bench_protocol_codec.cpp)
+    target_link_libraries(bench_protocol_codec PRIVATE mdh_core benchmark::benchmark)
+    target_compile_options(bench_protocol_codec PRIVATE ${MDH_WARNING_FLAGS})
+
+    add_executable(bench_matching_engine benchmarks/bench_matching_engine.cpp)
+    target_link_libraries(bench_matching_engine PRIVATE mdh_core benchmark::benchmark)
+    target_compile_options(bench_matching_engine PRIVATE ${MDH_WARNING_FLAGS})
+
+    add_executable(bench_order_book benchmarks/bench_order_book.cpp)
+    target_link_libraries(bench_order_book PRIVATE mdh_core benchmark::benchmark)
+    target_compile_options(bench_order_book PRIVATE ${MDH_WARNING_FLAGS})
+
+    add_executable(bench_spsc_queue benchmarks/bench_spsc_queue.cpp)
+    target_link_libraries(bench_spsc_queue PRIVATE mdh_core benchmark::benchmark)
+    target_compile_options(bench_spsc_queue PRIVATE ${MDH_WARNING_FLAGS})
+
+    # Its own tiny standalone executable, not a benchmark::benchmark case --
+    # see bench_end_to_end_latency.cpp's own top-of-file comment for why a
+    # real TCP round trip's latency *distribution* (p50/p90/p99/p99.9) needs
+    # a hand-rolled sample loop instead of Google Benchmark's fixed-iteration
+    # timing model.
+    add_executable(bench_end_to_end_latency benchmarks/bench_end_to_end_latency.cpp)
+    target_link_libraries(bench_end_to_end_latency PRIVATE mdh_core)
+    target_compile_options(bench_end_to_end_latency PRIVATE ${MDH_WARNING_FLAGS})
+endif()

@@ -2,9 +2,11 @@
 
 #include <array>
 #include <chrono>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "exchange/gateway/order_entry_gateway.hpp"
@@ -289,4 +291,49 @@ TEST(OrderEntryGatewayE2e, CrossingOrdersFromTwoConnectionsEachGetTheirOwnTradeR
     server.gateway().stop();
     const auto snapshot = server.gateway().snapshot();
     EXPECT_TRUE(snapshot.instruments.empty()); // both orders fully filled -- nothing left resting
+}
+
+TEST(OrderEntryGatewayE2e, ExtraEventSinkObservesEveryEventIncludingAnonymousBookEvents) {
+    std::mutex mutex;
+    std::vector<ExchangeEvent> observed;
+    OrderEntryGatewayOptions options;
+    options.extra_event_sink = [&](const ExchangeEvent& event) {
+        std::lock_guard<std::mutex> lock(mutex);
+        observed.push_back(event);
+    };
+
+    RunningGateway server(options);
+    ASSERT_TRUE(server.started());
+    server.gateway().deposit_cash(/*account_id=*/7, /*amount=*/1'000'000);
+
+    TestClient client;
+    ASSERT_TRUE(client.connect_to(server.port()));
+    client.send(Message{new_order(/*account=*/7, /*client_id=*/1, Side::Buy, /*price=*/100, /*qty=*/10)});
+    ASSERT_TRUE(client.receive().has_value()); // Accepted -- proves the command was fully processed
+
+    server.gateway().stop(); // quiesce the matching thread before reading `observed` below
+
+    std::lock_guard<std::mutex> lock(mutex);
+    // Unlike to_execution_reports() (never called from any client
+    // connection because there is none subscribed to market data in this
+    // test), extra_event_sink must have seen the resulting BookOrderAdded
+    // in addition to the account-addressed OrderAccepted -- proving it
+    // really does see the raw, untranslated event stream, not just
+    // whatever route_event() forwards to a connection.
+    bool saw_order_accepted = false;
+    bool saw_book_order_added = false;
+    for (const auto& event : observed) {
+        std::visit(
+            [&](const auto& ev) {
+                using T = std::decay_t<decltype(ev)>;
+                if constexpr (std::is_same_v<T, OrderAccepted>) {
+                    saw_order_accepted = true;
+                } else if constexpr (std::is_same_v<T, BookOrderAdded>) {
+                    saw_book_order_added = true;
+                }
+            },
+            event);
+    }
+    EXPECT_TRUE(saw_order_accepted);
+    EXPECT_TRUE(saw_book_order_added);
 }

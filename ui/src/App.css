@@ -1,0 +1,271 @@
+.app {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 1.25rem 1.5rem 3rem;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+}
+
+.app-header h1 {
+  font-size: 1.1rem;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--buy);
+  box-shadow: 0 0 8px var(--buy);
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.error-banner {
+  background: rgba(229, 72, 77, 0.15);
+  border: 1px solid var(--sell);
+  color: var(--sell);
+  padding: 0.6rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.selector-row {
+  display: flex;
+  gap: 2rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.selector-label {
+  display: block;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 0.35rem;
+}
+
+.pill-group {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.pill {
+  border-radius: 999px;
+  padding: 0.35rem 0.9rem;
+  font-family: var(--font-mono);
+}
+
+.pill-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) minmax(280px, 1fr) minmax(320px, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+}
+
+.order-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.order-entry label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.side-toggle {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.side-btn {
+  flex: 1;
+  font-weight: 600;
+}
+
+.side-btn.side-active.side-buy {
+  background: var(--buy);
+  border-color: var(--buy);
+  color: #fff;
+}
+
+.side-btn.side-active.side-sell {
+  background: var(--sell);
+  border-color: var(--sell);
+  color: #fff;
+}
+
+.submit-btn {
+  font-weight: 600;
+  margin-top: 0.3rem;
+}
+
+.submit-btn.side-buy {
+  border-color: var(--buy);
+  color: var(--buy);
+}
+
+.submit-btn.side-sell {
+  border-color: var(--sell);
+  color: var(--sell);
+}
+
+.status-line {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin: 0;
+}
+
+.cash-line {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.4rem 0;
+  margin-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+}
+
+.side-buy-text {
+  color: var(--buy);
+}
+
+.side-sell-text {
+  color: var(--sell);
+}
+
+.book-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.book-side th, .book-side td {
+  padding: 0.25rem 0.4rem;
+}
+
+.price.bid {
+  color: var(--buy);
+}
+
+.price.ask {
+  color: var(--sell);
+}
+
+.quantity {
+  font-weight: 600;
+}
+
+.actions {
+  display: flex;
+  gap: 0.3rem;
+}
+
+.actions button {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+}
+
+.replace-row input {
+  width: 80px;
+  display: inline-block;
+  margin-right: 0.4rem;
+}
+
+.replace-row button {
+  margin-right: 0.3rem;
+}
+
+.state-badge {
+  font-size: 0.7rem;
+  padding: 0.15rem 0.45rem;
+  border-radius: 999px;
+  background: var(--bg-panel-alt);
+  border: 1px solid var(--border);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.state-live, .state-partiallyfilled {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.state-filled {
+  border-color: var(--buy);
+  color: var(--buy);
+}
+
+.state-cancelled, .state-rejected {
+  border-color: var(--sell);
+  color: var(--sell);
+}
+
+.activity-feed {
+  margin-top: 1rem;
+}
+
+.activity-list {
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.activity-entry {
+  display: flex;
+  gap: 0.6rem;
+  padding: 0.15rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.activity-time {
+  flex-shrink: 0;
+}
+
+@media (max-width: 1000px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -10,12 +10,20 @@ namespace; neither depends on the other's types. If you're looking for how
 `market_data_replay` or `udp_sender` work, see the top-level `README.md`
 instead — this document is scoped entirely to `mdh::exchange`.
 
-It walks through the eleven milestones built so far in the order they were
+It walks through the fourteen milestones built so far in the order they were
 built, then traces one order through the whole stack end to end, then gives
 a directory-by-directory component reference. (Milestones 10-11 live under
 `trader/strategies/`, one level above everything else this document
 otherwise covers — see the "Milestones 10-11" section right after the
-numbered list below for those two specifically.)
+numbered list below for those two specifically. Milestone 12 -- the UI
+gateway -- lives under `ui_gateway/`, `apps/trading_server/`, and the
+separate `ui/` React project; see its own section right after "Milestones
+10-11" below. Milestones 13-14 -- benchmarks, failure injection, and the
+final live demonstration -- live under `benchmarks/`, `tests/
+test_failure_injection_*.cpp`, and `apps/live_strategy_demo/`; see their own
+sections right after Milestone 12 below, and `docs/benchmarks.md`/
+`docs/failure_injection.md`/`docs/live_demo.md` for the full detail this
+document only summarizes.)
 
 ---
 
@@ -238,6 +246,160 @@ is unit-tested (`test_strategy_runtime.cpp`) against synthetic
 `protocol::Event` values the same way `replay::apply_frame_result()`'s own
 tests are, so it is proven correct on its own even though nothing yet
 drives it from a live socket.
+
+---
+
+## Milestone 12 -- the UI gateway (`ui_gateway/`, `apps/trading_server/`, `ui/`)
+
+The first milestone to close two gaps this document's own "Integration
+status" section (below) had documented as open since Milestone 6: there was
+no long-running gateway process outside of tests, and `MarketDataPublisher`
+was never wired into one. `apps/trading_server/main.cpp` is that process --
+it constructs a real `OrderEntryGateway` with a new, purely additive
+`OrderEntryGatewayOptions::extra_event_sink` hook (invoked synchronously from
+`route_event()`, on the matching thread, alongside `RiskGatedEngine`'s own
+`Ledger` wiring) that fans every event out to a real `MarketDataPublisher`,
+publishing real UDP frames on a configurable port -- exactly the wiring
+Milestone 6 itself proved correct in isolation (`test_market_data_e2e.cpp`)
+but never connected to live traffic until now.
+
+`ui_gateway::UiGateway` is the new piece consuming that feed: a persistent
+background thread listens on that same UDP port and reconstructs a live
+`book::BookManager`, reusing the trader side's own
+`replay::apply_frame_result()` pipeline unchanged (the same one
+`market_data_replay --listen` already exercises against synthetic UDP --
+this is a second, independent, real caller of it, just one that never stops
+on idle). Each pre-seeded demo account gets exactly the same
+`TraderRiskGatedOms` + `OrderEntryClient` pairing a Milestone 10-11 strategy
+uses, connected back to the gateway's own TCP port -- `UiGateway` adds zero
+new trading logic; it is purely a protocol adapter. That adapter is REST +
+Server-Sent Events, built on `cpp-httplib` (a small, vendored, header-only
+library -- the first third-party dependency this project has taken on,
+justified in `ui_gateway.hpp`'s own class comment: HTTP/1.1 framing and a
+browser dashboard's transport are not this milestone's teaching point the way
+every other hand-rolled wire format in this project was for *its* milestone).
+SSE, not WebSocket, for the live push channel, for the same reason: cpp-httplib
+has no WebSocket support, and every standalone C++ WebSocket library
+evaluated was either unproven or a much larger dependency footprint than a
+read-mostly dashboard warrants -- SSE needs nothing beyond chunked HTTP
+responses cpp-httplib already provides, and the browser's native
+`EventSource` needs zero client-side dependencies either. `SseHub` (a small,
+mutex/condition-variable-guarded, per-topic "latest value wins" pub/sub, not
+a guaranteed-delivery log -- see its own class comment for the tradeoff) is
+what `/api/stream` actually reads from; `broadcast_book()`/`broadcast_order()`
+are its only two publishers.
+
+`ui/` is a separate React + Vite + TypeScript project (`npm create vite --
+--template react-ts`) consuming that REST/SSE surface -- an order book view,
+an order-entry form, a positions/cash panel, an orders table with
+cancel/replace, and a live activity feed, all kept in sync by one shared
+`EventSource` plus the REST calls a *newly selected* account/instrument needs
+to hydrate (SSE only pushes deltas; it was never meant to replace an initial
+fetch). `npm run build`'s output (`ui/dist`) is served directly by
+`trading_server` itself via `UiGatewayOptions::static_files_dir`
+(`--static-dir`), so the whole system -- exchange, gateway, market data, UI
+API, and dashboard -- is one process a browser can point at with nothing
+else running; `npm run dev`'s Vite dev server proxies `/api/*` to
+`trading_server` instead, for a fast frontend iteration loop.
+
+`tests/test_ui_gateway.cpp` is this milestone's loop-closing test -- a real
+`OrderEntryGateway` + `MarketDataPublisher` + `UiGateway`, driven entirely
+through `httplib::Client` against the actual REST/SSE surface, proving (among
+other things) that a resting order becomes visible on `GET /api/book/:id`
+only because a real UDP frame really was published and received, and that
+`/api/stream` really does deliver a live event to a subscribed client after
+an order is submitted. Two genuine concurrency bugs surfaced during this
+milestone's own manual end-to-end testing before that test file existed --
+see `docs/end_to_end_architecture.md`'s "Verified baseline as of Milestone
+12" section for both (a `bind_to_any_port`/`bind_to_port` mixup, and a
+`UiGateway::stop()` deadlock with two independent causes).
+
+---
+
+## Milestone 13 -- Benchmarks (`benchmarks/`)
+
+The performance half of the milestone `docs/current_system_assessment.md`
+originally scoped as "allocation profiling, decode throughput benchmarks,
+end-to-end latency (p50/p99/p99.9), comparison of alternative book
+representations." Five Google-Benchmark-based (plus one hand-rolled)
+executables, added via a new `MDH_BUILD_BENCHMARKS` CMake option
+(`FetchContent`, same pattern as `googletest`/`cpp-httplib`/`nlohmann-json`):
+`bench_protocol_codec` (market-data and order-entry encode/decode
+throughput), `bench_matching_engine` (`MatchingEngine::process()` for
+resting/crossing/cancel/replace), `bench_order_book` (the trader-side
+reconstructed `book::OrderBook`'s add/cancel/modify/query cost at varying
+depth), `bench_spsc_queue` (single- and two-thread `SpscQueue` throughput),
+and `bench_end_to_end_latency` (a real, hand-rolled loopback-TCP round trip
+against a real `OrderEntryGateway`, since Google Benchmark's fixed-iteration
+model can't express a latency *distribution* the way this one needed to).
+
+The single most useful finding, identified from a real measurement plus a
+source read rather than assumed: every hot-path component measured here
+(codec, matching engine, trader-side book, SPSC queue) costs tens to low
+thousands of nanoseconds per operation, while the real, live, real-TCP
+order-entry round trip measures ~0.7-1.3 ms at p50/mean -- three orders of
+magnitude larger, traced directly to `OrderEntryGateway::
+connection_writer_loop()`'s deliberate 1 ms `sleep_for` poll interval, not
+to anything slow inside matching/risk/ledger. See `docs/benchmarks.md` for
+every number, the machine they were measured on, and the full reasoning
+behind each one (including the real `PauseTiming()`/`ResumeTiming()`
+measurement-artifact caveat several of the matching-engine/book benchmarks
+have to account for).
+
+---
+
+## Milestone 14 -- Failure injection & the live demonstration
+
+The final milestone: hardening proof (failure injection against the two
+live network-facing components built so far) plus a real, end-to-end,
+running demonstration of the whole system.
+
+**Failure injection** (`tests/test_failure_injection_gateway.cpp`,
+`tests/test_failure_injection_market_data.cpp`) drives the *live*
+`OrderEntryGateway` over real TCP sockets and the *live*
+`UiGateway::market_data_loop()` over real UDP datagrams with deliberately
+malformed/adversarial/abrupt input -- unrecognized type bytes, corrupted
+payload fields under an otherwise-valid header, truncated frames/datagrams,
+abrupt disconnects, a slow non-reading client overflowing its outbound
+queue, a flood of non-protocol noise, corrupt magic numbers, sequence gaps,
+and duplicated packets -- and asserts, for every one, that (1) the
+component itself never crashes or hangs, and (2) a fault on one
+connection/datagram never degrades or blocks any *other* connection/packet.
+This is a strictly stronger claim than the existing unit-level decode-error
+tests (`test_order_entry_decode_errors.cpp`, `test_decoder_errors.cpp`)
+already made: those prove the codec classifies malformed bytes correctly in
+isolation; these prove the live, threaded, buffering components built on
+top of it behave correctly when that malformed input arrives over a real
+transport, interleaved with real traffic. One real, previously undocumented
+behavioral difference was found and is now recorded: the live UI gateway's
+market-data path does not halt on a sequence gap the way offline
+`replay::run_replay()` does, because `market_data_loop()` discards
+`apply_frame_result()`'s stop-signal return value -- see
+`docs/failure_injection.md` for the full fault matrix, the reasoning behind
+each one, and confirmation that all 11 of these tests pass clean under
+ThreadSanitizer too.
+
+**The live demonstration** (`apps/live_strategy_demo/`, new) is what
+finally closes the specific gap this document's own "Integration status"
+section (below) had listed as still open since Milestone 10: a real
+`MarketMakerStrategy`, trading through a real `TraderRiskGatedOms` +
+`OrderEntryClient` over a real TCP connection to a real, running
+`trading_server`, quoting off a book it gets by polling `UiGateway`'s own
+`GET /api/book/:id` REST endpoint (a deliberate, documented simplification
+for a demo binary -- see that app's own top comment for why this was chosen
+over standing up a second UDP market-data subscriber, which would be new
+production networking work, not a demo). It trades as its own dedicated
+account (9001, pre-seeded by `trading_server` alongside its existing UI
+demo accounts but deliberately never one of them -- see that app's own
+comment on the `OrderEntryGateway::routes_` collision this avoids), so its
+resting quotes are visible to every dashboard viewer (the book is public)
+while a human -- or, in this demonstration, `curl` exercising the exact same
+REST surface a human clicking the dashboard would use -- trades against it
+for real. `docs/live_demo.md` walks through one complete real run: seeding
+an initial market, the strategy quoting inside it, a demo account crossing
+both sides of the strategy's quotes, both processes' independently-computed
+fill accounting agreeing exactly, and a real (headless Chrome) screenshot of
+the live dashboard reflecting all of it.
 
 ---
 
@@ -653,6 +815,7 @@ Exchange-side test files, by milestone:
 | 9 — trader-side positions/risk | `test_position_tracker.cpp`, `test_trader_risk_engine.cpp` (pure logic, synthetic fills/checks), `test_trader_risk_gated_oms.cpp` (composition, fake sender), `test_trader_risk_gated_oms_e2e.cpp` (loop-closing, production risk-gated OMS against a real Milestone 7 gateway, including both independent risk layers rejecting on their own) |
 | 10 — strategy runtime + market maker | `test_strategy_runtime.cpp` (pure dispatch logic, synthetic events), `test_market_maker_strategy.cpp` (composition, fake sender), `test_market_maker_strategy_e2e.cpp` (loop-closing, a real market maker quoting/getting filled/requoting over a real Milestone 7 gateway) |
 | 11 — additional strategies, two-venue simulation | `test_cross_venue_arbitrage_strategy.cpp` (composition, two fake senders), `test_cross_venue_arbitrage_strategy_e2e.cpp` (the "two-venue simulation" -- two complete, independent exchange stacks, one arbitrage strategy trading both over real TCP) |
+| 12 — UI gateway | `test_order_entry_gateway_e2e.cpp` (new cases covering `extra_event_sink`), `test_ui_gateway.cpp` (loop-closing, a real gateway + `MarketDataPublisher` + `UiGateway`, driven through `httplib::Client` against the real REST/SSE surface) |
 
 `test_matching_pipeline.cpp`, `test_risk_gated_engine.cpp`,
 `test_order_entry_gateway_e2e.cpp`, `test_oms_gateway_e2e.cpp`,
@@ -661,10 +824,19 @@ Exchange-side test files, by milestone:
 from running under TSan — all exercise real, multi-threaded traffic
 (`MatchingPipeline`'s producer/matching-thread split, one or more gateways'
 per-connection reader/writer threads plus their matching threads, and one or
-more OMS clients' own reader threads). All 337 tests as of Milestone 11 pass
-clean under a debug build, an ASan+UBSan build, and a TSan build alike. TSan
-has now caught two real, if narrow, bugs across this project's development,
-both in test infrastructure rather than production code:
+more OMS clients' own reader threads). All 351 tests as of Milestone 12 pass
+clean under a debug build, an ASan+UBSan build, and a TSan build alike (this
+includes the 13 new tests in `test_ui_gateway.cpp`, themselves genuinely
+multi-threaded: a gateway's accept/reader/writer/matching threads, a
+`UiGateway`'s own market-data thread and per-session `OrderEntryClient`
+reader threads, and cpp-httplib's own HTTP worker threads, all running
+concurrently). TSan has now caught two real, if narrow, bugs across this
+project's development, both in test infrastructure rather than production
+code (a third, real but non-TSan-detected concurrency bug from Milestone 12 —
+a `std::jthread`/`std::stop_token` mixup causing `UiGateway::stop()` to hang —
+is documented in `docs/end_to_end_architecture.md`'s Milestone 12 section
+instead, since it was a deadlock, not a data race, and TSan does not detect
+deadlocks):
 - During Milestone 8: both gateway e2e tests were calling
   `OrderEntryGateway::snapshot()` — which, like `MatchingPipeline::snapshot()`,
   is only safe once the matching thread has been joined — while the gateway
@@ -684,16 +856,24 @@ both in test infrastructure rather than production code:
 
 ## Integration status: what's wired together, and what isn't yet
 
-As of Milestone 11, real client traffic can flow all the way from a TCP
-socket through risk-gated matching and back out to four different kinds of
+As of Milestone 12, real client traffic can flow all the way from a TCP
+socket through risk-gated matching and back out to five different kinds of
 client (a hand-rolled test client, the production `OrderEntryClient` +
 `OrderManagementSystem`, that same pair further wrapped in
 `TraderRiskGatedOms` for a second, independent trader-side risk check and
-live position/P&L tracking, or that `TraderRiskGatedOms` driven by a
+live position/P&L tracking, that `TraderRiskGatedOms` driven by a
 `strategies::MarketMakerStrategy`/`CrossVenueArbStrategy` instead of a test
-calling `submit_new_order()` directly) — see Milestones 7–11 above and their
-respective e2e tests. What's still **not** assembled into one live call path
-or app:
+calling `submit_new_order()` directly, or that same `TraderRiskGatedOms`
+driven by an HTTP request through the new `ui_gateway::UiGateway`) — see
+Milestones 7–12 above and their respective e2e tests. As of this same
+milestone, there is also a real long-running process outside of tests --
+`apps/trading_server/main.cpp` — and `MarketDataPublisher` is wired into its
+matching thread for real, closing the two items this section had previously
+listed as the most-open gaps. As of Milestone 14, a sixth kind of client
+exists too: `apps/live_strategy_demo/`'s real `MarketMakerStrategy`, trading
+against a real, running `trading_server` -- see that milestone's own section
+above and `docs/live_demo.md` for a full real run. What's still **not**
+assembled into one live call path or app:
 
 - `MatchingPipeline` (Milestone 4) itself still drives a bare
   `MatchingEngine` directly *by default* — `RiskGatedEngine` (Milestone 5)
@@ -705,38 +885,38 @@ or app:
   gateway's matching thread — journaling (Milestone 3) is exercised by its
   own tests and by `run_command_replay()` against journal files built
   directly via `encode_command`/`CommandJournalWriter`, not against live
-  gateway traffic.
-- There is no exchange-side equivalent yet of `market_data_replay`'s
-  `main.cpp` — no long-running app process hosts `OrderEntryGateway` against
-  a real port outside of tests (every gateway in this codebase today is
-  constructed, driven, and torn down within a single test).
-- `MarketDataPublisher` (Milestone 6) is proven correct both in isolation
-  and, via `test_market_data_e2e.cpp`, end to end against the trader side's
-  real replay pipeline — but nothing currently binds it into the gateway's
-  matching thread either. A live system would fan the matching thread's
-  events out to `Ledger::sink()` *and* `MarketDataPublisher::sink()` *and*
-  `CommandJournalWriter::write()` simultaneously (the gateway today only
-  wires up the first, via `RiskGatedEngine`, which owns the ledger); today
-  each of the other two only ever receives events from its own tests.
-- `strategies::StrategyRuntime` (Milestone 10) is proven correct in
-  isolation, against synthetic `protocol::Event` values feeding a
-  `book::BookManager`, but nothing binds it to a live UDP feed either —
-  that would need the `MarketDataPublisher` wiring immediately above to
-  exist first. `MarketMakerStrategy` and `CrossVenueArbStrategy`'s own e2e
-  tests instead drive their `on_book_update()`/`on_venue_a_update()`/
-  `on_venue_b_update()` methods directly, from a `book::OrderBook` the test
-  itself mirrors from a liquidity provider's own confirmed orders — see
-  this document's own "Milestones 10-11" section above for why that is a
-  legitimate proof of the strategy logic and the OMS/risk/gateway plumbing
-  underneath it, short of the live-feed wiring specifically.
+  gateway traffic. `trading_server` (Milestone 12) fans matching-thread
+  events out to `Ledger::sink()` (via `RiskGatedEngine`) *and*
+  `MarketDataPublisher::sink()` (via the new `extra_event_sink` hook) but
+  still not to a `CommandJournalWriter` -- a live gateway process still
+  keeps no durable command journal of its own traffic.
+- `strategies::StrategyRuntime` (Milestone 10) itself -- the dispatch class,
+  literally -- is still proven correct only in isolation, against synthetic
+  `protocol::Event` values feeding a `book::BookManager`; nothing calls
+  `StrategyRuntime::on_event()` from a live UDP feed. What Milestone 14's
+  `apps/live_strategy_demo` *does* close is the narrower, more concretely
+  useful gap: a real `MarketMakerStrategy` (the strategy `StrategyRuntime`
+  would otherwise dispatch to) now does trade, live, against a real running
+  `trading_server`, driven by book snapshots it polls from `UiGateway`'s own
+  REST API rather than by `StrategyRuntime` reacting to raw UDP frames — see
+  that milestone's own section above for exactly why that specific,
+  narrower substitution was the right scope for a demo binary. Binding
+  `StrategyRuntime` itself directly to the raw UDP feed (so a strategy could
+  react to a book update within microseconds of the packet arriving, not
+  within one REST-poll interval) remains open, real, future work.
 
 This is intentional, incremental milestone scope, not an oversight — each
 piece is built and proven correct on its own (and, as of Milestone 6, proven
 correct in combination with the trader side's replay pipeline; as of
 Milestones 7–11, proven correct end to end over real TCP connections between
 real gateways and real clients, including two independent gateways at once
-as of Milestone 11) before being composed further. See
-`docs/end_to_end_architecture.md` for the target composition and the
-still-to-come milestones (the UI gateway, benchmarks, failure injection, and
-a long-running gateway process outside of tests). This document should be
-updated as that wiring happens.
+as of Milestone 11; as of Milestone 12, proven correct end to end over a
+real long-running process, real UDP market data, and a real browser
+dashboard; as of Milestone 14, proven resilient to a real, documented matrix
+of network-level faults on both live components, and demonstrated once, for
+real, end to end, with a real strategy, a real counterparty, and a real
+browser screenshot) before being composed further. See
+`docs/end_to_end_architecture.md` for the full milestone table,
+`docs/benchmarks.md` for performance, `docs/failure_injection.md` for the
+fault matrix, and `docs/live_demo.md` for the final run. This document
+should be updated as any further wiring happens.

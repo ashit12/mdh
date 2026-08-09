@@ -13,6 +13,7 @@
 
 #include "common/spsc_queue.hpp"
 #include "exchange/core/commands.hpp"
+#include "exchange/core/event_sink.hpp"
 #include "exchange/core/events.hpp"
 #include "exchange/ledger/ledger.hpp"
 #include "exchange/matching/matching_engine.hpp"
@@ -76,7 +77,9 @@
 //   connection's own outbound SpscQueue, non-blocking (try_push()) --
 //   this is why every connection gets a queue instead of route_event()
 //   calling TcpSocket::write() directly, which would make the matching
-//   thread's throughput hostage to one slow client's socket.
+//   thread's throughput hostage to one slow client's socket. route_event()
+//   also invokes OrderEntryGatewayOptions::extra_event_sink (if set) with
+//   the raw, untranslated event -- see its own doc comment (Milestone 12).
 // - Session-to-account binding is opportunistic, not part of a handshake:
 //   a connection is unrouted (absent from routes_) until its first
 //   decoded client message arrives, since every client -> gateway message
@@ -100,6 +103,23 @@ struct OrderEntryGatewayOptions {
 
     // Passed straight through to TcpSocket::listen()'s backlog parameter.
     int accept_backlog = 16;
+
+    // Milestone 12: an optional second observer of every ExchangeEvent this
+    // gateway's matching thread produces, invoked from route_event()
+    // alongside (never instead of) the existing per-connection wire
+    // routing -- see route_event()'s own doc comment for exactly where.
+    // Unlike to_execution_reports() (which only ever looks at the four
+    // account-addressed event types), this sees *every* event, including
+    // the anonymous Book*/TradeExecuted ones -- e.g. wiring in
+    // market_data::MarketDataPublisher::sink(), the same seam
+    // exchange::ledger::Ledger::sink() and this gateway's own route_event()
+    // already use, so a live UI/market-data feed can finally observe a real
+    // running gateway (see apps/trading_server) instead of only ever being
+    // fed by a test. Defaults to nullptr (a no-op, checked before calling)
+    // -- every existing caller of this struct is completely unaffected.
+    // Runs on the matching thread, synchronously, under the exact same
+    // "must not block" constraint route_event() itself documents.
+    EventSink extra_event_sink;
 };
 
 class OrderEntryGateway {

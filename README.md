@@ -1,18 +1,37 @@
-# mdh — Market Data Handler & Limit Order Book Reconstruction
+# mdh — Market Data Handler, Matching Engine, and Live Trading Stack
 
-A C++20 application that consumes a custom binary market-data protocol
-over a file or live UDP, validates message sequencing, reconstructs an
-in-memory limit order book, supports deterministic replay, and reports
-measured correctness and performance statistics.
+A C++20 project that started as a market-data feed handler (this document,
+Milestones 1-4 below) and grew, across a second, much larger arc of
+milestones, into a complete simulated exchange: an authoritative matching
+engine, pre-trade risk, a TCP order-entry gateway, a trader-side OMS/risk/
+strategy stack, a REST + Server-Sent-Events UI gateway with a React
+dashboard, benchmarks, and failure-injection testing.
+
+**This document only covers the original market-data-handler scope
+(Milestones 1-4 below) and is kept as originally written, for history.**
+The project's *current* full scope -- the matching engine, gateway, trader
+stack, UI, benchmarks, and failure injection (14 milestones in total) -- is
+documented in `docs/exchange_flow.md` (a code-reading walkthrough),
+`docs/end_to_end_architecture.md` (the full system diagram and milestone
+table), `docs/benchmarks.md`, `docs/failure_injection.md`, and
+`docs/live_demo.md` (a real, end-to-end run of the whole stack). This
+top-level README's own *Planned Milestones* section below still lists the
+original 6-milestone plan for the feed-handler scope specifically; see the
+note directly above that section for how those milestones map onto (and
+were absorbed into, under new numbers) the larger project's own Milestones
+13-14.
 
 **This is a simulated, ITCH/OUCH-inspired protocol built as a systems
 programming portfolio project, not a production exchange implementation.**
-It has no matching engine and no persistence yet — those are explicitly
-out of scope for now (see *Planned Milestones*).
 
 ---
 
-## Current Milestone: 4 of 6
+## Current Milestone (feed-handler scope, this document): 4 of 6
+
+**For the full project's current status (14 milestones, all complete), see
+`docs/end_to_end_architecture.md`'s milestone table instead.** The
+"Current Milestone"/"Planned Milestones" framing below describes only the
+scope this specific document was written for.
 
 Milestone 1 was a complete, self-contained vertical slice: binary message
 definitions, an encoder/decoder, a binary event-file writer, deterministic
@@ -132,25 +151,49 @@ include/          public headers, mirrors src/
   exchange/        the exchange side: authoritative matching engine, command
                    journal + replay, command sequencer + matching pipeline,
                    ledger + pre-trade risk -- see docs/exchange_flow.md
+  ui_gateway/      REST + Server-Sent-Events front door onto a running
+                   exchange (milestone 12) -- see docs/exchange_flow.md's
+                   "Milestone 12" section
 src/               implementations for the above
 apps/
   feed_generator/      generates a deterministic binary event file
   udp_sender/          streams an event file over UDP, batched into packets
   market_data_replay/  replays a file OR listens live on a UDP port;
                        can write/load a book-state snapshot either way
-tests/             GoogleTest suite (103 tests as of milestone 4; plus a
-                   separate, growing exchange-side suite -- see
-                   docs/exchange_flow.md)
+  trading_server/      long-running process wiring the exchange gateway,
+                       market-data publishing, and the UI gateway together
+                       (milestone 12) -- the only app here meant to keep
+                       running, not exit after one file/stream
+  live_strategy_demo/  milestone 14: a real MarketMakerStrategy trading
+                       against a running trading_server -- see
+                       docs/live_demo.md
+ui/                React + Vite + TypeScript dashboard (milestone 12)
+                   consuming trading_server's REST/SSE API -- see ui/README.md
+benchmarks/        milestone 13: Google-Benchmark-based throughput/latency
+                   benchmarks for the protocol codec, matching engine,
+                   trader-side book, and SPSC queue, plus a hand-rolled real
+                   TCP end-to-end latency-distribution harness -- see
+                   docs/benchmarks.md
+tests/             GoogleTest suite (362 tests as of milestone 14; see
+                   docs/exchange_flow.md for the exchange-side/UI-gateway
+                   breakdown by milestone, and docs/failure_injection.md for
+                   the milestone-14 fault-injection tests specifically)
 docs/
   protocol.md               detailed wire-format spec (byte offsets, error
                              taxonomy, packet header layout, snapshot format)
-  exchange_flow.md          exchange-side code walkthrough: architecture,
-                             a worked end-to-end order trace, and a
-                             component-by-component reference
-  end_to_end_architecture.md  the planned trader-side + exchange-side
+  exchange_flow.md          exchange-side + UI-gateway code walkthrough:
+                             architecture, a worked end-to-end order trace,
+                             and a component-by-component reference
+  end_to_end_architecture.md  the trader-side + exchange-side + UI-gateway
                              system shape, and why the two books can't
                              share a class
   current_system_assessment.md  point-in-time gap analysis snapshot
+  benchmarks.md              milestone 13: real, measured throughput/latency
+                             numbers with methodology and interpretation
+  failure_injection.md       milestone 14: the fault matrix against the live
+                             TCP gateway and live UDP market-data listener
+  live_demo.md               milestone 14: one real, end-to-end run of the
+                             whole stack, with a live dashboard screenshot
 ```
 
 ---
@@ -635,8 +678,24 @@ claim (see *Milestone 5* below for planned formal benchmarking).
 
 ## Planned Milestones
 
-5. Allocation profiling, decode throughput benchmarks, end-to-end latency
+**Update: both milestones below are done** -- not under these numbers, though.
+Once the project grew a matching engine, a gateway, and a trader-side stack
+(see the top of this document), milestone numbering restarted from 1 for that
+much larger arc (`docs/exchange_flow.md`), and these two originally-planned
+feed-handler milestones were carried out, expanded in scope, and completed as
+that arc's **Milestones 13 and 14**:
+
+5. ~~Allocation profiling, decode throughput benchmarks, end-to-end latency
    (p50/p99/p99.9), burst-load tests, CPU affinity where supported,
-   comparison of alternative book representations.
-6. Fault injection: corrupt messages, truncated packets, duplication,
-   packet loss, delayed consumer, recovery validation.
+   comparison of alternative book representations.~~ Done as Milestone 13 --
+   see `docs/benchmarks.md` for real, measured numbers (protocol codec,
+   matching engine, trader-side book, SPSC queue, and a real TCP
+   end-to-end round trip's own latency distribution).
+6. ~~Fault injection: corrupt messages, truncated packets, duplication,
+   packet loss, delayed consumer, recovery validation.~~ Done as part of
+   Milestone 14 -- see `docs/failure_injection.md` for the fault matrix
+   against the live TCP order-entry gateway and the live UDP market-data
+   listener (this document's own feed-handler-only scope predates both of
+   those components, which is why this milestone grew well beyond what was
+   originally planned here). Milestone 14 also includes a final, real,
+   end-to-end demonstration -- see `docs/live_demo.md`.
