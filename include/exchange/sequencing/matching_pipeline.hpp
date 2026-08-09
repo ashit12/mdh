@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <stop_token>
 #include <thread>
 
@@ -70,7 +71,27 @@ struct MatchingPipelineOptions {
 
 class MatchingPipeline {
 public:
-    explicit MatchingPipeline(EventSink sink, const MatchingPipelineOptions& options = {});
+    // A pluggable substitute for calling engine_.process() directly on the
+    // matching thread (Milestone 7) -- lets a caller wrap the bare
+    // MatchingEngine with additional behavior (e.g.
+    // exchange::risk::RiskGatedEngine, Milestone 5, composing risk-checking
+    // and ledger updates around it) while keeping every threading/queueing
+    // guarantee this class already provides completely unchanged. Same
+    // signature as MatchingEngine::process() and RiskGatedEngine::process()
+    // themselves, so either one can be adapted into this type with nothing
+    // more than a lambda that forwards the call -- see the constructor's
+    // own doc comment for how the default (no processor supplied) case
+    // preserves exactly today's behavior.
+    using Processor = std::function<void(const ExchangeCommand&, const EventSink&)>;
+
+    // `processor`, if supplied, is invoked on the matching thread in place
+    // of engine_.process() for every command dequeued -- see the Processor
+    // alias comment above. Defaults to nullptr, meaning "call
+    // engine_.process() directly," so every existing caller that never
+    // passes one (i.e. every caller before this parameter existed) sees
+    // exactly the same behavior as before.
+    explicit MatchingPipeline(EventSink sink, const MatchingPipelineOptions& options = {},
+                               Processor processor = nullptr);
 
     // Requests the matching thread stop (after draining, see stop()) and
     // joins it.
@@ -120,6 +141,7 @@ private:
     CommandSequencer sequencer_; // producer-thread-only, see class-level comment
     SpscQueue<ExchangeCommand> queue_;
     MatchingEngine engine_; // matching-thread-only while running; see snapshot()'s precondition
+    Processor processor_;   // see the Processor alias comment above; matching-thread-only, like engine_
 
     std::atomic<std::size_t> commands_processed_{0}; // written by the matching thread only
     std::atomic<std::size_t> commands_rejected_{0};  // written by the producer thread only (submit())

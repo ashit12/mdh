@@ -4,8 +4,13 @@
 
 namespace mdh::exchange::sequencing {
 
-MatchingPipeline::MatchingPipeline(EventSink sink, const MatchingPipelineOptions& options)
-    : sink_(std::move(sink)), queue_(options.queue_capacity), options_(options) {
+MatchingPipeline::MatchingPipeline(EventSink sink, const MatchingPipelineOptions& options, Processor processor)
+    : sink_(std::move(sink)), queue_(options.queue_capacity),
+      processor_(processor ? std::move(processor)
+                            : Processor([this](const ExchangeCommand& command, const EventSink& event_sink) {
+                                  engine_.process(command, event_sink);
+                              })),
+      options_(options) {
     matching_thread_ = std::jthread([this] {
         const auto token = stop_source_.get_token();
         while (true) {
@@ -20,7 +25,7 @@ MatchingPipeline::MatchingPipeline(EventSink sink, const MatchingPipelineOptions
             if (options_.matching_delay.count() > 0) {
                 std::this_thread::sleep_for(options_.matching_delay); // simulated slow matching core, see MatchingPipelineOptions
             }
-            engine_.process(*command, sink_);
+            processor_(*command, sink_);
             commands_processed_.fetch_add(1, std::memory_order_relaxed);
         }
     });

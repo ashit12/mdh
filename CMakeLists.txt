@@ -44,6 +44,7 @@ add_library(mdh_core
     src/book/order_book.cpp
     src/book/book_manager.cpp
     src/net/udp_socket.cpp
+    src/net/tcp_socket.cpp
     src/net/packet.cpp
     src/net/udp_receiver.cpp
     src/net/udp_listener.cpp
@@ -61,6 +62,9 @@ add_library(mdh_core
     src/exchange/risk/risk_engine.cpp
     src/exchange/risk/risk_gated_engine.cpp
     src/exchange/market_data/market_data_publisher.cpp
+    src/protocol/order_entry/encoder.cpp
+    src/protocol/order_entry/decoder.cpp
+    src/exchange/gateway/order_entry_gateway.cpp
 )
 target_include_directories(mdh_core PUBLIC include)
 target_compile_options(mdh_core PRIVATE ${MDH_WARNING_FLAGS})
@@ -104,6 +108,7 @@ add_executable(mdh_tests
     tests/test_order_book.cpp
     tests/test_replay_e2e.cpp
     tests/test_udp_socket.cpp
+    tests/test_tcp_socket.cpp
     tests/test_packet_framing.cpp
     tests/test_packet_sequence_tracker.cpp
     tests/test_udp_receiver.cpp
@@ -128,6 +133,8 @@ add_executable(mdh_tests
     tests/test_risk_gated_engine.cpp
     tests/test_market_data_publisher.cpp
     tests/test_market_data_e2e.cpp
+    tests/test_order_entry_codec.cpp
+    tests/test_order_entry_decode_errors.cpp
 )
 target_link_libraries(mdh_tests PRIVATE mdh_core gtest gtest_main)
 target_compile_options(mdh_tests PRIVATE ${MDH_WARNING_FLAGS})

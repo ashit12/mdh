@@ -171,6 +171,46 @@ TEST(MatchingPipeline, SubmitRejectsWithoutDroppingWhenQueueIsFull) {
     EXPECT_EQ(pipeline.commands_processed(), static_cast<std::size_t>(accepted));
 }
 
+TEST(MatchingPipeline, CustomProcessorIsInvokedInsteadOfBareEngine) {
+    ThreadSafeCollectingSink out;
+    std::atomic<int> processor_calls{0};
+
+    // Deliberately never touches a MatchingEngine at all -- proves the
+    // pipeline truly substitutes this in place of engine_.process()
+    // (Milestone 7's seam) rather than calling both. Emits a distinctive
+    // event a bare engine would never produce for a NewOrderCommand
+    // (OrderRejected instead of OrderAccepted+BookOrderAdded), so the
+    // assertions below can tell which code path actually ran.
+    MatchingPipeline::Processor processor = [&](const ExchangeCommand& command, const EventSink& sink) {
+        ++processor_calls;
+        const auto& order = std::get<NewOrderCommand>(command);
+        sink(OrderRejected{
+            .event_sequence = 0,
+            .command_sequence = order.command_sequence,
+            .account_id = order.account_id,
+            .client_order_id = order.client_order_id,
+            .instrument_id = order.instrument_id,
+            .reason = RejectReason::InternalError,
+        });
+    };
+
+    MatchingPipeline pipeline(out.sink(), MatchingPipelineOptions{}, processor);
+    ASSERT_TRUE(pipeline.submit(new_order(100, 1, /*instrument=*/1, Side::Buy, 100, 10)));
+    ASSERT_TRUE(wait_until([&] { return pipeline.commands_processed() == 1; }));
+    pipeline.stop();
+
+    EXPECT_EQ(processor_calls.load(), 1);
+    const auto events = out.events();
+    ASSERT_EQ(events.size(), 1u); // a bare engine would have produced 2 events (OrderAccepted, BookOrderAdded) instead
+    ASSERT_TRUE(holds<OrderRejected>(events[0]));
+    EXPECT_EQ(std::get<OrderRejected>(events[0]).reason, RejectReason::InternalError);
+
+    // The custom processor never called engine_.process(), so its book
+    // stays empty -- confirms the substitution is exclusive, not additive.
+    const auto snapshot = pipeline.snapshot();
+    EXPECT_TRUE(snapshot.instruments.empty());
+}
+
 // ── Real concurrency ──────────────────────────────────────────────────────
 //
 // Everything above submits from the test's own (single) thread, which never
