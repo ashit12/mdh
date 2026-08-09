@@ -62,6 +62,25 @@ std::optional<TcpSocket> TcpSocket::accept() {
     if (val < 0) {
         return std::nullopt;
     }
+
+    // On BSD-derived kernels (including macOS), a socket returned by
+    // accept() inherits the listening socket's O_NONBLOCK flag rather than
+    // starting fresh like a newly ::socket()-ed fd does (unlike Linux,
+    // where it never does) -- since this class's own listen()/accept()
+    // pattern requires the *listening* socket to be non-blocking (see
+    // accept()'s own doc comment on why), every accepted connection on
+    // such a platform would otherwise silently come back non-blocking too,
+    // even though callers (e.g. the gateway's per-connection reader/writer
+    // threads) are documented and entitled to assume a freshly accepted
+    // TcpSocket behaves like a freshly constructed one: blocking by
+    // default. Clearing it here, unconditionally, makes that guarantee
+    // hold on every platform this project targets rather than only on
+    // Linux.
+    const int flags = ::fcntl(val, F_GETFL, 0);
+    if (flags >= 0) {
+        ::fcntl(val, F_SETFL, flags & ~O_NONBLOCK);
+    }
+
     return TcpSocket(val);
 }
 

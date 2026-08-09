@@ -65,6 +65,14 @@ add_library(mdh_core
     src/protocol/order_entry/encoder.cpp
     src/protocol/order_entry/decoder.cpp
     src/exchange/gateway/order_entry_gateway.cpp
+    src/trader/oms/order_entry_client.cpp
+    src/trader/oms/order_management_system.cpp
+    src/trader/positions/position_tracker.cpp
+    src/trader/risk/trader_risk_engine.cpp
+    src/trader/risk/trader_risk_gated_oms.cpp
+    src/trader/strategies/strategy_runtime.cpp
+    src/trader/strategies/market_maker_strategy.cpp
+    src/trader/strategies/cross_venue_arbitrage_strategy.cpp
 )
 target_include_directories(mdh_core PUBLIC include)
 target_compile_options(mdh_core PRIVATE ${MDH_WARNING_FLAGS})
@@ -135,6 +143,19 @@ add_executable(mdh_tests
     tests/test_market_data_e2e.cpp
     tests/test_order_entry_codec.cpp
     tests/test_order_entry_decode_errors.cpp
+    tests/test_order_entry_gateway_e2e.cpp
+    tests/test_order_management_system.cpp
+    tests/test_order_entry_client.cpp
+    tests/test_oms_gateway_e2e.cpp
+    tests/test_position_tracker.cpp
+    tests/test_trader_risk_engine.cpp
+    tests/test_trader_risk_gated_oms.cpp
+    tests/test_trader_risk_gated_oms_e2e.cpp
+    tests/test_strategy_runtime.cpp
+    tests/test_market_maker_strategy.cpp
+    tests/test_market_maker_strategy_e2e.cpp
+    tests/test_cross_venue_arbitrage_strategy.cpp
+    tests/test_cross_venue_arbitrage_strategy_e2e.cpp
 )
 target_link_libraries(mdh_tests PRIVATE mdh_core gtest gtest_main)
 target_compile_options(mdh_tests PRIVATE ${MDH_WARNING_FLAGS})

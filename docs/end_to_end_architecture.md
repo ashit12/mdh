@@ -1,8 +1,10 @@
 # End-to-End Architecture — Trader Side (existing) and Exchange Side (planned)
 
-**Status:** Milestone 0 deliverable. Describes the system as it exists today plus the
-components that will be added in later milestones. **No exchange-side production code
-exists yet** — this document is a map for work not yet started, clearly labeled as such.
+**Status:** originally a Milestone 0 deliverable, describing a system where no
+exchange-side production code existed yet. As of Milestone 11, Milestones 1–11 below are
+implemented and tested (see `docs/exchange_flow.md` for the exchange-side walkthrough);
+Milestone 12 onward remain a map for work not yet started, still clearly labeled as such
+in the sections below.
 
 ---
 
@@ -76,7 +78,7 @@ just in prose.
 │  book::BookManager / book::OrderBook  ──────────────────────────────  EXISTING                     │
 │       │  reconstructed, non-authoritative view — "what the exchange published so far"              │
 │       ▼                                                                                            │
-│  Strategy runtime ─────────────────────────────────────────────────  (Milestone 10)                │
+│  Strategy runtime ─────────────────────────────────────────────────  (Milestones 10-11)             │
 │       ▼                                                                                            │
 │  Trader-side risk ─────────────────────────────────────────────────  (Milestone 9)                 │
 │       ▼                                                                                            │
@@ -90,6 +92,31 @@ just in prose.
                      Later, outside the latency-sensitive path on both halves:
                      UI gateway (REST/WebSocket) + React dashboard  (Milestone 12)
 ```
+
+**Status of the milestone numbers in the diagram above, as of this writing:**
+Milestones 1–11 are built and tested (see `docs/exchange_flow.md` for 1–9's own
+walkthrough, and its "Milestones 10-11" section below the milestone-by-milestone
+list for the strategy layer) — this includes the "EXCHANGE SIDE" box in full (the
+order-entry gateway really does sit in front of a risk-gated matching engine
+today, over a real TCP socket) and, in the "TRADER-FIRM SIDE" box, the OMS + TCP
+order-entry client (Milestone 8) that closes the loop back up into that same
+gateway — proven by `tests/test_oms_gateway_e2e.cpp` — trader-side positions/P&L
+and a second, independent trader-side risk check (Milestone 9,
+`trader::risk::TraderRiskGatedOms`, wrapping that same OMS+client pair) —
+proven by `tests/test_trader_risk_gated_oms_e2e.cpp` — and now a strategy layer
+sitting on top of all of that (Milestones 10-11, `trader::strategies::
+StrategyRuntime`/`MarketMakerStrategy`/`CrossVenueArbStrategy`), proven by
+`tests/test_market_maker_strategy_e2e.cpp` (a real market maker quoting,
+getting filled, and requoting over a real gateway) and
+`tests/test_cross_venue_arbitrage_strategy_e2e.cpp` (two complete, independent
+exchange stacks running side by side, with one strategy trading both). The UDP
+market-data path in that same box predates this document (labeled "EXISTING"
+above) and is untouched — `StrategyRuntime` is unit-tested against synthetic
+market-data events the same way `replay::apply_frame_result()` itself is, but
+is not yet fed by a live UDP feed against a running gateway, since that
+wiring (`MarketDataPublisher` into a live gateway's matching thread) remains
+the same not-yet-done integration item described below. Milestone 12 onward
+(the UI gateway, benchmarks, and failure injection) remain not yet started.
 
 ---
 
@@ -114,24 +141,28 @@ rules governing this migration.
 
 ---
 
-## 4. New exchange-side components to be added (not yet implemented)
+## 4. Exchange-side components: built vs. still to come
 
-| Component | Target milestone | Will live under (eventual) |
-|---|---|---|
-| `ExchangeCommand` / `ExchangeEvent` / `EventSink` types | 1 | `exchange/core/` |
-| Matching engine (authoritative book, price-time priority, fills) | 2 | `exchange/matching/` |
-| Exchange command journal + deterministic replay | 3 | `exchange/persistence/` |
-| Command sequencer + matching-thread pipeline | 4 | `exchange/sequencing/` |
-| Account balances + pre-trade risk | 5 | `exchange/risk/`, `exchange/ledger/` |
-| Market-data publisher (matching events → existing wire format) | 6 | `exchange/market_data/` |
-| TCP order-entry protocol + gateway | 7 | `exchange/gateway/`, `protocol/order_entry/` |
-| Trader-side OMS + order-entry client | 8 | `trader/oms/` |
-| Trader-side positions/P&L/risk | 9 | `trader/positions/`, `trader/risk/` |
-| Strategy runtime + market maker | 10 | `trader/strategies/` |
-| Additional strategies, two-venue simulation | 11 | `trader/strategies/` |
-| UI gateway + React dashboard | 12 | `ui_gateway/`, `ui/` |
-| Benchmarks | 13 | `benchmarks/` |
-| Failure injection + final demonstration | 14 | across the above |
+| Component | Target milestone | Status | Lives under |
+|---|---|---|---|
+| `ExchangeCommand` / `ExchangeEvent` / `EventSink` types | 1 | Built | `exchange/core/` |
+| Matching engine (authoritative book, price-time priority, fills) | 2 | Built | `exchange/matching/` |
+| Exchange command journal + deterministic replay | 3 | Built | `exchange/persistence/` |
+| Command sequencer + matching-thread pipeline | 4 | Built | `exchange/sequencing/` |
+| Account balances + pre-trade risk | 5 | Built | `exchange/risk/`, `exchange/ledger/` |
+| Market-data publisher (matching events → existing wire format) | 6 | Built | `exchange/market_data/` |
+| TCP order-entry protocol + gateway | 7 | Built | `exchange/gateway/`, `protocol/order_entry/` |
+| Trader-side OMS + order-entry client | 8 | Built | `trader/oms/` |
+| Trader-side positions/P&L/risk | 9 | Built | `trader/positions/`, `trader/risk/` |
+| Strategy runtime + market maker | 10 | Built | `trader/strategies/` |
+| Additional strategies, two-venue simulation | 11 | Built | `trader/strategies/` |
+| UI gateway + React dashboard | 12 | Not started | `ui_gateway/`, `ui/` |
+| Benchmarks | 13 | Not started | `benchmarks/` |
+| Failure injection + final demonstration | 14 | Not started | across the above |
+
+See `docs/exchange_flow.md` for a full walkthrough of Milestones 1–9's
+implementation (and its own "Milestones 10-11" section for the strategy
+layer); this table only tracks scope and status.
 
 Per the working rules, headers stay where they are today until the exchange-side
 architecture is actually working — the `exchange/...` paths above are the eventual
@@ -173,3 +204,46 @@ relevant to this document's "existing components" claim above:
 - Remaining 53 tests (protocol codec, decode errors, sequence validation, SPSC/dropping queue, backpressure integration): all passing.
 
 No exchange-side code exists to test yet — that begins at Milestone 1.
+
+---
+
+## 7. Verified baseline as of Milestone 9
+
+Superseding section 6 above (kept for history): debug, ASan+UBSan, and TSan builds all
+still succeed with zero warnings, and all **314** tests pass under all three
+configurations. `docs/exchange_flow.md` has the full exchange-side test breakdown by
+milestone; the highlights specific to Milestones 7–9's own concurrency are
+`test_order_entry_gateway_e2e.cpp`, `test_oms_gateway_e2e.cpp`, and
+`test_trader_risk_gated_oms_e2e.cpp`, all real multi-threaded TCP round trips (gateway
+accept/reader/writer/matching threads on one side, an `OrderEntryClient` reader thread on
+the other) that pass clean under TSan. The last of these is also the test proving
+Milestone 9's central design claim: the trader-side risk check
+(`TraderRiskEngine`/`PositionTracker`) and the exchange-side one (`RiskGatedEngine`/
+`Ledger`) are genuinely independent, each capable of rejecting an order the other would
+have allowed.
+
+---
+
+## 8. Verified baseline as of Milestone 11
+
+Superseding section 7 above (kept for history): debug, ASan+UBSan, and TSan builds all
+still succeed with zero warnings, and all **337** tests pass under all three
+configurations. `docs/exchange_flow.md` has the full breakdown by milestone, including
+its own "Milestones 10-11" section; the highlights specific to Milestones 10-11 are
+`test_market_maker_strategy_e2e.cpp` (a real `MarketMakerStrategy`, trading through a
+real `TraderRiskGatedOms` + `OrderEntryClient`, quoting/getting filled/requoting over a
+real TCP connection to a real `OrderEntryGateway` — including a fix this test itself
+caught: replacing a widening bid before its own stale ask had moved could momentarily
+cross the strategy's own book, so `MarketMakerStrategy` now sequences which side it
+replaces first) and `test_cross_venue_arbitrage_strategy_e2e.cpp` (two complete,
+independent exchange stacks — two gateways, two matching engines, two ledgers — running
+side by side in one test process, with a single `CrossVenueArbStrategy` trading both and
+capturing a real, seeded price discrepancy between them via two independent IOC order
+round trips). TSan also caught a second real, if narrow, bug during this milestone's own
+development, in test infrastructure rather than production code: the `RiskGatedTrader`
+test helper (shared by the Milestone 9 and Milestone 10-11 e2e tests) declared its
+`OrderEntryClient` member before its `TraderRiskGatedOms` member, so the client's
+background reader thread — which calls into the risk-gated OMS asynchronously — could
+still be running while the OMS was being destroyed (C++ destroys members in reverse
+declaration order); all three `RiskGatedTrader` copies now declare `TraderRiskGatedOms`
+first so the client (and its thread) tears down before the OMS it calls into does.

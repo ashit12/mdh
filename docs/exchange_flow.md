@@ -10,9 +10,12 @@ namespace; neither depends on the other's types. If you're looking for how
 `market_data_replay` or `udp_sender` work, see the top-level `README.md`
 instead — this document is scoped entirely to `mdh::exchange`.
 
-It walks through the six milestones built so far in the order they were
+It walks through the eleven milestones built so far in the order they were
 built, then traces one order through the whole stack end to end, then gives
-a directory-by-directory component reference.
+a directory-by-directory component reference. (Milestones 10-11 live under
+`trader/strategies/`, one level above everything else this document
+otherwise covers — see the "Milestones 10-11" section right after the
+numbered list below for those two specifically.)
 
 ---
 
@@ -87,6 +90,155 @@ back through the trader side's *unmodified* `replay::run_replay()` —
 asserting the reconstructed `book::BookManager` agrees with the
 authoritative `MatchingEngine::snapshot()`.
 
+**Milestone 7 — TCP order-entry gateway** (`exchange/gateway/`,
+`protocol/order_entry/`). The first real network front door to the exchange:
+`OrderEntryGateway` composes everything built so far (`RiskGatedEngine` wired
+into `MatchingPipeline` via its `Processor` seam) behind a TCP listener built
+on a new `net::TcpSocket` RAII wrapper (the connection-oriented counterpart
+to the trader side's existing `net::UdpSocket`). `protocol::order_entry/`
+defines a small, 3-byte-header, length-prefixed wire format distinct from
+`protocol/messages.hpp` — no sequence number, since TCP already guarantees
+ordered, lossless delivery (see that header's own comment for the full
+reasoning) — carrying `NewOrder`/`CancelOrder`/`ReplaceOrder` one way and
+`Accepted`/`Rejected`/`Cancelled`/`Replaced`/`TradeReport` the other. Each
+accepted connection gets its own reader thread (decodes inbound frames,
+translates them to `ExchangeCommand`s, and calls a mutex-serialized
+`submit()`) and writer thread (drains a per-connection outbound `SpscQueue`
+fed by `route_event()`, which runs *on the matching thread* as the
+`Processor`'s `EventSink` and therefore must never block — a slow client's
+socket cannot be allowed to stall matching for every other client).
+Session-to-account binding is opportunistic: a connection is unrouted until
+its first decoded message arrives, since every client message type already
+carries `account_id`. `test_order_entry_gateway_e2e.cpp` is the loop-closing
+test here — a hand-rolled test client drives a real `OrderEntryGateway` over
+real loopback TCP, including a two-connection crossing trade that exercises
+`TradeReport` fan-out to both sides independently.
+
+**Milestone 8 — Trader-side OMS + order-entry client** (`trader/oms/`). The
+client-side counterpart to Milestone 7, reusing the exact same
+`protocol::order_entry/` wire format (the two milestones' only shared
+contract). `OrderEntryClient` is the network transport — one background
+reader thread decoding frames and delivering them to a `MessageSink`,
+`send()` writing synchronously on the caller's thread since (unlike the
+gateway) there is no shared matching thread here for a blocking write to
+endanger. `OrderManagementSystem` is the actual client-side order state
+machine (`PendingNew → Live → PartiallyFilled/Filled`, or `→ Rejected/
+Cancelled/Replaced`), deliberately decoupled from `OrderEntryClient` itself
+via two function-shaped seams (a `Sender` for outbound, `handle_message()`
+for inbound) — the same `EventSink`-style pattern used throughout this
+codebase, which is what makes its full state machine unit-testable
+(`test_order_management_system.cpp`) with a fake sender and no socket at
+all. The trickiest piece of that state machine: the wire's `Rejected`
+message carries no "what kind of request failed" field, so a `Rejected`
+referencing an order that isn't `PendingNew` must mean an in-flight
+cancel/replace attempt failed (the order itself is untouched), not that the
+order was rejected — `ClientOrder::pending_action` is what lets
+`handle_message()` tell those apart. `test_oms_gateway_e2e.cpp` is the
+loop-closing test: a real `OrderManagementSystem` + `OrderEntryClient`
+against a real, unmodified `OrderEntryGateway`, covering the same scenarios
+as Milestone 7's own e2e test but driven through the production client
+instead of a hand-rolled one.
+
+**Milestone 9 — Trader-side positions/P&L/risk** (`trader/positions/`,
+`trader/risk/`). The trader-side mirror of Milestone 5's `Ledger` +
+`RiskEngine` + `RiskGatedEngine` trio, one level up the stack:
+`positions::PositionTracker` keeps per-account cash and per-instrument
+holdings by watching fills, and `risk::TraderRiskEngine` checks a
+prospective order against it (order-too-large, insufficient funds,
+insufficient position -- the exact same three checks and `RejectReason`
+values as the exchange-side `RiskEngine`, reused rather than duplicated as a
+parallel enum). `risk::TraderRiskGatedOms` composes both together with a
+real `OrderManagementSystem` behind (almost) `OrderManagementSystem`'s own
+`submit_new_order()`/`cancel_order()`/`replace_order()` surface, exactly
+mirroring how `RiskGatedEngine` composes its own trio behind
+`MatchingEngine::process()`'s signature. The one real design problem this
+milestone had to solve: `PositionTracker` needs a fill's *price* and
+*incremental quantity* to update cash correctly, but
+`protocol::order_entry::TradeReport` (the wire message `OrderManagementSystem`
+already decodes) carries only a running `remaining_quantity`, not a delta,
+and no `side` at all (see that struct's own comment on why) -- so
+`OrderManagementSystem` gained a small, purely additive `Fill`/`FillSink`
+(computed once, inside `on_trade_report()`, from data it already has:
+`TradeReport`'s price/quantity plus the tracked order's own remembered
+side) rather than making every downstream consumer re-derive that from raw
+wire messages independently. The other explicit scope decision: unlike
+`Ledger`, `PositionTracker` does **not** reserve against the trader's own
+in-flight orders -- it is a second, best-effort, independent screen sitting
+in front of the OMS, never the authoritative check (the exchange's own
+`RiskGatedEngine` remains that); `test_trader_risk_gated_oms_e2e.cpp`
+proves both layers really are independent by seeding the trader-side and
+exchange-side ledgers differently and showing each layer can reject on its
+own without the other's help.
+
+---
+
+## Milestones 10-11 -- the strategy layer (`trader/strategies/`)
+
+**Milestone 10 -- Strategy runtime + market maker.**
+`strategies::StrategyRuntime` is the thin dispatch piece named "Strategy
+runtime" in `docs/end_to_end_architecture.md`'s system diagram:
+`subscribe(instrument_id, sink)` registers a `BookUpdateSink`
+(`std::function<void(InstrumentId, const book::OrderBook&)>` -- a plain
+callable, not a virtual `Strategy` base class, matching this codebase's one,
+uniform `EventSink`-style convention everywhere else), and `on_event(event,
+books)` extracts `event`'s instrument id (every `protocol::Event` variant
+carries one) and calls every sink subscribed to it, passing the book *as
+the caller has already updated it* -- `on_event()` does not itself mutate
+`books`, by design (see the header's own comment on why duplicating
+`replay::apply_frame_result()`'s private `apply_event()` logic here would be
+the wrong tradeoff). `strategies::MarketMakerStrategy` is a textbook
+two-sided market maker built on top of it: on every book update for its own
+instrument, it quotes a bid and an ask centered on the book's midpoint,
+`half_spread` ticks apart, replacing a resting quote (via
+`TraderRiskGatedOms::replace_order()`) only once the desired price has
+drifted by at least `requote_threshold` ticks, and withdrawing the bid
+entirely once held position reaches `max_position` (the ask side is already
+self-limiting -- `TraderRiskEngine`, Milestone 9, refuses to oversell). Its
+own e2e test (`test_market_maker_strategy_e2e.cpp`) caught a real bug during
+development: replacing a widening bid *before* the still-stale ask on the
+same book had moved could have the strategy's own new bid immediately cross
+and self-fill against its own resting ask; `on_book_update()` now checks
+which side's move would create that transient cross and sends that side's
+replace first (see `market_maker_strategy.cpp`'s own comment for the full
+reasoning) -- the exact "widen the far side before tightening the near side"
+discipline a real market maker's quoting logic needs.
+
+**Milestone 11 -- Additional strategies, two-venue simulation.**
+`strategies::CrossVenueArbStrategy` is a second, independent strategy on the
+exact same plumbing: it watches the same instrument's book on two separate
+venues (two entirely independent `TraderRiskGatedOms` connections -- nothing
+about `StrategyRuntime` or `TraderRiskGatedOms` has any single-venue
+assumption baked in) and, whenever one venue's best ask sits at least
+`min_edge` below the other venue's best bid, buys on the cheap venue and
+sells on the rich one, both legs as IOC (an arbitrage order is only worth
+sending if it can execute immediately against the edge just observed; GTC
+would risk only one leg filling, leaving a naked position). The "two-venue
+simulation" itself is `test_cross_venue_arbitrage_strategy_e2e.cpp`: two
+complete, independent exchange stacks (each its own `OrderEntryGateway` in
+front of its own matching engine and ledger, per Milestone 7's own
+composition) running side by side in one test process on two different
+ports, each with its own liquidity-provider account creating a genuine,
+seeded price discrepancy, with the arbitrage strategy capturing it via two
+real, independent TCP round trips and each venue's own `PositionTracker`
+showing the resulting cash/position movement.
+
+**Why both strategies' books are built by the test, not a live feed:** per
+this document's own "Integration status" section, `MarketDataPublisher`
+(Milestone 6) is not yet wired into a running gateway's matching thread --
+there is no live UDP feed to listen to yet. Both e2e tests instead mirror
+what such a feed would eventually report directly into a `book::OrderBook`,
+using only information the test itself already knows (a liquidity
+provider's own confirmed order prices), and drive the strategy's
+`on_book_update()`/`on_venue_a_update()`/`on_venue_b_update()` exactly the
+way a live `StrategyRuntime` call site would once that wiring exists. Order
+flow itself -- every `NewOrder`/`Accepted`/`ReplaceOrder`/`TradeReport` in
+both tests -- is fully real, over real sockets, against real gateways; only
+"how does a book update arrive" is test-simulated. `StrategyRuntime` itself
+is unit-tested (`test_strategy_runtime.cpp`) against synthetic
+`protocol::Event` values the same way `replay::apply_frame_result()`'s own
+tests are, so it is proven correct on its own even though nothing yet
+drives it from a live socket.
+
 ---
 
 ## Architecture: the live command path
@@ -137,8 +289,15 @@ SpscQueue<ExchangeCommand>::try_push()  ── full? ──► submit() returns 
 `RiskGatedEngine::process()` (Milestone 5) has the exact same signature as
 `MatchingEngine::process()` and is designed to substitute for the bare call
 inside `MatchingPipeline`'s matching-thread loop — but as of this writing
-that substitution has **not** been made; `MatchingPipeline` still calls
-`engine_.process()` directly (see `src/exchange/sequencing/matching_pipeline.cpp`).
+that substitution has **not** been made by default; `MatchingPipeline` still
+calls `engine_.process()` directly unless a caller supplies its own
+`Processor` (see `src/exchange/sequencing/matching_pipeline.cpp`). Milestone
+7's `OrderEntryGateway` is exactly that caller: it constructs its
+`MatchingPipeline` with a `Processor` that forwards to
+`risk_gated_engine_.process()`, so live traffic through the gateway *is*
+risk-gated end to end — the diagram above (a bare `MatchingEngine`) still
+describes `MatchingPipeline`'s own default/no-argument behavior, which
+remains what every pre-Milestone-7 test in this document exercises.
 `RiskGatedEngine` is fully implemented and tested standalone, single-threaded,
 against a bare `MatchingEngine` + `Ledger`. See *Integration status* at the
 end of this document.
@@ -489,44 +648,95 @@ Exchange-side test files, by milestone:
 | 4 — sequencer & pipeline | `test_command_sequencer.cpp`, `test_matching_pipeline.cpp` |
 | 5 — ledger & risk | `test_ledger.cpp`, `test_risk_engine.cpp`, `test_risk_gated_engine.cpp` |
 | 6 — market-data publisher | `test_market_data_publisher.cpp` (unit-level translation), `test_market_data_e2e.cpp` (loop-closing round-trip through the trader side's own replay pipeline) |
+| 7 — TCP order-entry gateway | `test_tcp_socket.cpp` (RAII socket wrapper), `test_order_entry_codec.cpp`, `test_order_entry_decode_errors.cpp` (wire codec), `test_order_entry_gateway_e2e.cpp` (loop-closing, real TCP client against a real gateway) |
+| 8 — trader-side OMS + client | `test_order_management_system.cpp` (pure state-machine logic, fake sender), `test_order_entry_client.cpp` (transport, real socket against a raw peer), `test_oms_gateway_e2e.cpp` (loop-closing, production OMS + client against a real Milestone 7 gateway) |
+| 9 — trader-side positions/risk | `test_position_tracker.cpp`, `test_trader_risk_engine.cpp` (pure logic, synthetic fills/checks), `test_trader_risk_gated_oms.cpp` (composition, fake sender), `test_trader_risk_gated_oms_e2e.cpp` (loop-closing, production risk-gated OMS against a real Milestone 7 gateway, including both independent risk layers rejecting on their own) |
+| 10 — strategy runtime + market maker | `test_strategy_runtime.cpp` (pure dispatch logic, synthetic events), `test_market_maker_strategy.cpp` (composition, fake sender), `test_market_maker_strategy_e2e.cpp` (loop-closing, a real market maker quoting/getting filled/requoting over a real Milestone 7 gateway) |
+| 11 — additional strategies, two-venue simulation | `test_cross_venue_arbitrage_strategy.cpp` (composition, two fake senders), `test_cross_venue_arbitrage_strategy_e2e.cpp` (the "two-venue simulation" -- two complete, independent exchange stacks, one arbitrage strategy trading both over real TCP) |
 
-`test_matching_pipeline.cpp` and `test_risk_gated_engine.cpp` are the two
-that most benefit from running under TSan — both exercise real threading
-(`MatchingPipeline`'s producer/matching-thread split) or state a future
-threaded caller must get right (`RiskGatedEngine`'s single-thread
-requirement).
+`test_matching_pipeline.cpp`, `test_risk_gated_engine.cpp`,
+`test_order_entry_gateway_e2e.cpp`, `test_oms_gateway_e2e.cpp`,
+`test_trader_risk_gated_oms_e2e.cpp`, `test_market_maker_strategy_e2e.cpp`, and
+`test_cross_venue_arbitrage_strategy_e2e.cpp` are the ones that most benefit
+from running under TSan — all exercise real, multi-threaded traffic
+(`MatchingPipeline`'s producer/matching-thread split, one or more gateways'
+per-connection reader/writer threads plus their matching threads, and one or
+more OMS clients' own reader threads). All 337 tests as of Milestone 11 pass
+clean under a debug build, an ASan+UBSan build, and a TSan build alike. TSan
+has now caught two real, if narrow, bugs across this project's development,
+both in test infrastructure rather than production code:
+- During Milestone 8: both gateway e2e tests were calling
+  `OrderEntryGateway::snapshot()` — which, like `MatchingPipeline::snapshot()`,
+  is only safe once the matching thread has been joined — while the gateway
+  was still running; both now call `stop()` first.
+- During Milestone 10-11's own development: the `RiskGatedTrader` test
+  helper (shared by the Milestone 9 and Milestone 10-11 e2e tests) declared
+  its `OrderEntryClient` member *before* its `TraderRiskGatedOms` member.
+  `OrderEntryClient`'s background reader thread calls into the risk-gated
+  OMS asynchronously, and C++ destroys members in reverse declaration order
+  — so the OMS could start being destroyed while that thread was still
+  calling into it. All three `RiskGatedTrader` copies now declare
+  `TraderRiskGatedOms` first (see any of their own comments for the full
+  reasoning), so the client — and the thread it owns — finishes tearing down
+  before the OMS it calls into does.
 
 ---
 
 ## Integration status: what's wired together, and what isn't yet
 
-Every component above is implemented and independently tested, but as of
-this writing they have **not** all been assembled into one live call path
+As of Milestone 11, real client traffic can flow all the way from a TCP
+socket through risk-gated matching and back out to four different kinds of
+client (a hand-rolled test client, the production `OrderEntryClient` +
+`OrderManagementSystem`, that same pair further wrapped in
+`TraderRiskGatedOms` for a second, independent trader-side risk check and
+live position/P&L tracking, or that `TraderRiskGatedOms` driven by a
+`strategies::MarketMakerStrategy`/`CrossVenueArbStrategy` instead of a test
+calling `submit_new_order()` directly) — see Milestones 7–11 above and their
+respective e2e tests. What's still **not** assembled into one live call path
 or app:
 
-- `MatchingPipeline` (Milestone 4) drives a bare `MatchingEngine` directly —
-  `RiskGatedEngine` (Milestone 5) is not substituted in.
-- Nothing currently calls `CommandJournalWriter::write()` from
-  `MatchingPipeline`'s matching thread — journaling (Milestone 3) is
-  exercised by its own tests and by `run_command_replay()` against
-  journal files built directly via `encode_command`/`CommandJournalWriter`,
-  not against live pipeline traffic.
+- `MatchingPipeline` (Milestone 4) itself still drives a bare
+  `MatchingEngine` directly *by default* — `RiskGatedEngine` (Milestone 5)
+  is only substituted in by a caller that supplies its own `Processor`, which
+  `OrderEntryGateway` (Milestone 7) does. Nothing about `MatchingPipeline`
+  changed to make that possible; it was designed for exactly this
+  substitution from Milestone 4 onward.
+- Nothing currently calls `CommandJournalWriter::write()` from the
+  gateway's matching thread — journaling (Milestone 3) is exercised by its
+  own tests and by `run_command_replay()` against journal files built
+  directly via `encode_command`/`CommandJournalWriter`, not against live
+  gateway traffic.
 - There is no exchange-side equivalent yet of `market_data_replay`'s
-  `main.cpp` — no app wires a `CommandSequencer` + `MatchingPipeline` +
-  `RiskGatedEngine` + `CommandJournalWriter` together and runs it against
-  real input (a file, a socket, or a TCP order-entry session).
+  `main.cpp` — no long-running app process hosts `OrderEntryGateway` against
+  a real port outside of tests (every gateway in this codebase today is
+  constructed, driven, and torn down within a single test).
 - `MarketDataPublisher` (Milestone 6) is proven correct both in isolation
   and, via `test_market_data_e2e.cpp`, end to end against the trader side's
-  real replay pipeline — but nothing currently binds it into
-  `MatchingPipeline`'s matching thread either. A live system would fan the
-  matching thread's events out to `Ledger::sink()` *and*
-  `MarketDataPublisher::sink()` *and* `CommandJournalWriter::write()`
-  simultaneously; today each of those three only ever receives events from
-  its own tests.
+  real replay pipeline — but nothing currently binds it into the gateway's
+  matching thread either. A live system would fan the matching thread's
+  events out to `Ledger::sink()` *and* `MarketDataPublisher::sink()` *and*
+  `CommandJournalWriter::write()` simultaneously (the gateway today only
+  wires up the first, via `RiskGatedEngine`, which owns the ledger); today
+  each of the other two only ever receives events from its own tests.
+- `strategies::StrategyRuntime` (Milestone 10) is proven correct in
+  isolation, against synthetic `protocol::Event` values feeding a
+  `book::BookManager`, but nothing binds it to a live UDP feed either —
+  that would need the `MarketDataPublisher` wiring immediately above to
+  exist first. `MarketMakerStrategy` and `CrossVenueArbStrategy`'s own e2e
+  tests instead drive their `on_book_update()`/`on_venue_a_update()`/
+  `on_venue_b_update()` methods directly, from a `book::OrderBook` the test
+  itself mirrors from a liquidity provider's own confirmed orders — see
+  this document's own "Milestones 10-11" section above for why that is a
+  legitimate proof of the strategy logic and the OMS/risk/gateway plumbing
+  underneath it, short of the live-feed wiring specifically.
 
 This is intentional, incremental milestone scope, not an oversight — each
 piece is built and proven correct on its own (and, as of Milestone 6, proven
-correct in combination with the trader side specifically) before being
-composed. See `docs/end_to_end_architecture.md` for the target composition
-and the still-to-come milestones (a wire-level order-entry protocol, a live
-gateway). This document should be updated once that wiring happens.
+correct in combination with the trader side's replay pipeline; as of
+Milestones 7–11, proven correct end to end over real TCP connections between
+real gateways and real clients, including two independent gateways at once
+as of Milestone 11) before being composed further. See
+`docs/end_to_end_architecture.md` for the target composition and the
+still-to-come milestones (the UI gateway, benchmarks, failure injection, and
+a long-running gateway process outside of tests). This document should be
+updated as that wiring happens.

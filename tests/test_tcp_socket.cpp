@@ -116,6 +116,54 @@ TEST(TcpSocket, ShutdownUnblocksBlockedRead) {
     }
 }
 
+TEST(TcpSocket, AcceptedConnectionIsBlockingRegardlessOfListenersMode) {
+    // On BSD-derived kernels (including macOS), a socket returned by
+    // accept() inherits the listening socket's O_NONBLOCK flag rather than
+    // starting fresh -- unlike Linux, where it never does. Callers of
+    // accept() (e.g. the order-entry gateway's accept_loop(), which must
+    // put the *listening* socket in non-blocking mode, see accept()'s own
+    // doc comment) are entitled to assume every accepted connection is
+    // blocking by default regardless of platform, exactly like a freshly
+    // constructed TcpSocket -- this pins that guarantee.
+    TcpSocket listener;
+    ASSERT_TRUE(listener.listen(0));
+    listener.set_non_blocking();
+    const auto port = listener.local_port();
+    ASSERT_TRUE(port.has_value());
+
+    TcpSocket client;
+    ASSERT_TRUE(client.connect("127.0.0.1", *port));
+
+    std::optional<TcpSocket> server_conn;
+    for (int attempt = 0; attempt < 100 && !server_conn.has_value(); ++attempt) {
+        server_conn = listener.accept();
+        if (!server_conn.has_value()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    ASSERT_TRUE(server_conn.has_value());
+
+    // Nothing has been written yet, so a non-blocking accepted socket would
+    // return std::nullopt (EWOULDBLOCK) immediately; a correctly-blocking
+    // one blocks until the write below actually arrives. This thread does
+    // the write concurrently so a wrongly-non-blocking read() failing fast
+    // doesn't hang the test either way -- read_result simply reflects
+    // whichever behavior actually occurred.
+    std::optional<std::size_t> read_result;
+    std::jthread reader([&] {
+        std::array<std::byte, 64> buf{};
+        read_result = server_conn->read(buf);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // give the reader a real chance to block first
+    const std::array<std::byte, 3> payload = {std::byte{'h'}, std::byte{'i'}, std::byte{'!'}};
+    ASSERT_TRUE(client.write(payload).has_value());
+    reader.join();
+
+    ASSERT_TRUE(read_result.has_value());
+    EXPECT_EQ(*read_result, payload.size());
+}
+
 TEST(TcpSocket, MoveTransfersOwnership) {
     TcpSocket a;
     ASSERT_TRUE(a.listen(0));
