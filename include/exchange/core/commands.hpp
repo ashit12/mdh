@@ -38,11 +38,6 @@ struct NewOrderCommand {
 struct CancelOrderCommand {
     CommandSequence command_sequence;
     AccountId account_id;
-    // Identifies the resting order to cancel -- the same client_order_id it
-    // was submitted under via NewOrderCommand. This project does not model a
-    // separate cancel-request id distinct from the target order's own id
-    // (some real order-entry protocols do, for ack correlation); deferred as
-    // unneeded complexity for the current milestones.
     ClientOrderId client_order_id;
     InstrumentId instrument_id;
 
@@ -52,11 +47,7 @@ struct CancelOrderCommand {
 struct ReplaceOrderCommand {
     CommandSequence command_sequence;
     AccountId account_id;
-    // The live order being replaced, identified by its original client_order_id.
     ClientOrderId original_client_order_id;
-    // The id the replacement order is submitted under. A successful replace
-    // makes original_client_order_id no longer live; new_client_order_id
-    // becomes the id of the (possibly re-priced/re-sized) resting order.
     ClientOrderId new_client_order_id;
     InstrumentId instrument_id;
     Price new_price;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -143,7 +144,10 @@ public:
 
     // Shuts everything down, in this order:
     //   1. Request-stop the shared stop_source -- observed by accept_loop()'s
-    //      poll loop and by connection_writer_loop()'s poll loop.
+    //      poll loop and by connection_writer_loop()'s wait (also woken
+    //      directly, per connection, via each Connection's wake_cv, rather
+    //      than left to that wait's own timeout -- see stop()'s
+    //      implementation).
     //   2. Join the accept thread, so no *new* connections can appear while
     //      steps 3-4 below iterate connections_.
     //   3. Call shutdown() on every live connection's socket -- this is what
@@ -222,6 +226,24 @@ private:
         // default.
         SpscQueue<protocol::order_entry::Message> outbound;
 
+        // Lets connection_writer_loop() block until route_event() actually
+        // pushes something for this connection instead of unconditionally
+        // sleeping a fixed poll interval every time it finds outbound
+        // empty (see connection_writer_loop()'s own doc comment on why
+        // that sleep used to dominate this gateway's measured end-to-end
+        // latency -- docs/benchmarks.md §7). wake_mutex guards nothing
+        // but the wait itself (outbound stays lock-free SPSC, unaffected);
+        // route_event() does not need to hold it to call notify_one() --
+        // the writer always re-checks outbound.size() itself as
+        // wait_for()'s predicate, so a notification that arrives just
+        // before the writer starts waiting is never lost, only redundant
+        // with the predicate's own re-check. kPollInterval remains as
+        // wait_for()'s timeout, purely as a safety net (e.g. against a
+        // spuriously missed wakeup), not as the primary wake mechanism
+        // anymore.
+        std::mutex wake_mutex;
+        std::condition_variable wake_cv;
+
         // Written exactly once, only by this connection's own reader
         // thread (see accept_loop()'s / connection_reader_loop()'s
         // opportunistic-binding doc comment) -- single-writer, so no
@@ -266,12 +288,17 @@ private:
     // the byte stream) is still intact.
     void connection_reader_loop(Connection& conn);
 
-    // Runs on `conn`'s own writer thread. Polls conn.outbound (try_pop())
+    // Runs on `conn`'s own writer thread. Drains conn.outbound (try_pop())
     // against `token`, encoding and writing each Message it finds via
     // protocol::order_entry::encode_message() + TcpSocket::write() --
     // remember write() can itself return a short count (tcp_socket.hpp's
     // own doc comment), so a single write() call is not guaranteed to
-    // flush one whole encoded message.
+    // flush one whole encoded message. When outbound is empty, blocks on
+    // conn.wake_cv (see Connection's own doc comment) instead of
+    // unconditionally sleeping a fixed interval -- route_event() notifies
+    // this directly the moment it pushes something for this connection, so
+    // in the common case this thread reacts immediately rather than on its
+    // next poll tick.
     void connection_writer_loop(Connection& conn, std::stop_token token);
 
     // Installed as the EventSink handed to pipeline_'s Processor -- runs on

@@ -33,9 +33,6 @@ struct ExchangeRestingOrder {
     // still-resting order was accepted onto the book.
     std::uint64_t order_sequence;
 
-    // Defaulted (Milestone 3): lets EngineStateSnapshot (see
-    // exchange/matching/state_snapshot.hpp) support == for replay-
-    // determinism tests. Purely additive, no behavior change.
     bool operator==(const ExchangeRestingOrder&) const = default;
 };
 

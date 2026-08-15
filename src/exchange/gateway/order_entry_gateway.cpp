@@ -13,11 +13,16 @@ namespace mdh::exchange::gateway {
 
 namespace {
 using namespace std::chrono_literals;
-// How long accept_loop()/connection_writer_loop() sleep between polls when
-// there was nothing to do -- short enough to keep latency low, long enough
-// not to spin a core at 100% doing nothing (same rationale as
+// How long accept_loop() sleeps between polls when there was nothing to
+// do -- short enough to keep latency low, long enough not to spin a core
+// at 100% doing nothing (same rationale as
 // net::UdpListenOptions::consumer_delay's "deterministic, not incidental"
 // framing, just applied to idle-polling instead of simulated slowness).
+// accept_loop() has no better option (TcpSocket::accept() has no blocking-
+// with-wakeup primitive to offer it -- see tcp_socket.hpp's own
+// shutdown()/accept() caveat), but connection_writer_loop() below now uses
+// this only as a wait_for() safety-net timeout, not its primary wake
+// mechanism -- see Connection::wake_cv's doc comment.
 constexpr auto kPollInterval = 1ms;
 } // namespace
 
@@ -50,6 +55,7 @@ void OrderEntryGateway::stop() {
     std::lock_guard<std::mutex> lock(connections_mutex_);
     for (auto& conn : connections_) {
         conn->socket.shutdown(); // unblocks a blocked read() on this connection's reader thread
+        conn->wake_cv.notify_all(); // unblocks a writer thread waiting in connection_writer_loop()'s wait_for()
     }
     for (auto& conn : connections_) {
         if (conn->reader_thread.joinable()) {
@@ -164,7 +170,16 @@ void OrderEntryGateway::connection_writer_loop(Connection& conn, std::stop_token
     while (!token.stop_requested()) {
         auto message = conn.outbound.try_pop();
         if (!message) {
-            std::this_thread::sleep_for(kPollInterval);
+            // wait_for()'s predicate is re-checked immediately, before ever
+            // actually sleeping -- so a notify_one() (route_event() below)
+            // or notify_all() (stop(), above) that already happened before
+            // this wait began is never lost, only redundant with this
+            // re-check. kPollInterval is a safety-net timeout only, not the
+            // expected wake path -- see this class's own kPollInterval doc
+            // comment.
+            std::unique_lock<std::mutex> lock(conn.wake_mutex);
+            conn.wake_cv.wait_for(lock, kPollInterval,
+                                   [&] { return token.stop_requested() || conn.outbound.size() > 0; });
             continue;
         }
 
@@ -203,7 +218,13 @@ void OrderEntryGateway::route_event(const ExchangeEvent& event) {
         // runs on the matching thread, see class-level comment on why it
         // must not block) -- there is no synchronous caller here to hand a
         // rejection back to the way MatchingPipeline::submit() can.
-        (void)it->second->outbound.try_push(std::move(message));
+        if (it->second->outbound.try_push(std::move(message))) {
+            // No lock needed here -- see Connection::wake_cv's doc comment
+            // on why a notification racing ahead of the writer thread
+            // starting its wait is never lost, only redundant with that
+            // wait's own predicate re-check.
+            it->second->wake_cv.notify_one();
+        }
     }
 }
 

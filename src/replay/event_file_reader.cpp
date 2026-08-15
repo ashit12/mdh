@@ -33,6 +33,14 @@ std::optional<std::variant<protocol::Event, protocol::DecodeError>> EventFileRea
                static_cast<std::streamsize>(header.payload_size));
     const auto payload_bytes_read = static_cast<std::size_t>(file_.gcount());
 
+    // gcount() only reports a shortfall against a genuine end-of-file. If
+    // the file still has payload_size-or-more bytes ahead of us (mid-file
+    // corruption, not truncation), this read succeeds with exactly the
+    // requested count even though those bytes may not actually belong to
+    // this frame -- e.g. a corrupted/wrong payload_size could silently
+    // consume bytes that belong to the next frame's header, desyncing
+    // every frame after it. Undetectable without a per-frame checksum
+    // this format doesn't have; a known scope limit, not a bug here.
     if (payload_bytes_read < header.payload_size) {
         return std::variant<Event, DecodeError>(DecodeError::TruncatedPayload);
     }

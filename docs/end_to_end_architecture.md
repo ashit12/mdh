@@ -362,11 +362,17 @@ gated behind `-DMDH_BUILD_BENCHMARKS=ON`, the default) were built and actually r
 Release on this machine; every number is recorded, with methodology and interpretation, in
 `docs/benchmarks.md` — summarized: every hot-path component measured (protocol codec,
 matching engine, trader-side book, SPSC queue) costs tens to low thousands of nanoseconds
-per operation, while the one live, real-TCP measurement (`bench_end_to_end_latency`, a
-real round trip against a real `OrderEntryGateway`) measures ~0.7-1.3 ms at p50/mean —
-three orders of magnitude larger, traced to a specific, deliberate design choice
-(`connection_writer_loop()`'s 1 ms poll interval), not to anything slow in matching/risk/
-ledger.
+per operation. The one live, real-TCP measurement (`bench_end_to_end_latency`, a real
+round trip against a real `OrderEntryGateway`) initially measured ~0.7-1.3 ms at
+p50/mean — three orders of magnitude larger, traced (by reading the code, not guessed)
+to a specific, deliberate design choice: `connection_writer_loop()`'s 1 ms sleep-based
+poll, not anything slow in matching/risk/ledger. That finding was then actually acted
+on, not just recorded: the writer thread now blocks on a condition variable notified
+directly by `route_event()` instead of polling on a timer, plus `TCP_NODELAY` was added
+to every connected `TcpSocket` (a second, previously-unexamined latency source the same
+investigation turned up). Re-measured after both fixes, p50 dropped to ~73 μs — roughly
+a 17x reduction, verified with two independent 20,000-sample runs, documented in
+`docs/benchmarks.md` §7.2.
 
 Finally, this milestone ran the one demonstration every earlier milestone's own
 end-to-end test proved the *pieces* for but never assembled into a single live scenario:

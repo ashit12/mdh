@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -10,6 +11,25 @@
 #include <utility>
 
 namespace mdh::net {
+
+namespace {
+// Disables Nagle's algorithm: without this, the kernel can hold a small
+// outbound write (e.g. one encoded protocol frame) back for a brief moment
+// hoping to coalesce it with another, waiting on an ACK of the previous
+// segment before sending. This project's protocol is request/response,
+// latency-sensitive, and already sends whole, already-batched frames one
+// write() at a time (see encode_message() call sites) -- there is nothing
+// for Nagle's coalescing to usefully buy here, only latency it can add.
+// Applied unconditionally to every connected socket (both accept()'s
+// server-side result and connect()'s client-side one) so this is a
+// guaranteed property of "a connected TcpSocket," not something every
+// caller must remember to opt into -- same rationale as accept()'s
+// unconditional O_NONBLOCK clearing right above this call's usual site.
+void disable_nagle(int fd) {
+    const int flag = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+}
+} // namespace
 
 TcpSocket::TcpSocket() : fd_(::socket(AF_INET, SOCK_STREAM, 0)) {}
 
@@ -80,6 +100,7 @@ std::optional<TcpSocket> TcpSocket::accept() {
     if (flags >= 0) {
         ::fcntl(val, F_SETFL, flags & ~O_NONBLOCK);
     }
+    disable_nagle(val);
 
     return TcpSocket(val);
 }
@@ -100,6 +121,7 @@ bool TcpSocket::connect(const std::string& host, std::uint16_t port) {
     if (val < 0) {
         return false;
     }
+    disable_nagle(fd_);
     return true;
 }
 

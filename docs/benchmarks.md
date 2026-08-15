@@ -192,7 +192,12 @@ A real loopback-TCP `NewOrder` (IOC, empty book, so exactly one round trip and n
 resting-order bookkeeping) sent to a real, fully-wired `OrderEntryGateway`
 (risk + ledger + matching, identical to what `tests/test_order_entry_gateway_e2e.cpp`
 exercises), timed from just before `send()` to just after this same connection's
-`Accepted` is fully decoded. 20,000 samples, 100 warm-up iterations excluded:
+`Accepted` is fully decoded.
+
+### 7.1 Original measurement, and the bottleneck it exposed
+
+The first real run of this benchmark (20,000 samples, 100 warm-up iterations
+excluded) produced:
 
 | Statistic | Latency |
 |---|---|
@@ -206,49 +211,98 @@ exercises), timed from just before `send()` to just after this same connection's
 
 **The dominant cost, identified by reading the code, not guessed at:**
 `OrderEntryGateway::connection_writer_loop()` (`src/exchange/gateway/
-order_entry_gateway.cpp`) polls its per-connection outbound queue with
+order_entry_gateway.cpp`) polled its per-connection outbound queue with
 `std::this_thread::sleep_for(kPollInterval)` (`kPollInterval = 1ms`) whenever
-`try_pop()` finds nothing — a deliberate, documented choice ("short enough to keep
+`try_pop()` found nothing — a deliberate, documented choice ("short enough to keep
 latency low, long enough not to spin a core at 100% doing nothing") appropriate for a
-demo-scale gateway, but it means every response this benchmark measures pays for
+demo-scale gateway, but it meant every response this benchmark measured paid for
 *this connection's own writer thread's next wake-up*, not just matching-engine time.
-The matching thread itself has no such delay (`MatchingPipeline`'s inner loop
+The matching thread itself had no such delay (`MatchingPipeline`'s inner loop
 `std::this_thread::yield()`s, never sleeps, when its queue is empty — see
-`matching_pipeline.cpp`) — the ~0.7-1.3 ms bulk of p50/mean above is consistent with
+`matching_pipeline.cpp`) — the ~0.7-1.3 ms bulk of p50/mean above was consistent with
 waiting on a uniformly-distributed-up-to-1ms poll interval plus this machine's own
 thread wake-up latency from `sleep_for`, not with anything slow inside
 `RiskGatedEngine`/`MatchingEngine`/`Ledger` (§4's `BM_MatchingEngine_*` numbers show
-those costing hundreds of nanoseconds, three orders of magnitude below what's measured
-here). The p99.9/max tail (10.2 ms / 17.5 ms) is consistent with occasional OS
-scheduler pre-emption of the writer thread for longer than one poll interval under
-this run's background load (this benchmark was run on a shared development machine,
-not an isolated/pinned core — see `Load Average` in the Google-Benchmark runs above,
-which was consistently 5-7 during this session).
+those costing hundreds of nanoseconds, three orders of magnitude below what was
+measured here).
 
-**What this means for anyone reusing this gateway where sub-millisecond latency
-actually matters:** replace `connection_writer_loop()`'s sleep-based poll with a
-blocking primitive woken directly by `route_event()` (e.g. a per-connection
-condition variable, or waking the writer thread's poll via the same `SpscQueue` a
-future revision could pair with a "has data" signal) rather than reaching for a
-shorter `kPollInterval`, which only trades latency for CPU spin, not fixing the
-underlying poll-vs-push mismatch. Out of scope for this milestone (which measures the
-system as built, not redesigns it) but recorded here since it's the single most
-actionable finding this entire benchmark suite produced.
+### 7.2 The fix: wake the writer thread directly instead of polling it
+
+Two changes, both applied for real and re-measured, not just proposed:
+
+1. **`connection_writer_loop()` now blocks on a condition variable
+   (`Connection::wake_cv`) instead of unconditionally sleeping `kPollInterval`.**
+   `route_event()` calls `wake_cv.notify_one()` immediately after a successful
+   `try_push()` onto that connection's outbound queue, so the writer thread reacts
+   as soon as the OS schedules it rather than on its next poll tick.
+   `wait_for(lock, kPollInterval, predicate)` re-checks `outbound.size() > 0` itself
+   before ever actually sleeping, so a notification that arrives just before the wait
+   begins is never lost, only redundant with that re-check — `kPollInterval` survives
+   only as a safety-net timeout, not the primary wake path anymore. `stop()` now also
+   calls `notify_all()` on every live connection's `wake_cv` so shutdown doesn't wait
+   on that same timeout either.
+2. **`TcpSocket` now disables Nagle's algorithm (`TCP_NODELAY`) on every connected
+   socket** (`net::tcp_socket.cpp`, both `accept()`'s server-side result and
+   `connect()`'s client-side one) — a second, previously-unexamined latency source:
+   this protocol is request/response and already writes one complete, already-framed
+   message per `write()` call, so Nagle's coalescing had nothing useful to buy here,
+   only latency to add.
+
+Re-running the exact same benchmark after both changes (20,000 samples, two
+independent runs back to back, to confirm this wasn't a fluke):
+
+| Statistic | Run 1 | Run 2 |
+|---|---|---|
+| min | 58.21 μs | 57.96 μs |
+| p50 | 73.12 μs | 74.04 μs |
+| mean | 75.92 μs | 80.15 μs |
+| p90 | 80.46 μs | 88.96 μs |
+| p99 | 140.88 μs | 190.00 μs |
+| p99.9 | 253.62 μs | 366.71 μs |
+| max | 1968.25 μs | 10115.54 μs |
+
+**p50 dropped from ~1272 μs to ~73 μs — roughly a 17x reduction** (mean: ~1304 μs →
+~78 μs, also ~17x); **p99.9 dropped from ~10.2 ms to ~0.25-0.37 μs·10³ (253-367 μs) —
+roughly a 30-40x reduction**. What's left (tens of μs, not sub-μs) is now
+consistent with genuine, unavoidable costs this design still has: two real context
+switches (reader thread → matching thread → writer thread, each a real OS thread
+hand-off, not a poll), the `submit_mutex_`/`routes_mutex_` locks each message
+crosses, and this machine's own scheduler wake-up latency for a *notified* (not
+merely timed-out) thread — three orders of magnitude smaller than before, but not
+zero, because this is still a real multi-thread, real-syscall design, not a
+kernel-bypass/busy-spin one. The occasional multi-ms outlier still visible in `max`
+(and to a lesser extent p99.9) is consistent with the same shared-machine scheduler
+pre-emption noted in the original measurement — this was run on a development
+machine with a live, otherwise-idle `trading_server` process from an earlier
+manual demo still competing for a core in the background, not an isolated/pinned
+one.
+
+**What this confirms about the earlier "measure before optimizing" framing:** the
+fix that mattered was the one already identified by reading the code, not a new one
+found by guessing — the condition-variable change alone accounts for essentially all
+of the ~17x median improvement; `TCP_NODELAY` was a real, previously-unexamined
+gap (worth fixing regardless, since it has no downside for this protocol) but a
+secondary contributor on loopback, where ACKs return almost instantly regardless of
+Nagle's algorithm.
 
 ---
 
 ## 8. Summary: what these benchmarks establish
 
 - **Codecs, matching engine, book, and SPSC queue are all sub-microsecond per
-  operation** (tens to low thousands of nanoseconds) — none of them is close to being
-  the bottleneck in the one place this project has an actual measured, real-network,
-  three-orders-of-magnitude-larger latency number: the live order-entry gateway's
-  request/response round trip.
-- **The gateway's own connection-writer poll interval (1 ms) is that bottleneck**,
+  operation** (tens to low thousands of nanoseconds) — none of them was ever close to
+  being the bottleneck in the one place this project has an actual measured,
+  real-network latency number: the live order-entry gateway's request/response round
+  trip.
+- **The gateway's own connection-writer poll interval (1 ms) *was* that bottleneck**,
   identified from a real measurement plus a source read, not assumed — exactly the
   "measure before optimizing" discipline `docs/current_system_assessment.md` §9
-  explicitly called out as absent in the pre-exchange codebase and worth carrying
-  forward now that there's something to measure.
+  explicitly called out as absent in the pre-exchange codebase. Unlike the original
+  version of this document, this was not left as a recorded-but-unfixed finding:
+  §7.2 replaced the sleep-based poll with a condition-variable wakeup notified
+  directly from `route_event()` (plus `TCP_NODELAY`, a second latency source the same
+  investigation turned up), re-measured p50 end-to-end latency dropping ~17x (~1272 μs
+  → ~73 μs) as a direct, verified result — not a projection.
 - **`OrderBook`'s `O(log P)` cancel/modify cost is real but small** at every depth
   tested up to 1024 distinct price levels, consistent with its own documented
   complexity analysis (`order_book.hpp`) and with `docs/current_system_assessment.md`

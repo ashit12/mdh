@@ -337,14 +337,19 @@ The single most useful finding, identified from a real measurement plus a
 source read rather than assumed: every hot-path component measured here
 (codec, matching engine, trader-side book, SPSC queue) costs tens to low
 thousands of nanoseconds per operation, while the real, live, real-TCP
-order-entry round trip measures ~0.7-1.3 ms at p50/mean -- three orders of
-magnitude larger, traced directly to `OrderEntryGateway::
+order-entry round trip *initially* measured ~0.7-1.3 ms at p50/mean -- three
+orders of magnitude larger, traced directly to `OrderEntryGateway::
 connection_writer_loop()`'s deliberate 1 ms `sleep_for` poll interval, not
-to anything slow inside matching/risk/ledger. See `docs/benchmarks.md` for
-every number, the machine they were measured on, and the full reasoning
-behind each one (including the real `PauseTiming()`/`ResumeTiming()`
-measurement-artifact caveat several of the matching-engine/book benchmarks
-have to account for).
+to anything slow inside matching/risk/ledger. That finding was then fixed and
+re-measured, not left as a recorded limitation: the writer thread now blocks
+on a condition variable notified directly by `route_event()` instead of
+polling on a timer (plus `TCP_NODELAY` on every connected `TcpSocket`, a
+second latency source the same investigation surfaced), dropping p50 to ~73
+μs -- roughly a 17x reduction, confirmed with two independent runs. See
+`docs/benchmarks.md` §7 for every number (both before and after), the
+machine they were measured on, and the full reasoning behind each one
+(including the real `PauseTiming()`/`ResumeTiming()` measurement-artifact
+caveat several of the matching-engine/book benchmarks have to account for).
 
 ---
 
