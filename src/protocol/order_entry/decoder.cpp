@@ -58,6 +58,7 @@ namespace {
         case exchange::RejectReason::InsufficientFunds:
         case exchange::RejectReason::InsufficientPosition:
         case exchange::RejectReason::OrderTooLarge:
+        case exchange::RejectReason::AccountMismatch:
             return true;
     }
     return false;

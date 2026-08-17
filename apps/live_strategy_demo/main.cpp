@@ -31,24 +31,26 @@
 // from that JSON response is a faithful, sufficient input -- it never
 // needs per-order identity or history, only current top-of-book prices.
 //
-// ── Why this needs its own, separate account id, never one of
+// ── Why this trades as its own, separate account id, never one of
 //    UiGatewayOptions::demo_account_ids ───────────────────────────────────
 // UiGateway::find_or_create_session() lazily opens its own real TCP
 // OrderEntryClient connection for account_id the first time any HTTP
-// request names it (see that method's own doc comment) -- and
-// OrderEntryGateway::routes_ maps one account_id to exactly one
-// Connection* (order_entry_gateway.hpp's own class comment). If this
-// app traded as account 1001-1003 (UiGateway's own demo accounts) at the
-// same time a browser dashboard requested that account, the two
-// independent TCP connections would fight over that single routes_ entry,
-// silently stealing each other's execution reports. Trading as a
-// dedicated account (default 9001, see kDefaultAccountId below) that is
-// never in demo_account_ids sidesteps this entirely: this app's resting
-// quotes are still fully visible to every dashboard viewer (the book is
-// public, not scoped per account -- see UiGateway::handle_get_book()), and
-// a human trader using the dashboard's own demo accounts can trade
-// against them for real, which is exactly what docs/live_demo.md's
-// walkthrough does.
+// request names it (see that method's own doc comment). Sharing an account
+// with it is no longer *unsafe* -- OrderEntryGateway supports many
+// sessions per account and routes each execution report back to the
+// session that placed the order (see its own session doc comment), where
+// it once mapped an account to exactly one connection and let a second one
+// silently take over the first's reports. What sharing would still be is
+// confusing: this app and a dashboard viewer would be two independent
+// traders spending the same balance and appearing in each other's
+// position, with neither one's view of "my account" telling the whole
+// story. Trading as a dedicated account (default 9001, see
+// kDefaultAccountId below) keeps the demonstration legible: this app's
+// resting quotes are still fully visible to every dashboard viewer (the
+// book is public, not scoped per account -- see
+// UiGateway::handle_get_book()), and a human trader using the dashboard's
+// own demo accounts can trade against them for real, which is exactly what
+// docs/live_demo.md's walkthrough does.
 //
 // Usage:
 //   live_strategy_demo [--host 127.0.0.1] [--tcp-port 7000] [--http-port 8080]

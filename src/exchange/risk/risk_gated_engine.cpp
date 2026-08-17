@@ -18,6 +18,15 @@ void RiskGatedEngine::process(const ExchangeCommand& command, const EventSink& s
             engine_.reject_new_order(*new_order, reason, sink);
             return;
         }
+    } else if (const auto* replace = std::get_if<ReplaceOrderCommand>(&command)) {
+        const RejectReason reason = risk_.check(*replace, ledger_);
+        if (reason != RejectReason::None) {
+            // Same pre-process rejection as NewOrder: the resting order and
+            // its hold are left exactly as they were. Ledger only mutates
+            // on events from a successful process() path.
+            engine_.reject_replace_order(*replace, reason, sink);
+            return;
+        }
     }
 
     engine_.process(command, [this, &sink](const ExchangeEvent& event) {

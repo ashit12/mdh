@@ -165,6 +165,27 @@ TEST(OrderEntryCodec, Rejected) {
     EXPECT_EQ(std::get<Rejected>(decoded), original);
 }
 
+// AccountMismatch is the one reject reason the gateway itself produces
+// rather than the matching or risk engine (see OrderEntryGateway's session
+// binding), and it is the highest-valued enumerator -- so this is also the
+// codec's check that appending to RejectReason kept the wire round-trip
+// intact.
+TEST(OrderEntryCodec, RejectedWithGatewayProducedAccountMismatchReason) {
+    Rejected original{
+        .account_id = 100,
+        .client_order_id = 7,
+        .instrument_id = 1,
+        .reason = RejectReason::AccountMismatch,
+    };
+
+    std::vector<std::byte> bytes;
+    encode_message(Message{original}, bytes);
+
+    Message decoded = decode_or_fail(bytes);
+    ASSERT_TRUE(std::holds_alternative<Rejected>(decoded));
+    EXPECT_EQ(std::get<Rejected>(decoded), original);
+}
+
 TEST(OrderEntryCodec, Cancelled) {
     Cancelled original{.account_id = 100, .client_order_id = 7, .exchange_order_id = 9001, .instrument_id = 1};
 

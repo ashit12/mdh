@@ -266,7 +266,7 @@ independent runs back to back, to confirm this wasn't a fluke):
 roughly a 30-40x reduction**. What's left (tens of μs, not sub-μs) is now
 consistent with genuine, unavoidable costs this design still has: two real context
 switches (reader thread → matching thread → writer thread, each a real OS thread
-hand-off, not a poll), the `submit_mutex_`/`routes_mutex_` locks each message
+hand-off, not a poll), the `submit_mutex_`/`sessions_mutex_` locks each message
 crosses, and this machine's own scheduler wake-up latency for a *notified* (not
 merely timed-out) thread — three orders of magnitude smaller than before, but not
 zero, because this is still a real multi-thread, real-syscall design, not a

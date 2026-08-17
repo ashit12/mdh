@@ -150,9 +150,9 @@ int main(int argc, char** argv) {
 
     // Milestone 14: also pre-seed apps/live_strategy_demo's own dedicated
     // trading account (never one of ui_options.demo_account_ids -- see
-    // that app's own top comment on why sharing an account id with a
-    // UiGateway-managed session would race on OrderEntryGateway's
-    // routes_). Same amounts, same pre-start() timing, same reasoning as
+    // that app's own top comment on why it trades as an account no
+    // dashboard viewer can also be trading as). Same amounts, same
+    // pre-start() timing, same reasoning as
     // the demo accounts immediately above; kept as its own loop (of one)
     // rather than folded into demo_account_ids itself specifically so
     // this account is never accidentally exposed through

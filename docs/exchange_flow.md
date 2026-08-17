@@ -115,12 +115,27 @@ translates them to `ExchangeCommand`s, and calls a mutex-serialized
 fed by `route_event()`, which runs *on the matching thread* as the
 `Processor`'s `EventSink` and therefore must never block — a slow client's
 socket cannot be allowed to stall matching for every other client).
-Session-to-account binding is opportunistic: a connection is unrouted until
-its first decoded message arrives, since every client message type already
-carries `account_id`. `test_order_entry_gateway_e2e.cpp` is the loop-closing
-test here — a hand-rolled test client drives a real `OrderEntryGateway` over
-real loopback TCP, including a two-connection crossing trade that exercises
-`TradeReport` fan-out to both sides independently.
+Session-to-account binding is opportunistic: a connection is unbound until
+its first valid request arrives, since every client message type already
+carries `account_id`. That binding is then immutable — a later message
+naming a different account is answered with `Rejected{AccountMismatch}` and
+never reaches the pipeline — and an account may have several sessions at
+once. Which of them a private report belongs to is decided by
+`(account_id, client_order_id)`, the same key `MatchingEngine` already uses
+for live orders: the gateway records the session that submitted each order
+and routes its reports back there, falling back to another live session for
+the account if that one has disconnected (a resting order outlives the session
+that placed it) and, failing even that, retaining the report until a session
+for the account reconnects. This retention is only a bounded, process-local
+best effort: queue overflow, a slow connected client, or a gateway restart
+can lose reports. Durable offline delivery and a full reconciliation protocol
+remain out of scope. None of this reaches into `ExchangeCommand`/
+`ExchangeEvent` — the exchange core has still never heard of a socket.
+`test_order_entry_gateway_e2e.cpp` is the loop-closing test here — a
+hand-rolled test client drives a real `OrderEntryGateway` over real loopback
+TCP, including a two-connection crossing trade that exercises `TradeReport`
+fan-out to both sides independently, and four session tests covering the
+routing rules above.
 
 **Milestone 8 — Trader-side OMS + order-entry client** (`trader/oms/`). The
 client-side counterpart to Milestone 7, reusing the exact same
@@ -396,7 +411,7 @@ over standing up a second UDP market-data subscriber, which would be new
 production networking work, not a demo). It trades as its own dedicated
 account (9001, pre-seeded by `trading_server` alongside its existing UI
 demo accounts but deliberately never one of them -- see that app's own
-comment on the `OrderEntryGateway::routes_` collision this avoids), so its
+comment on why a shared account would make the demonstration ambiguous), so its
 resting quotes are visible to every dashboard viewer (the book is public)
 while a human -- or, in this demonstration, `curl` exercising the exact same
 REST surface a human clicking the dashboard would use -- trades against it
@@ -700,24 +715,26 @@ same event stream with no extra coordination between `MatchingEngine` and
   against).
 
 ### `exchange/risk/` — pre-trade checks
-- **`risk_engine.hpp`/`.cpp`** — `RiskEngine::check(command, ledger)`:
-  read-only pre-trade checks against a `NewOrderCommand` — order size vs
-  `RiskLimits::max_order_quantity`, available cash for a buy, available
-  position for a sell. Returns `RejectReason::None` or a specific reason;
-  never mutates the ledger (reservation happens later, via `Ledger::apply()`
-  watching the resulting `OrderAccepted`). Only `NewOrderCommand` is
-  checked — `CancelOrderCommand` can't increase exposure, and
-  `ReplaceOrderCommand` is a documented, deliberate gap (see the class
-  comment in `risk_engine.hpp` for why: the priority-preserving replace path
-  never increases exposure, and the cancel-plus-new path is allowed to
-  overdraw rather than being rejected, for now).
+- **`risk_engine.hpp`/`.cpp`** — `RiskEngine::check(...)`: read-only
+  pre-trade checks against a `NewOrderCommand` or `ReplaceOrderCommand` —
+  order size vs `RiskLimits::max_order_quantity`, then available cash /
+  position. For a replace, only the *extra* exposure beyond the original
+  order's existing reservation must fit in available resources
+  (`max(0, new_required - old_required)`); a shrink always passes the
+  balance check. Returns `RejectReason::None` or a specific reason; never
+  mutates the ledger (reservation happens later, via `Ledger::apply()`
+  watching the resulting `OrderAccepted` / `OrderReplaced`).
+  `CancelOrderCommand` is not checked — it cannot increase exposure.
 - **`risk_gated_engine.hpp`/`.cpp`** — `RiskGatedEngine::process(command,
   sink)`: same signature as `MatchingEngine::process()`. Runs
-  `RiskEngine::check()` first for a `NewOrderCommand`; on reject, calls
-  `MatchingEngine::reject_new_order()` (so the rejection still consumes a
+  `RiskEngine::check()` first for a `NewOrderCommand` or
+  `ReplaceOrderCommand`; on reject, calls
+  `MatchingEngine::reject_new_order()` /
+  `reject_replace_order()` (so the rejection still consumes a
   real, gapless `event_sequence`) and stops — the command never reaches
-  `MatchingEngine::process()` at all. On pass (or for Cancel/Replace, which
-  skip the check entirely), delegates to the engine and feeds every emitted
+  `MatchingEngine::process()` at all, and a rejected replace leaves the
+  resting order and its hold untouched. On pass (or for Cancel, which
+  skips the check), delegates to the engine and feeds every emitted
   event to `Ledger::apply()` *before* forwarding it to the caller's `sink` —
   so by the time a caller observes an event, the ledger is already
   consistent with it. Deliberately keeps risk-check-then-reserve

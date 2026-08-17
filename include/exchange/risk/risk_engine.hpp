@@ -11,22 +11,16 @@
 // attempt at a real venue's full risk stack (margin, per-instrument limits,
 // self-trade prevention, kill switches, etc. are all out of scope here).
 //
-// Only NewOrderCommand is checked. CancelOrderCommand never increases an
-// account's exposure. ReplaceOrderCommand doesn't need an independent check
-// either, for a reason specific to *this* engine's own documented replace
-// policy (matching_engine.hpp): the priority-preserving path only ever
-// keeps quantity the same or shrinks it (never a check-worthy increase in
-// exposure), and the cancel-plus-new path is treated by Ledger's
-// on_order_replaced as a full, fresh reservation at the new price/quantity
-// regardless of size -- if that reservation would overdraw the account, it
-// simply goes negative rather than being rejected, a known, documented
-// simplification for this milestone (see RiskGatedEngine's own class
-// comment) rather than an oversight: correctly rejecting a too-large
-// replace would require the same before-you-touch-the-book check this class
-// gives NewOrderCommand, applied through the *matching engine's* two
-// different replace code paths instead of before them, which is
-// meaningfully more invasive to Milestone 2's already-tested code than this
-// milestone's scope calls for.
+// NewOrderCommand is checked against the account's currently *available*
+// (unreserved) cash/position. CancelOrderCommand never increases exposure
+// and is not checked. ReplaceOrderCommand *is* checked, but credits the
+// reservation already held for the original order: only the *extra*
+// exposure (max(0, new_required - old_required)) must fit in available
+// resources. A replace that shrinks or keeps exposure therefore always
+// passes the balance check (OrderTooLarge still applies to new_quantity).
+// If there is no open hold for the original id, this class returns None and
+// leaves UnknownOrderId / InvalidReplacement to MatchingEngine -- risk has
+// nothing to evaluate without a reservation to credit.
 namespace mdh::exchange::risk {
 
 struct RiskLimits {
@@ -43,9 +37,10 @@ public:
     // Returns RejectReason::None if `command` may proceed to the matching
     // engine, otherwise the specific reason it must not. Reads `ledger` but
     // never mutates it -- reservation happens later, via Ledger::apply()
-    // watching the resulting OrderAccepted (see ledger.hpp's own class
-    // comment); this function only decides yes/no.
+    // watching the resulting OrderAccepted / OrderReplaced (see ledger.hpp);
+    // this function only decides yes/no.
     [[nodiscard]] RejectReason check(const NewOrderCommand& command, const ledger::Ledger& ledger) const;
+    [[nodiscard]] RejectReason check(const ReplaceOrderCommand& command, const ledger::Ledger& ledger) const;
 
 private:
     RiskLimits limits_;

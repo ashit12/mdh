@@ -1,8 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -74,22 +76,67 @@
 //   ON the matching thread, synchronously, exactly like every other
 //   EventSink call site in this codebase (see event_sink.hpp) -- it must
 //   not block. It translates the event (via to_execution_reports()) and
-//   pushes the resulting per-account messages onto each target
-//   connection's own outbound SpscQueue, non-blocking (try_push()) --
-//   this is why every connection gets a queue instead of route_event()
-//   calling TcpSocket::write() directly, which would make the matching
-//   thread's throughput hostage to one slow client's socket. route_event()
-//   also invokes OrderEntryGatewayOptions::extra_event_sink (if set) with
-//   the raw, untranslated event -- see its own doc comment (Milestone 12).
-// - Session-to-account binding is opportunistic, not part of a handshake:
-//   a connection is unrouted (absent from routes_) until its first
-//   decoded client message arrives, since every client -> gateway message
-//   type carries account_id (see protocol/order_entry/messages.hpp) --
-//   there's nothing to wait for beyond that first message.
+//   pushes the resulting messages onto each target connection's own
+//   outbound SpscQueue, non-blocking (try_push()) -- this is why every
+//   connection gets a queue instead of route_event() calling
+//   TcpSocket::write() directly, which would make the matching thread's
+//   throughput hostage to one slow client's socket. Which connection is
+//   the target is the session model's job, immediately below.
+//   route_event() also invokes OrderEntryGatewayOptions::extra_event_sink
+//   (if set) with the raw, untranslated event -- see its own doc comment
+//   (Milestone 12).
+//
+// ── Sessions, and how a private report finds its way back ─────────────────
+//
+// One connection is one *session*. Session-to-account binding is
+// opportunistic, not part of a handshake: a connection is unbound until
+// its first valid client request arrives, since every client -> gateway
+// message type carries account_id (see protocol/order_entry/messages.hpp)
+// -- there's nothing to wait for beyond that first message. Two rules
+// follow from that, and they are what keep one client's execution stream
+// out of another's socket:
+//
+//   1. The binding is *immutable*. Every later message on the connection
+//      must carry the same account_id; one that doesn't is answered with
+//      a Rejected{AccountMismatch} and never reaches the pipeline, so a
+//      session can never trade (or spend the balance of) an account other
+//      than the one it bound to.
+//   2. An account may have *many* sessions. account_sessions_ maps one
+//      account to every connection currently bound to it, so a second
+//      connection for the same account joins the account instead of
+//      silently displacing whoever was there first.
+//
+// Many sessions per account then raises the question rule 2 exists to
+// answer properly: which of them should a given execution report go to?
+// Not all of them -- these are private, account-addressed reports, and a
+// session that placed nothing should not be told about an order it never
+// sent. The gateway therefore correlates each report back to the session
+// that *originated* it, using the one key the engine already guarantees
+// is unique among live orders: (account_id, client_order_id) -- see
+// MatchingEngine::LiveKey. order_owner_ records that mapping when a
+// connection's reader thread submits a command, before the command can
+// possibly produce an event, and route_event() resolves it in three
+// steps: the owning session if it's still connected, otherwise one
+// other live session of that account (a resting order outlives the
+// session that placed it -- there is no cancel-on-disconnect here), and
+// otherwise pending_reports_, which retains the report so a reconnecting
+// session can reconcile. That last queue is bounded and process-local, not
+// durable offline delivery: reports can be dropped on overflow and are lost
+// on restart. Deliberately, none of this reaches into
+// ExchangeCommand/ExchangeEvent: the exchange core stays a
+// transport-independent, deterministic, replayable thing that has never
+// heard of a socket (see commands.hpp's own comment), and the entire
+// session model lives here in the gateway.
 //
 // See tests/test_order_entry_gateway_e2e.cpp for the behavioral spec this
 // class is expected to satisfy end to end, over real TCP sockets.
 namespace mdh::exchange::gateway {
+
+// Identifies one connection for the lifetime of the gateway process.
+// Purely for diagnostics and for tests that need to talk about "the same
+// session" without holding a Connection* -- routing itself keys on
+// (account_id, client_order_id), never on this.
+using SessionId = std::uint64_t;
 
 struct OrderEntryGatewayOptions {
     risk::RiskLimits risk_limits{};
@@ -104,6 +151,19 @@ struct OrderEntryGatewayOptions {
 
     // Passed straight through to TcpSocket::listen()'s backlog parameter.
     int accept_backlog = 16;
+
+    // How many execution reports are retained per account while that
+    // account has no live session at all (see this class's own session
+    // doc comment): an order can rest, and later fill, long after the
+    // session that placed it disconnected, and dropping that fill on the
+    // floor would leave a reconnecting client unable to reconcile its own
+    // position. Once this many are queued for one account the oldest is
+    // dropped to make room -- the newest reports are the ones a
+    // reconciling client most needs, and retaining without bound would
+    // let a never-returning account grow this map forever. Set to 0 to
+    // disable retention entirely (reports for an account with no live
+    // session are simply dropped).
+    std::size_t pending_report_capacity = 1024;
 
     // Milestone 12: an optional second observer of every ExchangeEvent this
     // gateway's matching thread produces, invoked from route_event()
@@ -197,14 +257,37 @@ public:
     }
 
 private:
-    // One accepted TCP connection and everything that belongs to it.
-    // Allocated with std::make_unique and stored in connections_ so its
-    // address stays stable for the lifetime of the connection (routes_
-    // below holds raw, non-owning pointers to these) even as connections_
-    // itself grows.
+    // Identifies one order for as long as the gateway needs to know which
+    // session it came from. Same shape, and for exactly the same reason,
+    // as MatchingEngine::LiveKey: a client order id is only unique
+    // per-account, so nothing keyed on client_order_id alone would be
+    // unambiguous across two accounts that both chose id 1.
+    struct OrderKey {
+        AccountId account_id;
+        ClientOrderId client_order_id;
+
+        bool operator==(const OrderKey&) const = default;
+    };
+
+    struct OrderKeyHash {
+        [[nodiscard]] std::size_t operator()(const OrderKey& key) const {
+            const std::size_t a = std::hash<AccountId>{}(key.account_id);
+            const std::size_t b = std::hash<ClientOrderId>{}(key.client_order_id);
+            return a ^ (b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2));
+        }
+    };
+
+    // One accepted TCP connection -- one session -- and everything that
+    // belongs to it. Allocated with std::make_unique and stored in
+    // connections_ so its address stays stable for the lifetime of the
+    // connection (account_sessions_ and order_owner_ below hold raw,
+    // non-owning pointers to these) even as connections_ itself grows.
     struct Connection {
-        explicit Connection(net::TcpSocket socket_in, std::size_t outbound_capacity)
-            : socket(std::move(socket_in)), outbound(outbound_capacity) {}
+        explicit Connection(SessionId id, net::TcpSocket socket_in, std::size_t outbound_capacity)
+            : session_id(id), socket(std::move(socket_in)), outbound(outbound_capacity),
+              session_outbound(outbound_capacity) {}
+
+        SessionId session_id;
 
         net::TcpSocket socket;
 
@@ -226,6 +309,28 @@ private:
         // default.
         SpscQueue<protocol::order_entry::Message> outbound;
 
+        // The gateway's *own* replies to this connection -- currently just
+        // the Rejected{AccountMismatch} a bound session gets for claiming
+        // somebody else's account. A second queue rather than a second
+        // producer on `outbound`: SpscQueue is single-producer by contract
+        // (see spsc_queue.hpp -- its whole lock-free argument rests on
+        // head_ having exactly one writer), and `outbound`'s producer is
+        // the matching thread, whereas these are produced by this
+        // connection's own reader thread. One consumer, this connection's
+        // writer thread, drains both.
+        SpscQueue<protocol::order_entry::Message> session_outbound;
+
+        // Reports retained for this session's account while it had no live
+        // session at all (pending_reports_ below), handed over at bind time
+        // so a reconnecting client can reconcile. Drained by the writer
+        // thread ahead of either queue above, which is what keeps a
+        // retained report from arriving after a live one: the handover
+        // happens while sessions_mutex_ is held, before this session is
+        // visible in account_sessions_, so route_event() cannot have
+        // pushed anything to `outbound` yet.
+        std::mutex replay_mutex;
+        std::vector<protocol::order_entry::Message> replay_backlog;
+
         // Lets connection_writer_loop() block until route_event() actually
         // pushes something for this connection instead of unconditionally
         // sleeping a fixed poll interval every time it finds outbound
@@ -244,15 +349,26 @@ private:
         std::mutex wake_mutex;
         std::condition_variable wake_cv;
 
-        // Written exactly once, only by this connection's own reader
-        // thread (see accept_loop()'s / connection_reader_loop()'s
-        // opportunistic-binding doc comment) -- single-writer, so no
-        // atomics needed on this field itself. routes_ (guarded by its own
-        // mutex) is what makes the *binding* visible to the matching
-        // thread; this field is purely so the reader thread itself can
-        // tell "have I already registered myself" without re-locking
-        // routes_mutex_ on every single message.
+        // The account this session bound to on its first valid request,
+        // and never anything else afterwards (see this class's own session
+        // doc comment on why the binding is immutable). Written exactly
+        // once, only by this connection's own reader thread -- single
+        // writer, so no atomic needed on the field itself. It's
+        // account_sessions_ (guarded by sessions_mutex_) that makes the
+        // binding visible to the matching thread; this field is what lets
+        // the reader thread check "am I already bound, and to whom" on
+        // every subsequent message without touching that mutex.
         std::optional<AccountId> account_id;
+
+        // Set by this connection's reader thread as it exits (peer EOF,
+        // read error, or stop()'s shutdown()) and read by the matching
+        // thread in route_event(). Between that store and the unbinding
+        // that follows it, this is what stops a report being pushed onto
+        // a queue whose writer thread is on its way out; after unbinding,
+        // the connection is unreachable from routes at all. Also the
+        // writer thread's own exit condition, so a disconnected client's
+        // writer doesn't linger until stop().
+        std::atomic<bool> closed{false};
 
         std::jthread reader_thread;
         std::jthread writer_thread;
@@ -276,8 +392,10 @@ private:
     // TcpSocket::read()), accumulates them in conn.read_buffer, decodes
     // complete messages via protocol::order_entry::decode_message(),
     // translates each via to_command(), and calls submit_command(). Also
-    // responsible for the opportunistic account_id -> routes_ binding
-    // described in Connection's own doc comment. Exits when read() reports
+    // responsible for this session's account binding and for claiming
+    // ownership of every order id it submits, both described in this
+    // class's own session doc comment, and for unbinding the session again
+    // once it exits. Exits when read() reports
     // EOF/error (including the shutdown() this class's stop() triggers). A
     // malformed header (bad type byte) or a header whose payload hasn't
     // fully arrived yet are treated identically -- wait for the next
@@ -288,26 +406,66 @@ private:
     // the byte stream) is still intact.
     void connection_reader_loop(Connection& conn);
 
-    // Runs on `conn`'s own writer thread. Drains conn.outbound (try_pop())
-    // against `token`, encoding and writing each Message it finds via
-    // protocol::order_entry::encode_message() + TcpSocket::write() --
-    // remember write() can itself return a short count (tcp_socket.hpp's
-    // own doc comment), so a single write() call is not guaranteed to
-    // flush one whole encoded message. When outbound is empty, blocks on
-    // conn.wake_cv (see Connection's own doc comment) instead of
-    // unconditionally sleeping a fixed interval -- route_event() notifies
-    // this directly the moment it pushes something for this connection, so
-    // in the common case this thread reacts immediately rather than on its
-    // next poll tick.
+    // Runs on `conn`'s own writer thread. Drains, in priority order,
+    // conn.replay_backlog (retained reports handed over at bind time),
+    // conn.session_outbound (the gateway's own replies) and conn.outbound
+    // (execution reports from the matching thread), encoding and writing
+    // each Message it finds via protocol::order_entry::encode_message() +
+    // TcpSocket::write() -- remember write() can itself return a short
+    // count (tcp_socket.hpp's own doc comment), so a single write() call
+    // is not guaranteed to flush one whole encoded message. When all three
+    // are empty, blocks on conn.wake_cv (see Connection's own doc comment)
+    // instead of unconditionally sleeping a fixed interval -- every
+    // producer notifies this directly the moment it pushes, so in the
+    // common case this thread reacts immediately rather than on its next
+    // poll tick. Exits on `token`, or as soon as its own connection is
+    // marked closed.
     void connection_writer_loop(Connection& conn, std::stop_token token);
+
+    // Binds this session to `account_id` (its first valid request) and
+    // hands it whatever pending_reports_ accumulated for that account
+    // while it had no live session. Runs on `conn`'s reader thread.
+    void bind_session(Connection& conn, AccountId account_id);
+
+    // Removes this session from account_sessions_ and drops every
+    // order_owner_ entry pointing at it, so nothing routes to a connection
+    // that is on its way out. Runs on `conn`'s reader thread as it exits.
+    void unbind_session(Connection& conn);
+
+    // Answers a request whose account_id isn't the one this session bound
+    // to with a Rejected{AccountMismatch}, without `command` ever reaching
+    // the pipeline. The connection stays open and stays bound to its
+    // original account. Runs on `conn`'s reader thread.
+    void reject_account_mismatch(Connection& conn, const ExchangeCommand& command);
+
+    // Records `conn` as the owner of every order id `message` submits
+    // under, so route_event() can send the resulting reports back to this
+    // session specifically. Must be called *before* submit_command(),
+    // otherwise the matching thread can emit an event for an id that has
+    // no owner yet. Runs on `conn`'s reader thread.
+    void claim_order_ownership(Connection& conn, AccountId account_id,
+                                const protocol::order_entry::Message& message);
 
     // Installed as the EventSink handed to pipeline_'s Processor -- runs on
     // the matching thread (see class-level comment on why it must not
-    // block). Calls to_execution_reports(event), then for each
-    // (account_id, message) pair, looks up that account's Connection in
-    // routes_ (guarded by routes_mutex_) and pushes onto its outbound
-    // queue.
+    // block). Calls to_execution_reports(event), then resolves each report
+    // to a session under sessions_mutex_ -- owning session, else one
+    // other live session of the account, else retained in pending_reports_
+    // -- and finally updates order ownership for the event.
     void route_event(const ExchangeEvent& event);
+
+    // Pushes one report onto `conn`'s outbound queue and wakes its writer.
+    // Called by route_event() with sessions_mutex_ held; a full queue
+    // drops, exactly as before (that connection's writer has fallen
+    // behind, and the matching thread must not block on it).
+    void deliver(Connection& conn, protocol::order_entry::Message message);
+
+    // Keeps order_owner_ in step with the engine's own live-order
+    // lifecycle as events go by: carries ownership from the original to
+    // the new id on a replace, and drops keys whose order is provably gone
+    // (cancelled, fully filled, or rejected in a way that leaves nothing
+    // live behind). Called by route_event() with sessions_mutex_ held.
+    void update_order_ownership(const ExchangeEvent& event);
 
     // Translates one decoded client -> gateway wire message into the
     // matching engine's own command vocabulary. Returns std::nullopt for a
@@ -318,7 +476,7 @@ private:
     // since this protocol has no NAK/error-response type to report it with.
     [[nodiscard]] static std::optional<ExchangeCommand> to_command(const protocol::order_entry::Message& message);
 
-    // Translates one ExchangeEvent into zero or more (account_id, message)
+    // Translates one ExchangeEvent into zero or more (order key, message)
     // pairs to deliver over the wire. Zero for every Book* event (see
     // events.hpp's own comment on why those are deliberately anonymous --
     // they belong to market data, Milestone 6, not order entry). One for
@@ -328,7 +486,11 @@ private:
     // to two different connections -- see this file's class-level comment
     // and the plan this scaffold was built from for why TradeReport is
     // deliberately one-sided rather than mirroring TradeExecuted's shape.
-    [[nodiscard]] static std::vector<std::pair<AccountId, protocol::order_entry::Message>> to_execution_reports(
+    // The key is what route_event() resolves to a session: the account
+    // alone would only narrow a report down to "some connection of this
+    // account", which is exactly the ambiguity the session model exists to
+    // remove.
+    [[nodiscard]] static std::vector<std::pair<OrderKey, protocol::order_entry::Message>> to_execution_reports(
         const ExchangeEvent& event);
 
     std::uint16_t port_;
@@ -341,13 +503,38 @@ private:
     // Guarded by connections_mutex_: accept_loop() appends on the accept
     // thread, connection_count() and stop() read it from whatever thread
     // calls them. Connection objects are allocated with make_unique
-    // specifically so a pointer into one (see routes_ below) stays valid
-    // even while this vector itself grows and reallocates.
+    // specifically so a pointer into one (see the routing state below)
+    // stays valid even while this vector itself grows and reallocates,
+    // and they are never erased before stop() -- a disconnected session
+    // unbinds itself from every map below, which is what makes it
+    // unreachable, rather than being destroyed out from under a pointer
+    // the matching thread might still be holding.
     mutable std::mutex connections_mutex_;
     std::vector<std::unique_ptr<Connection>> connections_;
 
-    std::mutex routes_mutex_;
-    std::unordered_map<AccountId, Connection*> routes_; // non-owning; see Connection's own doc comment
+    SessionId next_session_id_ = 1; // accept thread only
+
+    // ── Routing state: all three guarded by sessions_mutex_ ───────────────
+    // Written by connection reader threads (binding, unbinding, claiming
+    // order ids), read and written by the matching thread inside
+    // route_event(). All pointers are non-owning -- connections_ above owns
+    // the Connection objects themselves.
+    std::mutex sessions_mutex_;
+
+    // Every session currently bound to an account, in bind order (oldest
+    // first). An account with no live session has no entry at all.
+    std::unordered_map<AccountId, std::vector<Connection*>> account_sessions_;
+
+    // Which session an order belongs to, i.e. where its private reports
+    // should go. Populated when a reader thread submits a command, kept in
+    // step with the engine's live orders by update_order_ownership().
+    std::unordered_map<OrderKey, Connection*, OrderKeyHash> order_owner_;
+
+    // Reports for an account that currently has no live session at all,
+    // replayed to the next session that binds to it -- see
+    // OrderEntryGatewayOptions::pending_report_capacity for the bound on
+    // how many are kept.
+    std::unordered_map<AccountId, std::deque<protocol::order_entry::Message>> pending_reports_;
 
     std::mutex submit_mutex_; // see submit_command()'s doc comment
 

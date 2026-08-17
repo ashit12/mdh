@@ -67,6 +67,13 @@ enum class RejectReason {
     InsufficientFunds,    // buy: account's available (unreserved) cash can't cover price * quantity
     InsufficientPosition, // sell: account's available (unreserved) instrument holdings are short
     OrderTooLarge,        // exceeds RiskLimits::max_order_quantity
+    // Milestone 7 (exchange/gateway/): the message's account_id is not the
+    // one this connection bound to on its first message. Unlike every
+    // reason above, this one is produced by the gateway itself and the
+    // command never reaches the matching engine at all -- see
+    // OrderEntryGateway's own session-binding doc comment. Appended last
+    // so every existing reason keeps its on-wire value.
+    AccountMismatch,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(RejectReason r) {
@@ -83,6 +90,7 @@ enum class RejectReason {
         case RejectReason::InsufficientFunds:     return "InsufficientFunds";
         case RejectReason::InsufficientPosition:  return "InsufficientPosition";
         case RejectReason::OrderTooLarge:         return "OrderTooLarge";
+        case RejectReason::AccountMismatch:       return "AccountMismatch";
     }
     return "UnknownRejectReason";
 }

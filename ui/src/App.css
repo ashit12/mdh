@@ -194,14 +194,22 @@
   font-weight: 600;
 }
 
+/* Stays a real table-cell (a flex td drops out of the table's column model,
+   so its buttons overflow the table box instead of widening the column).
+   width: 1% + nowrap is the shrink-to-fit idiom for an auto-layout table. */
 .actions {
-  display: flex;
-  gap: 0.3rem;
+  width: 1%;
+  white-space: nowrap;
+  text-align: right;
 }
 
 .actions button {
   padding: 0.25rem 0.5rem;
   font-size: 0.75rem;
+}
+
+.actions button + button {
+  margin-left: 0.3rem;
 }
 
 .replace-row input {

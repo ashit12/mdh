@@ -53,6 +53,14 @@ public:
     // is purely "emit the event using the right counter."
     void reject_new_order(const NewOrderCommand& command, RejectReason reason, const EventSink& sink);
 
+    // Same as reject_new_order(), for a ReplaceOrderCommand rejected by
+    // RiskEngine before process_replace() runs. Reports under
+    // original_client_order_id (MatchingEngine's own convention for every
+    // replace rejection). The resting order and its ledger hold are left
+    // untouched -- the caller must not have invoked process() for this
+    // command.
+    void reject_replace_order(const ReplaceOrderCommand& command, RejectReason reason, const EventSink& sink);
+
     // A canonical, deterministically-ordered dump of every resting order
     // across every instrument (Milestone 3) -- see state_snapshot.hpp for
     // why this is safe to compare with == across two independently-built

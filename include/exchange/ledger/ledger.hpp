@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 
 #include "common/types.hpp"
@@ -83,6 +84,17 @@ struct AccountBalances {
     std::unordered_map<InstrumentId, Quantity> position_reserved;
 };
 
+// Read-only view of one open reservation -- what RiskEngine needs to credit
+// an existing order when evaluating a ReplaceOrderCommand (see risk/
+// RiskEngine::check(ReplaceOrderCommand)). Mirrors the private Hold fields
+// that matter for that check; not a mutation handle.
+struct HoldView {
+    InstrumentId instrument_id;
+    Side side;
+    Price limit_price;
+    Quantity remaining;
+};
+
 class Ledger {
 public:
     // Adds cash to an account (test/admin seeding only).
@@ -107,6 +119,13 @@ public:
     // (all-zero) AccountBalances for an account never seen before, rather
     // than requiring the caller to check existence first.
     [[nodiscard]] AccountBalances balances(AccountId account_id) const;
+
+    // The open reservation for (account_id, client_order_id), if any.
+    // std::nullopt when nothing is held under that key (unknown order, or
+    // an IOC/FOK that never reserved). Read-only -- RiskEngine uses this to
+    // compute the *extra* exposure a replace would need beyond what's
+    // already locked for the original order.
+    [[nodiscard]] std::optional<HoldView> find_hold(AccountId account_id, ClientOrderId client_order_id) const;
 
     // Updates balances/holds in response to one matching-engine event.
     //

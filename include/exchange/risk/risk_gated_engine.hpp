@@ -47,8 +47,10 @@ public:
     RiskGatedEngine(MatchingEngine& engine, ledger::Ledger& ledger, RiskLimits limits = {});
 
     // Same signature as MatchingEngine::process() -- see class-level
-    // comment. Only NewOrderCommand is ever risk-checked; see
-    // RiskEngine's own class comment for why Cancel/Replace are exempt.
+    // comment. NewOrderCommand and ReplaceOrderCommand are risk-checked
+    // before the matching engine sees them (CancelOrderCommand is not --
+    // see RiskEngine); a failed check emits OrderRejected via
+    // reject_new_order()/reject_replace_order() and never calls process().
     // Every event actually emitted by the underlying MatchingEngine is fed
     // to `ledger` before being forwarded to `sink`, so a caller observing
     // `sink` sees ledger state that is already consistent with the event

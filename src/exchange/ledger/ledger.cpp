@@ -36,6 +36,19 @@ AccountBalances Ledger::balances(AccountId account_id) const {
     return it == accounts_.end() ? AccountBalances{} : it->second;
 }
 
+std::optional<HoldView> Ledger::find_hold(AccountId account_id, ClientOrderId client_order_id) const {
+    const auto it = holds_.find(HoldKey{account_id, client_order_id});
+    if (it == holds_.end()) {
+        return std::nullopt;
+    }
+    return HoldView{
+        .instrument_id = it->second.instrument_id,
+        .side = it->second.side,
+        .limit_price = it->second.limit_price,
+        .remaining = it->second.remaining,
+    };
+}
+
 void Ledger::open_hold(AccountId account_id, ClientOrderId client_order_id, InstrumentId instrument_id, Side side,
                         Price limit_price, Quantity quantity) {
     if (quantity == 0) {

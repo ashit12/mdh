@@ -64,6 +64,18 @@ void MatchingEngine::reject_new_order(const NewOrderCommand& command, RejectReas
     });
 }
 
+void MatchingEngine::reject_replace_order(const ReplaceOrderCommand& command, RejectReason reason,
+                                           const EventSink& sink) {
+    sink(OrderRejected{
+        .event_sequence = next_event_sequence_++,
+        .command_sequence = command.command_sequence,
+        .account_id = command.account_id,
+        .client_order_id = command.original_client_order_id,
+        .instrument_id = command.instrument_id,
+        .reason = reason,
+    });
+}
+
 Quantity MatchingEngine::crossable_quantity(InstrumentId instrument_id, Side incoming_side, Price price,
                                              Quantity quantity) const {
     auto it = books_.find(instrument_id);
