@@ -121,6 +121,36 @@ void MatchingBook::remove_front(Side book_side) {
     }
 }
 
+Quantity MatchingBook::crossable_quantity(Side book_side, Price price, Quantity quantity) const {
+    Quantity total = 0;
+    if (book_side == Side::Buy) {
+        for (const auto& [level_price, level] : bids_) {
+            if (price > level_price) {
+                break;
+            }
+            for (const auto& order : level) {
+                total += order.remaining_quantity;
+                if (total >= quantity) {
+                    return total;
+                }
+            }
+        }
+    } else {
+        for (const auto& [level_price, level] : asks_) {
+            if (price < level_price) {
+                break;
+            }
+            for (const auto& order : level) {
+                total += order.remaining_quantity;
+                if (total >= quantity) {
+                    return total;
+                }
+            }
+        }
+    }
+    return total;
+}
+
 std::vector<ExchangeRestingOrder> MatchingBook::all_bids() const {
     std::vector<ExchangeRestingOrder> result;
     for (const auto& [price, level] : bids_) {

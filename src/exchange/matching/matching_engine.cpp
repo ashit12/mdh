@@ -82,22 +82,8 @@ Quantity MatchingEngine::crossable_quantity(InstrumentId instrument_id, Side inc
     if (it == books_.end()) {
         return 0;
     }
-    // all_bids()/all_asks() are already ordered price-priority-then-FIFO, so
-    // the first non-crossing level ends the scan -- nothing after it can
-    // cross either.
-    const auto contra_orders = incoming_side == Side::Buy ? it->second.all_asks() : it->second.all_bids();
-    Quantity total = 0;
-    for (const auto& order : contra_orders) {
-        const bool crosses = incoming_side == Side::Buy ? price >= order.price : price <= order.price;
-        if (!crosses) {
-            break;
-        }
-        total += order.remaining_quantity;
-        if (total >= quantity) {
-            break;
-        }
-    }
-    return total;
+    const Side contra_side = incoming_side == Side::Buy ? Side::Sell : Side::Buy;
+    return it->second.crossable_quantity(contra_side, price, quantity);
 }
 
 void MatchingEngine::match_and_rest(ExchangeRestingOrder& incoming, CommandSequence command_sequence,

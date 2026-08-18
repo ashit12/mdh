@@ -66,6 +66,15 @@ public:
     [[nodiscard]] std::vector<ExchangeRestingOrder> all_bids() const;
     [[nodiscard]] std::vector<ExchangeRestingOrder> all_asks() const;
 
+    // FOK's all-or-none pre-check: sums remaining quantity on `book_side`
+    // that would immediately cross at `price` or better, stopping as soon
+    // as either the first non-crossing level is reached or `quantity` is
+    // already satisfied. Walks bids_/asks_ in place -- unlike all_bids()/
+    // all_asks(), this never materializes a copy of the side being
+    // scanned, so its cost is bounded by how many orders it actually needs
+    // to look at, not by how many orders are resting on that side.
+    [[nodiscard]] Quantity crossable_quantity(Side book_side, Price price, Quantity quantity) const;
+
 private:
     struct Location {
         Side side;
