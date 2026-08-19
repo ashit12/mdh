@@ -1,10 +1,39 @@
 #include "exchange/matching/matching_engine.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <type_traits>
 #include <variant>
 
 namespace mdh::exchange {
+namespace {
+
+// live_orders_ allocates a single 48-byte node per resting order, so this
+// pool only ever needs to serve small blocks. The bound is nonetheless set
+// an order of magnitude above that, for the reason spelled out in
+// matching_book.cpp: libc++ only pools blocks up to a quarter of this value,
+// and a node that misses the pool lands in an adhoc list with a linear-scan
+// deallocate.
+constexpr std::size_t kLargestPooledBlock = 512;
+constexpr std::size_t kMaxBlocksPerChunk = 4096;
+
+constexpr std::size_t kInitialLiveOrderBuckets = 1024;
+constexpr std::size_t kInitialInstrumentBuckets = 16;
+
+} // namespace
+
+MatchingEngine::MatchingEngine()
+    : pool_(std::make_unique<std::pmr::unsynchronized_pool_resource>(
+          std::pmr::pool_options{.max_blocks_per_chunk = kMaxBlocksPerChunk,
+                                 .largest_required_pool_block = kLargestPooledBlock})),
+      live_orders_(pool_.get()) {
+    books_.reserve(kInitialInstrumentBuckets);
+    live_orders_.reserve(kInitialLiveOrderBuckets);
+}
+
+MatchingBook& MatchingEngine::book_for(InstrumentId instrument_id) {
+    return books_.try_emplace(instrument_id, instrument_id).first->second;
+}
 
 EngineStateSnapshot MatchingEngine::snapshot() const {
     std::vector<InstrumentId> instrument_ids;
@@ -88,18 +117,28 @@ Quantity MatchingEngine::crossable_quantity(InstrumentId instrument_id, Side inc
 
 void MatchingEngine::match_and_rest(ExchangeRestingOrder& incoming, CommandSequence command_sequence,
                                      const EventSink& sink) {
-    MatchingBook& book = books_[incoming.instrument_id];
+    MatchingBook& book = book_for(incoming.instrument_id);
     const Side contra_side = incoming.side == Side::Buy ? Side::Sell : Side::Buy;
 
     while (incoming.remaining_quantity > 0) {
-        const auto contra = book.front_of_best(contra_side);
-        if (!contra.has_value()) {
+        const BookOrder* contra = book.front_of_best(contra_side);
+        if (contra == nullptr) {
             break;
         }
         const bool crosses = incoming.side == Side::Buy ? incoming.price >= contra->price : incoming.price <= contra->price;
         if (!crosses) {
             break;
         }
+
+        // Everything this iteration still needs once the book has been
+        // mutated, read out while `contra` is guaranteed to be valid: the
+        // full-fill branch below calls remove_front(), which destroys the
+        // order this points at.
+        const AccountId contra_account_id = contra->account_id;
+        const ClientOrderId contra_client_order_id = contra->client_order_id;
+        const ExchangeOrderId contra_exchange_order_id = contra->exchange_order_id;
+        const Side contra_order_side = contra->side;
+        const Price contra_price = contra->price;
 
         const Quantity trade_qty = std::min(incoming.remaining_quantity, contra->remaining_quantity);
         incoming.remaining_quantity -= trade_qty;
@@ -112,9 +151,9 @@ void MatchingEngine::match_and_rest(ExchangeRestingOrder& incoming, CommandSeque
             .remaining_quantity = incoming.remaining_quantity,
         };
         const TradeCounterparty resting_cp{
-            .account_id = contra->account_id,
-            .client_order_id = contra->client_order_id,
-            .exchange_order_id = contra->exchange_order_id,
+            .account_id = contra_account_id,
+            .client_order_id = contra_client_order_id,
+            .exchange_order_id = contra_exchange_order_id,
             .remaining_quantity = contra_remaining_after,
         };
 
@@ -126,7 +165,7 @@ void MatchingEngine::match_and_rest(ExchangeRestingOrder& incoming, CommandSeque
             .event_sequence = next_event_sequence_++,
             .command_sequence = command_sequence,
             .instrument_id = incoming.instrument_id,
-            .price = contra->price,
+            .price = contra_price,
             .quantity = trade_qty,
             .aggressor_side = incoming.side,
             .buyer = incoming.side == Side::Buy ? aggressor_cp : resting_cp,
@@ -135,22 +174,22 @@ void MatchingEngine::match_and_rest(ExchangeRestingOrder& incoming, CommandSeque
 
         if (contra_remaining_after == 0) {
             book.remove_front(contra_side);
-            live_orders_.erase(LiveKey{contra->account_id, contra->client_order_id});
+            live_orders_.erase(LiveKey{contra_account_id, contra_client_order_id});
             sink(BookOrderRemoved{
                 .event_sequence = next_event_sequence_++,
                 .instrument_id = incoming.instrument_id,
-                .exchange_order_id = contra->exchange_order_id,
-                .side = contra->side,
-                .price = contra->price,
+                .exchange_order_id = contra_exchange_order_id,
+                .side = contra_order_side,
+                .price = contra_price,
             });
         } else {
             book.reduce_front(contra_side, contra_remaining_after);
             sink(BookOrderReduced{
                 .event_sequence = next_event_sequence_++,
                 .instrument_id = incoming.instrument_id,
-                .exchange_order_id = contra->exchange_order_id,
-                .side = contra->side,
-                .price = contra->price,
+                .exchange_order_id = contra_exchange_order_id,
+                .side = contra_order_side,
+                .price = contra_price,
                 .new_remaining_quantity = contra_remaining_after,
             });
         }
@@ -163,7 +202,7 @@ void MatchingEngine::rest_remainder_if_applicable(const ExchangeRestingOrder& or
         // resting, so there is nothing to announce.
         return;
     }
-    books_[order.instrument_id].add(order);
+    book_for(order.instrument_id).add(order);
     live_orders_[LiveKey{order.account_id, order.client_order_id}] =
         LiveOrderRef{order.instrument_id, order.exchange_order_id};
     sink(BookOrderAdded{
@@ -235,13 +274,13 @@ void MatchingEngine::process_new_order(const NewOrderCommand& cmd, const EventSi
         .exchange_order_id = exchange_order_id,
         .client_order_id = cmd.client_order_id,
         .account_id = cmd.account_id,
-        .instrument_id = cmd.instrument_id,
-        .side = cmd.side,
         .price = cmd.price,
         .original_quantity = cmd.quantity,
         .remaining_quantity = cmd.quantity,
-        .time_in_force = cmd.time_in_force,
         .order_sequence = next_priority_++,
+        .instrument_id = cmd.instrument_id,
+        .side = cmd.side,
+        .time_in_force = cmd.time_in_force,
     };
 
     sink(OrderAccepted{
@@ -279,7 +318,7 @@ void MatchingEngine::process_cancel(const CancelOrderCommand& cmd, const EventSi
 
     const ExchangeOrderId exchange_order_id = it->second.exchange_order_id;
     live_orders_.erase(it);
-    const auto removed = books_[cmd.instrument_id].remove(exchange_order_id);
+    const auto removed = book_for(cmd.instrument_id).remove(exchange_order_id);
     // live_orders_ and each MatchingBook are kept in sync at every mutation
     // point in this engine, so `removed` is guaranteed to have a value here.
 
@@ -328,7 +367,7 @@ void MatchingEngine::process_replace(const ReplaceOrderCommand& cmd, const Event
     }
 
     const ExchangeOrderId old_exchange_order_id = it->second.exchange_order_id;
-    MatchingBook& book = books_[cmd.instrument_id];
+    MatchingBook& book = book_for(cmd.instrument_id);
     const auto old_order = book.find(old_exchange_order_id);
     // Guaranteed to have a value: same invariant as process_cancel.
 
@@ -398,13 +437,13 @@ void MatchingEngine::process_replace(const ReplaceOrderCommand& cmd, const Event
         .exchange_order_id = new_exchange_order_id,
         .client_order_id = cmd.new_client_order_id,
         .account_id = cmd.account_id,
-        .instrument_id = cmd.instrument_id,
-        .side = old_order->side,
         .price = cmd.new_price,
         .original_quantity = cmd.new_quantity,
         .remaining_quantity = cmd.new_quantity,
-        .time_in_force = old_order->time_in_force,
         .order_sequence = next_priority_++,
+        .instrument_id = cmd.instrument_id,
+        .side = old_order->side,
+        .time_in_force = old_order->time_in_force,
     };
     match_and_rest(new_order, cmd.command_sequence, sink);
     rest_remainder_if_applicable(new_order, sink);

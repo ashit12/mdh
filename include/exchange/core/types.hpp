@@ -31,7 +31,7 @@ enum class OrderType {
     return "UnknownOrderType";
 }
 
-enum class TimeInForce {
+enum class TimeInForce : std::uint8_t {
     GTC, // Good-Til-Cancelled: unmatched remainder rests on the book.
     IOC, // Immediate-Or-Cancel: unmatched remainder is discarded, never rests.
     FOK, // Fill-Or-Kill: fully filled immediately, or not executed at all.

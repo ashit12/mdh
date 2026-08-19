@@ -11,18 +11,18 @@ ExchangeRestingOrder make_order(ExchangeOrderId id, Side side, Price price, Quan
         .exchange_order_id = id,
         .client_order_id = client_order_id,
         .account_id = account_id,
-        .instrument_id = 1,
-        .side = side,
         .price = price,
         .original_quantity = qty,
         .remaining_quantity = qty,
-        .time_in_force = TimeInForce::GTC,
         .order_sequence = id,
+        .instrument_id = 1,
+        .side = side,
+        .time_in_force = TimeInForce::GTC,
     };
 }
 
 TEST(MatchingBook, AddThenFindOnEmptyBook) {
-    MatchingBook book;
+    MatchingBook book{1};
     EXPECT_FALSE(book.find(1).has_value());
 
     book.add(make_order(1, Side::Buy, 100, 10));
@@ -33,23 +33,23 @@ TEST(MatchingBook, AddThenFindOnEmptyBook) {
 }
 
 TEST(MatchingBook, FifoOrderWithinOneLevel) {
-    MatchingBook book;
+    MatchingBook book{1};
     book.add(make_order(1, Side::Buy, 100, 5));
     book.add(make_order(2, Side::Buy, 100, 7));
     book.add(make_order(3, Side::Buy, 100, 9));
 
-    auto front = book.front_of_best(Side::Buy);
-    ASSERT_TRUE(front.has_value());
+    const BookOrder* front = book.front_of_best(Side::Buy);
+    ASSERT_NE(front, nullptr);
     EXPECT_EQ(front->exchange_order_id, 1u); // first-added is first in FIFO
 
     book.remove_front(Side::Buy);
     front = book.front_of_best(Side::Buy);
-    ASSERT_TRUE(front.has_value());
+    ASSERT_NE(front, nullptr);
     EXPECT_EQ(front->exchange_order_id, 2u);
 }
 
 TEST(MatchingBook, BestBidIsHighestAndBestAskIsLowest) {
-    MatchingBook book;
+    MatchingBook book{1};
     book.add(make_order(1, Side::Buy, 100, 1));
     book.add(make_order(2, Side::Buy, 105, 1));
     book.add(make_order(3, Side::Buy, 102, 1));
@@ -64,7 +64,7 @@ TEST(MatchingBook, BestBidIsHighestAndBestAskIsLowest) {
 }
 
 TEST(MatchingBook, RemoveByIdWorksFromAnyFifoPositionNotJustFront) {
-    MatchingBook book;
+    MatchingBook book{1};
     book.add(make_order(1, Side::Buy, 100, 5));
     book.add(make_order(2, Side::Buy, 100, 7));
     book.add(make_order(3, Side::Buy, 100, 9));
@@ -82,13 +82,13 @@ TEST(MatchingBook, RemoveByIdWorksFromAnyFifoPositionNotJustFront) {
 }
 
 TEST(MatchingBook, RemoveUnknownIdReturnsNullopt) {
-    MatchingBook book;
+    MatchingBook book{1};
     book.add(make_order(1, Side::Buy, 100, 5));
     EXPECT_FALSE(book.remove(999).has_value());
 }
 
 TEST(MatchingBook, EmptyLevelIsClearedAfterLastOrderRemoved) {
-    MatchingBook book;
+    MatchingBook book{1};
     book.add(make_order(1, Side::Buy, 100, 5));
     EXPECT_TRUE(book.best_bid_price().has_value());
 
@@ -97,7 +97,7 @@ TEST(MatchingBook, EmptyLevelIsClearedAfterLastOrderRemoved) {
 }
 
 TEST(MatchingBook, EmptyLevelIsClearedAfterRemoveFrontOfLastOrder) {
-    MatchingBook book;
+    MatchingBook book{1};
     book.add(make_order(1, Side::Sell, 100, 5));
     book.remove_front(Side::Sell);
     EXPECT_FALSE(book.best_ask_price().has_value());
@@ -105,7 +105,7 @@ TEST(MatchingBook, EmptyLevelIsClearedAfterRemoveFrontOfLastOrder) {
 }
 
 TEST(MatchingBook, ReduceInPlacePreservesFifoPosition) {
-    MatchingBook book;
+    MatchingBook book{1};
     book.add(make_order(1, Side::Buy, 100, 5));
     book.add(make_order(2, Side::Buy, 100, 7));
 
@@ -115,18 +115,18 @@ TEST(MatchingBook, ReduceInPlacePreservesFifoPosition) {
     EXPECT_EQ(found->remaining_quantity, 2u);
 
     // Still first in FIFO despite the mutation.
-    auto front = book.front_of_best(Side::Buy);
-    ASSERT_TRUE(front.has_value());
+    const BookOrder* front = book.front_of_best(Side::Buy);
+    ASSERT_NE(front, nullptr);
     EXPECT_EQ(front->exchange_order_id, 1u);
 }
 
 TEST(MatchingBook, ReduceUnknownIdReturnsFalse) {
-    MatchingBook book;
+    MatchingBook book{1};
     EXPECT_FALSE(book.reduce(999, 1));
 }
 
 TEST(MatchingBook, SetClientOrderIdUpdatesInPlaceWithoutChangingFifoPosition) {
-    MatchingBook book;
+    MatchingBook book{1};
     book.add(make_order(1, Side::Buy, 100, 5, /*client_order_id=*/1));
     book.add(make_order(2, Side::Buy, 100, 7, /*client_order_id=*/2));
 
@@ -137,18 +137,18 @@ TEST(MatchingBook, SetClientOrderIdUpdatesInPlaceWithoutChangingFifoPosition) {
     EXPECT_EQ(found->exchange_order_id, 1u); // exchange_order_id never changes
 
     // Still first in FIFO despite the mutation.
-    auto front = book.front_of_best(Side::Buy);
-    ASSERT_TRUE(front.has_value());
+    const BookOrder* front = book.front_of_best(Side::Buy);
+    ASSERT_NE(front, nullptr);
     EXPECT_EQ(front->exchange_order_id, 1u);
 }
 
 TEST(MatchingBook, SetClientOrderIdUnknownIdReturnsFalse) {
-    MatchingBook book;
+    MatchingBook book{1};
     EXPECT_FALSE(book.set_client_order_id(999, 1));
 }
 
 TEST(MatchingBook, AllBidsOrderedByPricePriorityThenFifo) {
-    MatchingBook book;
+    MatchingBook book{1};
     book.add(make_order(1, Side::Buy, 100, 1));
     book.add(make_order(2, Side::Buy, 105, 1));
     book.add(make_order(3, Side::Buy, 100, 1));
@@ -163,10 +163,10 @@ TEST(MatchingBook, AllBidsOrderedByPricePriorityThenFifo) {
     EXPECT_EQ(all[3].exchange_order_id, 3u);
 }
 
-TEST(MatchingBook, FrontOfBestOnEmptySideReturnsNullopt) {
-    MatchingBook book;
-    EXPECT_FALSE(book.front_of_best(Side::Buy).has_value());
-    EXPECT_FALSE(book.front_of_best(Side::Sell).has_value());
+TEST(MatchingBook, FrontOfBestOnEmptySideReturnsNullptr) {
+    MatchingBook book{1};
+    EXPECT_EQ(book.front_of_best(Side::Buy), nullptr);
+    EXPECT_EQ(book.front_of_best(Side::Sell), nullptr);
 }
 
 } // namespace

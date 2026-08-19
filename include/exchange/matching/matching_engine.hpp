@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <memory_resource>
 #include <unordered_map>
 
 #include "common/types.hpp"
@@ -39,6 +41,8 @@ namespace mdh::exchange {
 // handling. A future milestone may add prevention; this one does not.
 class MatchingEngine {
 public:
+    MatchingEngine();
+
     void process(const ExchangeCommand& command, const EventSink& sink);
 
     // Emits an OrderRejected for `command` using this engine's own
@@ -91,6 +95,11 @@ private:
         }
     };
 
+    // books_.operator[] cannot be used: MatchingBook has no default
+    // constructor, because a book that does not know its own instrument
+    // cannot report one in all_bids().
+    MatchingBook& book_for(InstrumentId instrument_id);
+
     void process_new_order(const NewOrderCommand& cmd, const EventSink& sink);
     void process_cancel(const CancelOrderCommand& cmd, const EventSink& sink);
     void process_replace(const ReplaceOrderCommand& cmd, const EventSink& sink);
@@ -115,8 +124,15 @@ private:
     [[nodiscard]] Quantity crossable_quantity(InstrumentId instrument_id, Side incoming_side, Price price,
                                                Quantity quantity) const;
 
+    // live_orders_ holds one node per resting order -- the third of the
+    // three per-order allocations the baseline paid -- so it draws from an
+    // engine-owned pool for the same reason each MatchingBook's containers
+    // draw from a book-owned one. books_ stays on the general heap: it holds
+    // one node per *instrument*, a number that does not grow with order flow.
+    // Declared before both, so it outlives them (see MatchingBook::pool_).
+    std::unique_ptr<std::pmr::unsynchronized_pool_resource> pool_;
     std::unordered_map<InstrumentId, MatchingBook> books_;
-    std::unordered_map<LiveKey, LiveOrderRef, LiveKeyHash> live_orders_;
+    std::pmr::unordered_map<LiveKey, LiveOrderRef, LiveKeyHash> live_orders_;
 
     // Deterministic, engine-owned counters -- no timestamps, no randomness,
     // per the working rules on determinism in the exchange core.
