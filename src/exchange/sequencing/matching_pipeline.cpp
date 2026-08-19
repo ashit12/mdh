@@ -5,7 +5,7 @@
 namespace mdh::exchange::sequencing {
 
 MatchingPipeline::MatchingPipeline(EventSink sink, const MatchingPipelineOptions& options, Processor processor)
-    : sink_(std::move(sink)), queue_(options.queue_capacity),
+    : sink_(std::move(sink)), queue_(options.queue_capacity), engine_(options.expected_resting_orders),
       processor_(processor ? std::move(processor)
                             : Processor([this](const ExchangeCommand& command, const EventSink& event_sink) {
                                   engine_.process(command, event_sink);

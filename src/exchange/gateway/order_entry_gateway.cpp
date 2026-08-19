@@ -31,7 +31,8 @@ constexpr auto kPollInterval = 1ms;
 } // namespace
 
 OrderEntryGateway::OrderEntryGateway(std::uint16_t port, const OrderEntryGatewayOptions& options)
-    : port_(port), options_(options), risk_gated_engine_(engine_, ledger_, options_.risk_limits),
+    : port_(port), options_(options), engine_(options.expected_resting_orders),
+      risk_gated_engine_(engine_, ledger_, options_.risk_limits),
       pipeline_(
           EventSink{[this](const ExchangeEvent& event) { route_event(event); }},
           sequencing::MatchingPipelineOptions{.queue_capacity = options_.matching_queue_capacity},

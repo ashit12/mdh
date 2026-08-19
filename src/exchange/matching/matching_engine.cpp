@@ -8,31 +8,48 @@
 namespace mdh::exchange {
 namespace {
 
-// live_orders_ allocates a single 48-byte node per resting order, so this
-// pool only ever needs to serve small blocks. The bound is nonetheless set
-// an order of magnitude above that, for the reason spelled out in
-// matching_book.cpp: libc++ only pools blocks up to a quarter of this value,
-// and a node that misses the pool lands in an adhoc list with a linear-scan
-// deallocate.
-constexpr std::size_t kLargestPooledBlock = 512;
+// orders_ allocates a single node per resting order, now the wider of the
+// two it used to allocate because it carries the location the book's own
+// index used to hold. The bound is set well above that node's size for the
+// reason spelled out in matching_book.cpp: libc++ only pools blocks up to a
+// quarter of this value, and a node that misses the pool lands in an adhoc
+// list with a linear-scan deallocate.
+constexpr std::size_t kLargestPooledBlock = 1024;
 constexpr std::size_t kMaxBlocksPerChunk = 4096;
 
-constexpr std::size_t kInitialLiveOrderBuckets = 1024;
 constexpr std::size_t kInitialInstrumentBuckets = 16;
 
 } // namespace
 
-MatchingEngine::MatchingEngine()
+MatchingEngine::MatchingEngine(std::size_t expected_resting_orders)
     : pool_(std::make_unique<std::pmr::unsynchronized_pool_resource>(
           std::pmr::pool_options{.max_blocks_per_chunk = kMaxBlocksPerChunk,
                                  .largest_required_pool_block = kLargestPooledBlock})),
-      live_orders_(pool_.get()) {
+      orders_(pool_.get()) {
     books_.reserve(kInitialInstrumentBuckets);
-    live_orders_.reserve(kInitialLiveOrderBuckets);
+    orders_.reserve(expected_resting_orders);
 }
 
 MatchingBook& MatchingEngine::book_for(InstrumentId instrument_id) {
-    return books_.try_emplace(instrument_id, instrument_id).first->second;
+    return books_[instrument_id];
+}
+
+ExchangeRestingOrder MatchingEngine::compose(const BookOrder& order, InstrumentId instrument_id) const {
+    // Every order on a book has an entry here: the two are written and
+    // erased together at every mutation point in this engine.
+    const OrderRef& ref = orders_.at(LiveKey{order.account_id, order.client_order_id});
+    return ExchangeRestingOrder{
+        .exchange_order_id = order.exchange_order_id,
+        .client_order_id = order.client_order_id,
+        .account_id = order.account_id,
+        .price = order.price,
+        .original_quantity = ref.original_quantity,
+        .remaining_quantity = order.remaining_quantity,
+        .order_sequence = ref.order_sequence,
+        .instrument_id = instrument_id,
+        .side = order.side,
+        .time_in_force = order.time_in_force,
+    };
 }
 
 EngineStateSnapshot MatchingEngine::snapshot() const {
@@ -47,8 +64,16 @@ EngineStateSnapshot MatchingEngine::snapshot() const {
     snap.instruments.reserve(instrument_ids.size());
     for (const auto instrument_id : instrument_ids) {
         const MatchingBook& book = books_.at(instrument_id);
-        auto bids = book.all_bids();
-        auto asks = book.all_asks();
+        const auto compose_all = [&](const std::vector<BookOrder>& orders) {
+            std::vector<ExchangeRestingOrder> composed;
+            composed.reserve(orders.size());
+            for (const BookOrder& order : orders) {
+                composed.push_back(compose(order, instrument_id));
+            }
+            return composed;
+        };
+        auto bids = compose_all(book.all_bids());
+        auto asks = compose_all(book.all_asks());
         if (bids.empty() && asks.empty()) {
             // books_ never erases an instrument entry once touched, even
             // after every resting order on it is gone (Cancel/full-fill
@@ -174,7 +199,7 @@ void MatchingEngine::match_and_rest(ExchangeRestingOrder& incoming, CommandSeque
 
         if (contra_remaining_after == 0) {
             book.remove_front(contra_side);
-            live_orders_.erase(LiveKey{contra_account_id, contra_client_order_id});
+            orders_.erase(LiveKey{contra_account_id, contra_client_order_id});
             sink(BookOrderRemoved{
                 .event_sequence = next_event_sequence_++,
                 .instrument_id = incoming.instrument_id,
@@ -202,9 +227,22 @@ void MatchingEngine::rest_remainder_if_applicable(const ExchangeRestingOrder& or
         // resting, so there is nothing to announce.
         return;
     }
-    book_for(order.instrument_id).add(order);
-    live_orders_[LiveKey{order.account_id, order.client_order_id}] =
-        LiveOrderRef{order.instrument_id, order.exchange_order_id};
+    const MatchingBook::Handle handle = book_for(order.instrument_id).add(BookOrder{
+        .exchange_order_id = order.exchange_order_id,
+        .client_order_id = order.client_order_id,
+        .account_id = order.account_id,
+        .price = order.price,
+        .remaining_quantity = order.remaining_quantity,
+        .side = order.side,
+        .time_in_force = order.time_in_force,
+    });
+    orders_.insert_or_assign(LiveKey{order.account_id, order.client_order_id},
+                             OrderRef{
+                                 .handle = handle,
+                                 .original_quantity = order.original_quantity,
+                                 .order_sequence = order.order_sequence,
+                                 .instrument_id = order.instrument_id,
+                             });
     sink(BookOrderAdded{
         .event_sequence = next_event_sequence_++,
         .instrument_id = order.instrument_id,
@@ -240,7 +278,7 @@ void MatchingEngine::process_new_order(const NewOrderCommand& cmd, const EventSi
     }
 
     const LiveKey key{cmd.account_id, cmd.client_order_id};
-    if (live_orders_.contains(key)) {
+    if (orders_.contains(key)) {
         sink(OrderRejected{
             .event_sequence = next_event_sequence_++,
             .command_sequence = cmd.command_sequence,
@@ -303,8 +341,8 @@ void MatchingEngine::process_new_order(const NewOrderCommand& cmd, const EventSi
 
 void MatchingEngine::process_cancel(const CancelOrderCommand& cmd, const EventSink& sink) {
     const LiveKey key{cmd.account_id, cmd.client_order_id};
-    auto it = live_orders_.find(key);
-    if (it == live_orders_.end() || it->second.instrument_id != cmd.instrument_id) {
+    auto it = orders_.find(key);
+    if (it == orders_.end() || it->second.instrument_id != cmd.instrument_id) {
         sink(OrderRejected{
             .event_sequence = next_event_sequence_++,
             .command_sequence = cmd.command_sequence,
@@ -316,26 +354,24 @@ void MatchingEngine::process_cancel(const CancelOrderCommand& cmd, const EventSi
         return;
     }
 
-    const ExchangeOrderId exchange_order_id = it->second.exchange_order_id;
-    live_orders_.erase(it);
-    const auto removed = book_for(cmd.instrument_id).remove(exchange_order_id);
-    // live_orders_ and each MatchingBook are kept in sync at every mutation
-    // point in this engine, so `removed` is guaranteed to have a value here.
+    const MatchingBook::Handle handle = it->second.handle;
+    orders_.erase(it);
+    const BookOrder removed = book_for(cmd.instrument_id).remove_at(handle);
 
     sink(OrderCancelled{
         .event_sequence = next_event_sequence_++,
         .command_sequence = cmd.command_sequence,
         .account_id = cmd.account_id,
         .client_order_id = cmd.client_order_id,
-        .exchange_order_id = exchange_order_id,
+        .exchange_order_id = removed.exchange_order_id,
         .instrument_id = cmd.instrument_id,
     });
     sink(BookOrderRemoved{
         .event_sequence = next_event_sequence_++,
         .instrument_id = cmd.instrument_id,
-        .exchange_order_id = exchange_order_id,
-        .side = removed->side,
-        .price = removed->price,
+        .exchange_order_id = removed.exchange_order_id,
+        .side = removed.side,
+        .price = removed.price,
     });
 }
 
@@ -353,8 +389,8 @@ void MatchingEngine::process_replace(const ReplaceOrderCommand& cmd, const Event
     }
 
     const LiveKey original_key{cmd.account_id, cmd.original_client_order_id};
-    auto it = live_orders_.find(original_key);
-    if (it == live_orders_.end() || it->second.instrument_id != cmd.instrument_id) {
+    auto it = orders_.find(original_key);
+    if (it == orders_.end() || it->second.instrument_id != cmd.instrument_id) {
         sink(OrderRejected{
             .event_sequence = next_event_sequence_++,
             .command_sequence = cmd.command_sequence,
@@ -366,23 +402,30 @@ void MatchingEngine::process_replace(const ReplaceOrderCommand& cmd, const Event
         return;
     }
 
-    const ExchangeOrderId old_exchange_order_id = it->second.exchange_order_id;
+    const OrderRef ref = it->second;
     MatchingBook& book = book_for(cmd.instrument_id);
-    const auto old_order = book.find(old_exchange_order_id);
-    // Guaranteed to have a value: same invariant as process_cancel.
+    // Read out everything wanted after the book is mutated, while the
+    // reference is still known good -- the priority-losing path below
+    // destroys the order it points at.
+    const BookOrder& resting = book.at(ref.handle);
+    const ExchangeOrderId old_exchange_order_id = resting.exchange_order_id;
+    const Side old_side = resting.side;
+    const Price old_price = resting.price;
+    const TimeInForce old_time_in_force = resting.time_in_force;
 
     // Priority-preserving path: same price, quantity unchanged or decreased.
     // A price change or a quantity *increase* falls through to the
     // cancel-plus-new path below (see the class-level policy comment in
     // matching_engine.hpp).
-    const bool preserves_priority = cmd.new_price == old_order->price && cmd.new_quantity <= old_order->remaining_quantity;
+    const bool preserves_priority = cmd.new_price == old_price && cmd.new_quantity <= resting.remaining_quantity;
 
     if (preserves_priority) {
-        book.reduce(old_exchange_order_id, cmd.new_quantity);
-        book.set_client_order_id(old_exchange_order_id, cmd.new_client_order_id);
-        live_orders_.erase(it);
-        live_orders_[LiveKey{cmd.account_id, cmd.new_client_order_id}] =
-            LiveOrderRef{cmd.instrument_id, old_exchange_order_id};
+        book.reduce_at(ref.handle, cmd.new_quantity);
+        book.set_client_order_id_at(ref.handle, cmd.new_client_order_id);
+        // Same order, same place in the queue, addressable under its new
+        // client order id: the entry is re-keyed, not rebuilt.
+        orders_.erase(it);
+        orders_.insert_or_assign(LiveKey{cmd.account_id, cmd.new_client_order_id}, ref);
 
         sink(OrderReplaced{
             .event_sequence = next_event_sequence_++,
@@ -399,8 +442,8 @@ void MatchingEngine::process_replace(const ReplaceOrderCommand& cmd, const Event
             .event_sequence = next_event_sequence_++,
             .instrument_id = cmd.instrument_id,
             .exchange_order_id = old_exchange_order_id,
-            .side = old_order->side,
-            .price = old_order->price,
+            .side = old_side,
+            .price = old_price,
             .new_remaining_quantity = cmd.new_quantity,
         });
         return;
@@ -410,8 +453,8 @@ void MatchingEngine::process_replace(const ReplaceOrderCommand& cmd, const Event
     // book and a freshly-id'd order re-enters the ordinary matching path, so
     // a reprice into a crossing price trades immediately just like any other
     // aggressive new order.
-    book.remove(old_exchange_order_id);
-    live_orders_.erase(it);
+    book.remove_at(ref.handle);
+    orders_.erase(it);
 
     const ExchangeOrderId new_exchange_order_id = next_exchange_order_id_++;
     sink(OrderReplaced{
@@ -429,8 +472,8 @@ void MatchingEngine::process_replace(const ReplaceOrderCommand& cmd, const Event
         .event_sequence = next_event_sequence_++,
         .instrument_id = cmd.instrument_id,
         .exchange_order_id = old_exchange_order_id,
-        .side = old_order->side,
-        .price = old_order->price,
+        .side = old_side,
+        .price = old_price,
     });
 
     ExchangeRestingOrder new_order{
@@ -442,8 +485,8 @@ void MatchingEngine::process_replace(const ReplaceOrderCommand& cmd, const Event
         .remaining_quantity = cmd.new_quantity,
         .order_sequence = next_priority_++,
         .instrument_id = cmd.instrument_id,
-        .side = old_order->side,
-        .time_in_force = old_order->time_in_force,
+        .side = old_side,
+        .time_in_force = old_time_in_force,
     };
     match_and_rest(new_order, cmd.command_sequence, sink);
     rest_remainder_if_applicable(new_order, sink);

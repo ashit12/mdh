@@ -60,6 +60,11 @@ namespace mdh::exchange::sequencing {
 struct MatchingPipelineOptions {
     std::size_t queue_capacity = 1024;
 
+    // Passed straight to the MatchingEngine this pipeline owns -- see
+    // MatchingEngine::kDefaultExpectedRestingOrders for what it buys and
+    // what guessing low costs.
+    std::size_t expected_resting_orders = MatchingEngine::kDefaultExpectedRestingOrders;
+
     // Artificial delay applied by the matching thread after processing
     // each command -- a deterministic way to simulate a slow matching
     // core (e.g. a heavier instrument mix) without depending on incidental

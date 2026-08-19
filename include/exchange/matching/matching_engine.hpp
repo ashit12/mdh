@@ -41,7 +41,23 @@ namespace mdh::exchange {
 // handling. A future milestone may add prevention; this one does not.
 class MatchingEngine {
 public:
-    MatchingEngine();
+    // Roughly how many orders will be resting across all instruments at
+    // once. The engine keeps one directory entry per resting order, and
+    // sizes that table from this figure so a book that fills up does not
+    // have to grow it repeatedly under load. Getting it wrong is not a
+    // correctness problem -- the table grows either way -- but growth is
+    // where this engine's worst latencies come from, by a wide margin:
+    // measured at a million resting orders, the same insert costs 81 ns
+    // against a table sized up front and 1814 ns against one that grew into
+    // it, and the workload benchmark's worst single operation improves from
+    // 1.3 ms to 0.12 ms. Over-estimating costs 8 bytes per unused slot, in
+    // exactly one array, so it is much the cheaper direction to be wrong in.
+    //
+    // The default suits a test or a small book. Anything running real order
+    // flow should say what it expects.
+    static constexpr std::size_t kDefaultExpectedRestingOrders = 1024;
+
+    explicit MatchingEngine(std::size_t expected_resting_orders = kDefaultExpectedRestingOrders);
 
     void process(const ExchangeCommand& command, const EventSink& sink);
 
@@ -72,14 +88,28 @@ public:
     [[nodiscard]] EngineStateSnapshot snapshot() const;
 
 private:
-    struct LiveOrderRef {
+    // Everything the engine knows about one live resting order that the
+    // book itself does not: which book it is in, whereabouts in that book,
+    // and the two fields only a snapshot ever reads.
+    //
+    // This is the single per-order directory. It replaces a pair of tables
+    // -- this one, plus an index inside each MatchingBook keyed by exchange
+    // order id -- whose lookups were strictly serial: find the order's
+    // exchange id here, then find its list node there. Every cancel and
+    // replace paid both misses, and every resting order carried two hash
+    // nodes that grew and rehashed independently.
+    struct OrderRef {
+        MatchingBook::Handle handle;
+        Quantity original_quantity;
+        std::uint64_t order_sequence;
         InstrumentId instrument_id;
-        ExchangeOrderId exchange_order_id;
     };
 
     // A client order id is only unique per-account (two different accounts
     // may independently choose client_order_id == 1), so live-order lookup
-    // is keyed on the pair, not client_order_id alone.
+    // is keyed on the pair, not client_order_id alone. Keyed globally
+    // rather than per-instrument, which is what makes a client order id
+    // already live on *another* instrument a duplicate.
     struct LiveKey {
         AccountId account_id;
         ClientOrderId client_order_id;
@@ -95,10 +125,13 @@ private:
         }
     };
 
-    // books_.operator[] cannot be used: MatchingBook has no default
-    // constructor, because a book that does not know its own instrument
-    // cannot report one in all_bids().
     MatchingBook& book_for(InstrumentId instrument_id);
+
+    // Puts a resting order back together for the snapshot: the book holds
+    // the order, orders_ holds the fields the book gave up, and the caller
+    // supplies the instrument the book belongs to. One hash lookup per
+    // order, on a path that already copies the entire book.
+    [[nodiscard]] ExchangeRestingOrder compose(const BookOrder& order, InstrumentId instrument_id) const;
 
     void process_new_order(const NewOrderCommand& cmd, const EventSink& sink);
     void process_cancel(const CancelOrderCommand& cmd, const EventSink& sink);
@@ -124,15 +157,15 @@ private:
     [[nodiscard]] Quantity crossable_quantity(InstrumentId instrument_id, Side incoming_side, Price price,
                                                Quantity quantity) const;
 
-    // live_orders_ holds one node per resting order -- the third of the
-    // three per-order allocations the baseline paid -- so it draws from an
-    // engine-owned pool for the same reason each MatchingBook's containers
-    // draw from a book-owned one. books_ stays on the general heap: it holds
-    // one node per *instrument*, a number that does not grow with order flow.
-    // Declared before both, so it outlives them (see MatchingBook::pool_).
+    // orders_ holds one node per resting order -- now the only one outside
+    // the book's own list node -- so it draws from an engine-owned pool for
+    // the same reason each MatchingBook's containers draw from a book-owned
+    // one. books_ stays on the general heap: it holds one node per
+    // *instrument*, a number that does not grow with order flow. Declared
+    // before both, so it outlives them (see MatchingBook::pool_).
     std::unique_ptr<std::pmr::unsynchronized_pool_resource> pool_;
     std::unordered_map<InstrumentId, MatchingBook> books_;
-    std::pmr::unordered_map<LiveKey, LiveOrderRef, LiveKeyHash> live_orders_;
+    std::pmr::unordered_map<LiveKey, OrderRef, LiveKeyHash> orders_;
 
     // Deterministic, engine-owned counters -- no timestamps, no randomness,
     // per the working rules on determinism in the exchange core.

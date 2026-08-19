@@ -144,6 +144,11 @@ struct OrderEntryGatewayOptions {
     // MatchingPipeline's own inbound command queue (matching_pipeline.hpp).
     std::size_t matching_queue_capacity = 1024;
 
+    // Passed straight to the MatchingEngine behind this gateway -- see
+    // MatchingEngine::kDefaultExpectedRestingOrders. A gateway carrying real
+    // order flow is exactly the caller that should raise it.
+    std::size_t expected_resting_orders = MatchingEngine::kDefaultExpectedRestingOrders;
+
     // Per-connection outbound queue capacity -- see Connection::outbound
     // below for why a full one is a real, documented policy decision left
     // to you (route_event()'s TODO), not an edge case to overlook.
