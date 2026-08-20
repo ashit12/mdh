@@ -1,11 +1,13 @@
 #include "exchange/sequencing/matching_pipeline.hpp"
 
+#include <span>
 #include <utility>
 
 namespace mdh::exchange::sequencing {
 
 MatchingPipeline::MatchingPipeline(EventSink sink, const MatchingPipelineOptions& options, Processor processor)
-    : sink_(std::move(sink)), queue_(options.queue_capacity), engine_(options.expected_resting_orders),
+    : sink_(std::move(sink)), queue_(options.queue_capacity),
+      engine_(std::span<const InstrumentId>(options.instruments), options.expected_resting_orders),
       processor_(processor ? std::move(processor)
                             : Processor([this](const ExchangeCommand& command, const EventSink& event_sink) {
                                   engine_.process(command, event_sink);

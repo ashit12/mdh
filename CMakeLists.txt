@@ -126,6 +126,21 @@ add_library(mdh_core
 target_include_directories(mdh_core PUBLIC include)
 target_compile_options(mdh_core PRIVATE ${MDH_WARNING_FLAGS})
 
+# ── Experimental: boost::unordered_flat_map for MatchingBook's order index ──
+# A/B toggle only, OFF by default (std::unordered_map, unchanged). Isolates
+# exactly one type swap in matching_book.hpp behind MDH_USE_BOOST_FLAT_MAP so
+# the existing latency/allocation benchmarks can be run unmodified against
+# either container for a head-to-head comparison. Header-only (Boost.Unordered's
+# flat containers need no compiled library), so this adds no link dependency.
+option(MDH_USE_BOOST_FLAT_MAP
+       "Use boost::unordered_flat_map instead of std::unordered_map for MatchingBook::index_ (A/B experiment)"
+       OFF)
+if(MDH_USE_BOOST_FLAT_MAP)
+    find_package(Boost 1.81 CONFIG REQUIRED)
+    target_link_libraries(mdh_core PUBLIC Boost::headers)
+    target_compile_definitions(mdh_core PUBLIC MDH_USE_BOOST_FLAT_MAP)
+endif()
+
 if(MDH_ENABLE_ASAN)
     target_compile_options(mdh_core PUBLIC -fsanitize=address -fno-omit-frame-pointer)
     target_link_options(mdh_core PUBLIC -fsanitize=address)
@@ -246,6 +261,7 @@ add_executable(mdh_tests
     tests/test_ui_gateway.cpp
     tests/test_failure_injection_gateway.cpp
     tests/test_failure_injection_market_data.cpp
+    tests/test_matching_engine_stress.cpp
 )
 target_link_libraries(mdh_tests PRIVATE mdh_ui_gateway httplib nlohmann_json::nlohmann_json gtest gtest_main)
 target_compile_options(mdh_tests PRIVATE ${MDH_WARNING_FLAGS})
@@ -289,4 +305,24 @@ if(MDH_BUILD_BENCHMARKS)
     add_executable(bench_end_to_end_latency benchmarks/bench_end_to_end_latency.cpp)
     target_link_libraries(bench_end_to_end_latency PRIVATE mdh_core)
     target_compile_options(bench_end_to_end_latency PRIVATE ${MDH_WARNING_FLAGS})
+
+    # Milestone 15. Also standalone rather than Google Benchmark cases, and
+    # for two different reasons.
+    #
+    # bench_matching_workload needs the individual per-operation samples to
+    # report a p99.9, and one figure per configuration to draw a scaling
+    # curve -- neither of which Google Benchmark's fixed-loop timing model
+    # exposes (same reasoning as bench_end_to_end_latency above).
+    #
+    # bench_matching_memory replaces every global operator new/delete to
+    # count allocations, which would silently perturb the timing of anything
+    # else linked into the same binary -- hence its own executable rather
+    # than another case inside bench_matching_engine.
+    add_executable(bench_matching_workload benchmarks/bench_matching_workload.cpp)
+    target_link_libraries(bench_matching_workload PRIVATE mdh_core)
+    target_compile_options(bench_matching_workload PRIVATE ${MDH_WARNING_FLAGS})
+
+    add_executable(bench_matching_memory benchmarks/bench_matching_memory.cpp)
+    target_link_libraries(bench_matching_memory PRIVATE mdh_core)
+    target_compile_options(bench_matching_memory PRIVATE ${MDH_WARNING_FLAGS})
 endif()

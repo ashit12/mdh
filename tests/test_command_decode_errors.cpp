@@ -10,9 +10,9 @@ using namespace mdh::exchange::persistence;
 namespace {
 
 CommandDecodeError decode_expect_error(std::span<const std::byte> bytes) {
-    auto result = decode_command(bytes);
-    if (std::holds_alternative<ExchangeCommand>(result)) {
-        ADD_FAILURE() << "expected a decode error but got a valid command";
+    auto result = decode_journal_frame(bytes);
+    if (!std::holds_alternative<CommandDecodeError>(result)) {
+        ADD_FAILURE() << "expected a decode error but got a valid frame";
         return CommandDecodeError::TruncatedHeader;
     }
     return std::get<CommandDecodeError>(result);
@@ -98,6 +98,22 @@ TEST(CommandDecodeErrors, InvalidTimeInForceByteIsRejected) {
 TEST(CommandDecodeErrors, TrailingBytesBeyondPayloadAreIgnoredNotRejected) {
     auto bytes = valid_new_order_bytes();
     bytes.push_back(std::byte{0xAB});
-    auto result = decode_command(bytes);
+    auto result = decode_journal_frame(bytes);
     ASSERT_TRUE(std::holds_alternative<ExchangeCommand>(result));
+}
+
+TEST(CommandDecodeErrors, RegisterInstrumentFrameDecodesToARegistrationNotACommand) {
+    std::vector<std::byte> bytes;
+    encode_register_instrument(4242, bytes);
+
+    auto result = decode_journal_frame(bytes);
+    ASSERT_TRUE(std::holds_alternative<RegisterInstrumentRecord>(result));
+    EXPECT_EQ(std::get<RegisterInstrumentRecord>(result).instrument_id, 4242u);
+}
+
+TEST(CommandDecodeErrors, TruncatedRegisterInstrumentPayloadIsRejected) {
+    std::vector<std::byte> bytes;
+    encode_register_instrument(1, bytes);
+    bytes.resize(bytes.size() - 1);
+    EXPECT_EQ(decode_expect_error(bytes), CommandDecodeError::TruncatedPayload);
 }

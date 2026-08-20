@@ -452,12 +452,18 @@ SpscQueue<ExchangeCommand>::try_push()  ── full? ──► submit() returns 
                                                     │
                                    ┌────────────────┼─────────────────────┐
                                    ▼                ▼                     ▼
-                          MatchingBook          live_orders_       next_event_sequence_
-                          (per instrument:      (AccountId,        (gapless, engine-owned;
-                           std::map price       ClientOrderId)      also used by
-                           levels, std::list     -> live order       reject_new_order(),
-                           FIFO, unordered_map    lookup             see Milestone 5 below)
-                           id index)
+                          books_[slot]           orders_            next_event_sequence_
+                          (one MatchingBook     (AccountId,         (gapless, engine-owned;
+                           per registered        ClientOrderId)      also used by
+                           instrument;            -> book handle     reject_new_order(),
+                           tick-ladder price         + the fields    see Milestone 5 below)
+                           levels over a slab        the book gave
+                           of orders. The slot       up)
+                           from slot_of_id_, a
+                           direct-mapped table;
+                           an unregistered id is
+                           rejected, never
+                           conjured into a book)
                                    │
                                    ▼
                      zero or more ExchangeEvent, in command order, delivered
@@ -490,10 +496,12 @@ This is a second, currently-separate path — nothing above writes to a
 journal automatically:
 
 ```
-ExchangeCommand ──encode_command()──► CommandJournalWriter ──► journal file
-                                                                (12-byte header +
-                                                                 fixed payload per type)
-journal file ──CommandJournalReader::next()──► decode_command() ──► fresh MatchingEngine
+instrument universe ─────────────► CommandJournalWriter ──► journal file
+ExchangeCommand ──encode_command()──►    (at open)           (12-byte header +
+                                                              fixed payload per type;
+                                                              RegisterInstrument frames
+                                                              first, then commands)
+journal file ──CommandJournalReader::next()──► decode_journal_frame() ──► fresh MatchingEngine
                                                                           │
                                                                           ▼
                                                         run_command_replay(): every emitted
@@ -505,6 +513,13 @@ journal file ──CommandJournalReader::next()──► decode_command() ──
 share state with whatever process originally produced the journal. Calling
 it twice on the same file is the actual determinism proof: identical event
 vectors and `EngineStateSnapshot::operator==` both hold.
+
+The journal is self-describing about its instruments, which it has to be:
+a `MatchingEngine` rejects commands on instruments it was not told about,
+so a file listing only commands could no longer reproduce the run that
+wrote it. `CommandJournalWriter` writes one `RegisterInstrument` frame per
+instrument when the file is opened, and the replay registers from them as
+it reads, before any command arrives.
 
 ### Closing the loop: publishing to the trader side (Milestone 6)
 
@@ -608,17 +623,37 @@ same event stream with no extra coordination between `MatchingEngine` and
   than a virtual interface — nothing here needs a base class or a vtable.
 
 ### `exchange/matching/` — the matcher itself
-- **`resting_order.hpp`** — `ExchangeRestingOrder`: a live book entry
-  (account, client/exchange order ids, side, price, original/remaining
-  quantity, TIF, an observability-only `order_sequence`). Deliberately not
-  reused with the trader-side `book::RestingOrder` — this one has to decide
-  whether to cross, whose order it is, and whether it may rest at all.
-- **`matching_book.hpp`/`.cpp`** — `MatchingBook`: per-instrument order book.
-  `std::map<Price, std::list<ExchangeRestingOrder>>` per side (`std::greater`
-  for bids so `begin()` is best-bid, ascending for asks so `begin()` is
-  best-ask), plus an `unordered_map<ExchangeOrderId, Location>` for O(1)
-  `remove`/`reduce`/`find`. `front_of_best()`/`reduce_front()`/`remove_front()`
-  are the three operations the matching walk actually needs.
+- **`resting_order.hpp`** — two forms of the same order. `ExchangeRestingOrder`
+  is the complete one (account, client/exchange order ids, instrument, side,
+  price, original/remaining quantity, TIF, an observability-only
+  `order_sequence`): what a command becomes, and what snapshots and the state
+  hash are made of. `BookOrder` is what actually rests on the book — the same
+  order minus the three fields nothing but the snapshot reads. Both are
+  deliberately not reused with the trader-side `book::RestingOrder` — this
+  side has to decide whether to cross, whose order it is, and whether it may
+  rest at all.
+- **`matching_book.hpp`/`.cpp`** — `MatchingBook`: per-instrument order book,
+  and *only* a book. The orders live in one flat per-book slab, and a price
+  level is just the head and tail index of that level's FIFO chain through
+  it — a `LevelSlot`, eight bytes, no container of its own. Each side indexes
+  those levels two ways: a tick ladder (a flat array over a band of prices,
+  with a three-level occupancy bitmap over it, so the touch is a few
+  count-leading-zeros and a level is an array index) plus a
+  `std::pmr::map<Price, LevelSlot>` from a book-local pool for prices outside
+  the band. Every walk merges the two, and a book whose universe is too large
+  to afford a ladder runs on the map alone —
+  `bench-results/stage3-ladder-band-decision.txt` is where the band width, the
+  memory budget and the decision not to reject out-of-band prices come from.
+  It has no order directory of its own:
+  it cannot find an order by id, and does not know its own instrument.
+  `add()` returns an opaque `Handle` — a slab index, four bytes — and every
+  operation on an order already resting —
+  `remove_at`/`reduce_at`/`set_client_order_id_at`/`at` — takes that handle
+  back. Because a handle is an offset rather than an address, it survives
+  both the slab relocating under it and the whole book being moved.
+  `front_of_best()`/`reduce_front()`/`remove_front()` are what the matching
+  walk needs; `front_of_best()` hands back a pointer into the slab, valid
+  until the book is next mutated, rather than copying the order out.
 - **`state_snapshot.hpp`** — `EngineStateSnapshot`/`InstrumentBookSnapshot`:
   a canonical (instruments sorted by id, each side already in
   price-priority-then-FIFO order) dump of every resting order, so two
@@ -638,10 +673,47 @@ same event stream with no extra coordination between `MatchingEngine` and
   prevention is explicitly deferred — orders from the same account match
   each other normally.
 
+  The engine also owns `orders_`, the single directory of live resting
+  orders: `(account_id, client_order_id)` → the instrument, the book handle,
+  and the two snapshot-only fields (`original_quantity`, `order_sequence`).
+  One table, so cancel and replace each do one hash lookup rather than the
+  two dependent ones they used to (client key → exchange order id in the
+  engine, then exchange order id → list node in the book), and a resting
+  order carries one hash node rather than two. Keyed globally, which is what
+  makes a client order id already live on another instrument a duplicate.
+  `snapshot()` is the one place that puts a whole `ExchangeRestingOrder` back
+  together, from the book's order plus this table's entry. The constructor
+  takes the number of resting orders to expect and sizes that table once:
+  growing it is where this engine's worst latencies come from, so the two
+  production embedders (`MatchingPipelineOptions`,
+  `OrderEntryGatewayOptions`) both pass the figure through.
+
+  The constructor also takes the engine's *instrument universe*, and it is
+  not optional. `slot_of_id_` maps an instrument id to a dense slot in
+  `books_` through a direct-mapped array, so the hottest lookup there is —
+  every command carries an instrument id — costs a bounds check and two
+  array loads, and that bounds check doubles as the validity check. A
+  command naming anything unregistered is rejected with
+  `RejectReason::InvalidInstrument`, checked ahead of price, quantity and
+  order id, and checked in `RiskGatedEngine` ahead of the risk check so a
+  sell does not come back as `InsufficientPosition` instead. Before this,
+  `books_` was an `unordered_map` with a lazy insert, which meant a client
+  could make the engine allocate a book per instrument id it invented;
+  registration is capped at `kMaxInstrumentId` (`1<<22`) so the id table
+  cannot exceed 16 MB either. `register_instrument()` adds one after
+  construction, which is what replay uses; the books move when that vector
+  grows, and outstanding handles survive because each book's pool sits
+  behind a `unique_ptr` and a `pmr` container move with an equal allocator
+  relinks nodes rather than copying them.
+
 ### `exchange/persistence/` — journal codec, journal I/O, replay
 - **`command_messages.hpp`** — wire format constants: 12-byte header
   (`type`, `reserved`, `payload_size`, `command_sequence`) and
-  `payload_size_for(type)` giving each command type's fixed payload size.
+  `payload_size_for(type)` giving each type's fixed payload size. Three of
+  the four types are commands; the fourth, `RegisterInstrument`, names an
+  instrument the engine that wrote the file traded, and decodes to a
+  `RegisterInstrumentRecord` rather than into `ExchangeCommand` — it is not
+  something a client can send, it mutates no book, and it emits no event.
   A deliberately separate format from `protocol/messages.hpp` (trader-side
   market-data wire format) — same *style* (big-endian via
   `common/byte_io.hpp`, fixed header + fixed payload), different vocabulary,
@@ -650,15 +722,18 @@ same event stream with no extra coordination between `MatchingEngine` and
   bad reserved byte, invalid type/size/enum value) — structured returns
   instead of exceptions, decoded via `std::variant<T, CommandDecodeError>`.
 - **`command_encoder.hpp`/`.cpp`**, **`command_decoder.hpp`/`.cpp`** —
-  `encode_command()` appends one command's wire bytes to a caller-owned
-  buffer; `decode_command_header()`/`decode_command()` decode them back,
-  mirroring `protocol::decode_header`/`decode_event`'s two-step shape (peek
-  the header to learn the payload size, then decode the full frame).
+  `encode_command()`/`encode_register_instrument()` append one frame's wire
+  bytes to a caller-owned buffer; `decode_command_header()`/
+  `decode_journal_frame()` decode them back, mirroring
+  `protocol::decode_header`/`decode_event`'s two-step shape (peek the header
+  to learn the payload size, then decode the full frame).
 - **`command_journal_writer.hpp`/`.cpp`**, **`command_journal_reader.hpp`/`.cpp`** —
-  `CommandJournalWriter::write()` appends encoded frames to a file with no
-  extra framing beyond each frame's own header. `CommandJournalReader::next()`
-  reads one frame at a time, returning `std::nullopt` at a clean EOF or a
-  `CommandDecodeError` for a corrupt/truncated frame. Both mirror
+  `CommandJournalWriter` is constructed with the instrument universe and
+  writes it as `RegisterInstrument` frames straight away; `write()` then
+  appends encoded commands with no extra framing beyond each frame's own
+  header. `CommandJournalReader::next()` reads one frame at a time,
+  returning `std::nullopt` at a clean EOF or a `CommandDecodeError` for a
+  corrupt/truncated frame. Both mirror
   `replay::EventFileWriter`/`EventFileReader` exactly, applied to
   `ExchangeCommand` instead of `protocol::Event`.
 - **`state_hash.hpp`/`.cpp`** — `hash_state_snapshot()`: a 64-bit FNV-1a
@@ -669,7 +744,10 @@ same event stream with no extra coordination between `MatchingEngine` and
   options)`: reads a journal end to end (or stops at the first decode error,
   per `CommandReplayOptions::stop_on_decode_error`), replaying into a fresh
   `MatchingEngine` and returning a `CommandReplayOutcome` (final engine,
-  every event emitted, commands processed, stop reason if any). A distinct
+  every event emitted, commands processed, instruments registered, stop
+  reason if any). The engine starts with an empty universe and learns it
+  from the file's own `RegisterInstrument` frames, so nothing about the
+  original run has to be supplied alongside the path. A distinct
   concept from `replay::run_replay()` — that one replays market-data events
   into the trader-side `book::BookManager`; this one replays exchange
   *commands* into the authoritative `MatchingEngine`. Neither reuses the

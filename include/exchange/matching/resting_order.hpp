@@ -61,12 +61,10 @@ struct ExchangeRestingOrder {
 // keeps) and reassembles the full order on those cold paths. No runtime path
 // pays a second lookup for the privilege.
 //
-// Staying at or under 48 bytes is the entire point of the split. A
-// std::pmr::list node adds two links to whatever it holds, and 48 + 16 is
-// exactly the largest node the book's pool serves out of its 64-byte blocks;
-// at 49 bytes the node moves up to the 128-byte class and the book's
-// per-order footprint doubles. The static_assert is therefore a real
-// constraint, not a tidiness check.
+// Staying at or under 48 bytes is the entire point of the split, and it is a
+// real constraint rather than a tidiness check: this is what a slab entry is
+// made of, plus two 32-bit links, so every byte added here is a byte added
+// per resting order and one fewer order per cache line swept.
 struct BookOrder {
     ExchangeOrderId exchange_order_id;
     ClientOrderId client_order_id;

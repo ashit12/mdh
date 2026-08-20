@@ -1,0 +1,65 @@
+mdh matching-engine baseline: allocation behaviour and memory footprint
+
+=== Allocations per matching-engine operation =================================
+Averages over a batch, so a fractional count is real (amortised container growth),
+not a rounding artefact. "net bytes" is allocated minus freed: it is what the
+operation leaves behind on the heap, and should be ~0 for anything that does not
+grow the book.
+
+operation                                     allocs/op   frees/op     bytes/op   net bytes/op
+----------------------------------------------------------------------------------------------
+new resting order, existing price level           0.001      0.001        285.7          180.9
+new resting order, new price level                0.003      0.001        354.5          249.7
+cancel                                            0.000      0.000          0.0            0.0
+match, one fill (IOC vs one resting order)        0.000      0.000          0.0            0.0
+match, 16-level sweep (per operation)             0.000      0.000          0.0            0.0
+replace, priority preserved (qty decrease)        0.000      0.000          0.0            0.0
+replace, priority lost (qty increase)             0.000      0.000          0.0            0.0
+replace, priority lost (reprice)                  0.000      0.000          0.0            0.0
+FOK rejected in preflight, 1 contra level         0.000      0.000          0.0            0.0
+FOK rejected in preflight, 4096 contra levels      0.000      0.000          0.0            0.0
+mixed realistic workload (average)                0.000      0.000         26.1           16.0
+
+=== Memory footprint of a resting book ========================================
+Directly measured, not estimated: live bytes is (allocated - freed) across building
+the book, using the platform allocator's own reported block sizes, so allocator
+rounding is included. RSS delta is a coarse cross-check that includes page-level
+granularity and the process's other state.
+
+      orders          shape |     live bytes  bytes/order allocs/order   RSS delta MB
+----------------------------------------------------------------------------------------
+        1000  1 order/level |         215632        215.6        0.024            0.0
+        1000 100 orders/level |         215632        215.6        0.024            0.0
+       10000  1 order/level |        2358992        235.9        0.006            0.0
+       10000 100 orders/level |        1868368        186.8        0.003            0.0
+      100000  1 order/level |       27557584        275.6        0.001            9.2
+      100000 100 orders/level |       20890192        208.9        0.001            0.1
+     1000000  1 order/level |      207765200        207.8        0.001          216.0
+     1000000 100 orders/level |      140312272        140.3        0.000            0.1
+
+=== Which structures the bytes go to ==========================================
+Allocation-size histogram for building a 1,000,000-order book (1 order per price
+level, so every per-order structure is exercised once). Sizes are the allocator's
+block sizes. No per-order structure is visible here at all: the orders come from
+one slab vector and the price-index nodes from a pool, so what reaches the
+allocator is a few dozen bulk buffers rather than a few million nodes -- which is
+why nearly all the bytes land in the >=1024 row.
+
+Type sizes on this build:
+  sizeof(BookOrder)                  48  (what a slab entry actually holds)
+  slab entry                         56  (BookOrder plus two 32-bit FIFO links)
+  sizeof(ExchangeRestingOrder)       64  (the reassembled form: commands, snapshots)
+  sizeof(Price)                       8
+  sizeof(ExchangeOrderId)             8
+
+block size          count    total bytes      share
+----------------------------------------------------
+       320              1            320       0.0%
+       128              2            256       0.0%
+        48              2             96       0.0%
+        64              1             64       0.0%
+        16              3             48       0.0%
+    >=1024            555      281981952     100.0%  (pool chunks / bucket arrays)
+
+total: 563 allocations, 281982672 bytes for 1,000,000 resting orders
+

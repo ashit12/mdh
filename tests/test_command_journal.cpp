@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -31,8 +32,9 @@ private:
 
 TEST(CommandJournal, WritesAndReadsBackAllThreeCommandTypes) {
     TempFile tmp("mdh_test_command_journal_roundtrip.bin");
+    constexpr std::array<InstrumentId, 1> kInstruments{1};
     {
-        CommandJournalWriter writer(tmp.path());
+        CommandJournalWriter writer(tmp.path(), kInstruments);
         ASSERT_TRUE(writer.is_open());
         writer.write(ExchangeCommand{NewOrderCommand{.command_sequence = 1,
                                                       .account_id = 1,
@@ -58,6 +60,14 @@ TEST(CommandJournal, WritesAndReadsBackAllThreeCommandTypes) {
     CommandJournalReader reader(tmp.path());
     ASSERT_TRUE(reader.is_open());
 
+    // The universe comes first, before any command -- that ordering is what
+    // lets a replay register instruments as it reads rather than needing to
+    // be told them separately.
+    auto registration = reader.next();
+    ASSERT_TRUE(registration.has_value());
+    ASSERT_TRUE(std::holds_alternative<RegisterInstrumentRecord>(*registration));
+    EXPECT_EQ(std::get<RegisterInstrumentRecord>(*registration).instrument_id, 1u);
+
     auto c1 = reader.next();
     ASSERT_TRUE(c1.has_value());
     ASSERT_TRUE(std::holds_alternative<ExchangeCommand>(*c1));
@@ -77,7 +87,9 @@ TEST(CommandJournal, WritesAndReadsBackAllThreeCommandTypes) {
 TEST(CommandJournal, TruncatedFileAtPayloadReportsTruncatedPayload) {
     TempFile tmp("mdh_test_command_journal_truncated.bin");
     {
-        CommandJournalWriter writer(tmp.path());
+        // No instruments: this test is about framing, and a registration
+        // frame ahead of the command would just be one more frame to skip.
+        CommandJournalWriter writer(tmp.path(), {});
         writer.write(ExchangeCommand{NewOrderCommand{.command_sequence = 1,
                                                       .account_id = 1,
                                                       .client_order_id = 1,
@@ -124,7 +136,7 @@ TEST(CommandJournal, PreservesFieldValuesAcrossRoundTrip) {
                               .order_type = OrderType::Limit,
                               .time_in_force = TimeInForce::FOK};
     {
-        CommandJournalWriter writer(tmp.path());
+        CommandJournalWriter writer(tmp.path(), {});
         writer.write(ExchangeCommand{original});
     }
 

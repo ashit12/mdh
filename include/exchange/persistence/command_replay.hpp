@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -27,9 +28,16 @@ struct CommandReplayOptions {
 };
 
 struct CommandReplayOutcome {
-    MatchingEngine engine;              // final state after every replayed command
-    std::vector<ExchangeEvent> events;  // every event emitted, across all commands, in order
+    // Starts with no instruments and learns them from the journal's own
+    // RegisterInstrument frames as they are read, so a replay reproduces the
+    // run that wrote the file without being told anything about it beyond
+    // the path. A journal written before that frame type existed registers
+    // nothing, so every command in it is rejected as InvalidInstrument --
+    // visibly wrong rather than quietly different.
+    MatchingEngine engine{std::span<const InstrumentId>{}};
+    std::vector<ExchangeEvent> events; // every event emitted, across all commands, in order
     std::size_t commands_processed = 0;
+    std::size_t instruments_registered = 0;
     bool stopped_early = false;
     std::string stop_reason;
 };

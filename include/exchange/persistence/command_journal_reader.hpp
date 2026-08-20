@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "exchange/core/commands.hpp"
+#include "exchange/persistence/command_decoder.hpp"
 #include "exchange/persistence/command_errors.hpp"
 
 namespace mdh::exchange::persistence {
@@ -23,9 +24,10 @@ public:
     [[nodiscard]] bool is_open() const { return file_.is_open(); }
 
     // Returns std::nullopt at a clean end-of-file (no partial frame
-    // pending). Otherwise returns the decoded command or the
-    // CommandDecodeError that made this frame unreadable/invalid.
-    [[nodiscard]] std::optional<std::variant<ExchangeCommand, CommandDecodeError>> next();
+    // pending). Otherwise returns the decoded frame -- a command, an
+    // instrument registration, or the CommandDecodeError that made this
+    // frame unreadable/invalid.
+    [[nodiscard]] std::optional<DecodedFrame> next();
 
 private:
     std::ifstream file_;

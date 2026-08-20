@@ -11,6 +11,7 @@ namespace {
         case static_cast<std::uint8_t>(CommandMessageType::NewOrder):
         case static_cast<std::uint8_t>(CommandMessageType::CancelOrder):
         case static_cast<std::uint8_t>(CommandMessageType::ReplaceOrder):
+        case static_cast<std::uint8_t>(CommandMessageType::RegisterInstrument):
             return true;
         default:
             return false;
@@ -64,7 +65,7 @@ std::variant<CommandHeader, CommandDecodeError> decode_command_header(std::span<
     };
 }
 
-std::variant<ExchangeCommand, CommandDecodeError> decode_command(std::span<const std::byte> data) {
+DecodedFrame decode_journal_frame(std::span<const std::byte> data) {
     auto header_result = decode_command_header(data);
     if (std::holds_alternative<CommandDecodeError>(header_result)) {
         return std::get<CommandDecodeError>(header_result);
@@ -150,6 +151,13 @@ std::variant<ExchangeCommand, CommandDecodeError> decode_command(std::span<const
                 .new_price = *new_price,
                 .new_quantity = *new_quantity,
             }};
+        }
+        case CommandMessageType::RegisterInstrument: {
+            auto instrument_id = r.get_u32();
+            if (!instrument_id) {
+                return CommandDecodeError::TruncatedPayload;
+            }
+            return RegisterInstrumentRecord{.instrument_id = *instrument_id};
         }
     }
 

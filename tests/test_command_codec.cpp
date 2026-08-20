@@ -10,7 +10,7 @@ using namespace mdh::exchange::persistence;
 namespace {
 
 ExchangeCommand decode_or_fail(std::span<const std::byte> bytes) {
-    auto result = decode_command(bytes);
+    auto result = decode_journal_frame(bytes);
     if (std::holds_alternative<CommandDecodeError>(result)) {
         ADD_FAILURE() << "decode failed: " << to_string(std::get<CommandDecodeError>(result));
         return NewOrderCommand{};

@@ -60,4 +60,10 @@ void encode_command(const ExchangeCommand& command, std::vector<std::byte>& out)
         command);
 }
 
+void encode_register_instrument(InstrumentId instrument_id, std::vector<std::byte>& out) {
+    put_header(out, CommandMessageType::RegisterInstrument, 0,
+               static_cast<std::uint16_t>(payload_size_for(CommandMessageType::RegisterInstrument)));
+    io::put_u32(out, instrument_id);
+}
+
 } // namespace mdh::exchange::persistence

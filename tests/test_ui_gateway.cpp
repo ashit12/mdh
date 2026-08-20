@@ -55,6 +55,9 @@ public:
                 (void)market_data_socket_.send_to(datagram, "127.0.0.1", market_data_port_);
             });
         };
+        // The exchange trades exactly the instruments the UI knows about,
+        // the same way apps/trading_server wires the two together.
+        gateway_options_.instruments = ui_options.demo_instrument_ids;
         gateway_ = std::make_unique<gateway::OrderEntryGateway>(0, gateway_options_);
 
         // Pre-seed every demo account before start() -- see

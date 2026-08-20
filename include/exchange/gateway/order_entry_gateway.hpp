@@ -141,6 +141,14 @@ using SessionId = std::uint64_t;
 struct OrderEntryGatewayOptions {
     risk::RiskLimits risk_limits{};
 
+    // Every instrument this gateway trades. Anything else a client sends is
+    // answered with RejectReason::InvalidInstrument over the wire, which is
+    // the point of stating it here: instrument ids arrive from clients, and
+    // before this list existed each new id a client invented got a book of
+    // its own. Empty means every order is rejected, so a real deployment
+    // must set it.
+    std::vector<InstrumentId> instruments;
+
     // MatchingPipeline's own inbound command queue (matching_pipeline.hpp).
     std::size_t matching_queue_capacity = 1024;
 

@@ -43,7 +43,9 @@ constexpr AccountId kArbAccount = 201;
 
 class RunningGateway {
 public:
-    explicit RunningGateway(const OrderEntryGatewayOptions& options = {}) : gateway_(0, options) {
+    // The gateway trades only what it is told about, and both venues here
+    // trade the one instrument above.
+    explicit RunningGateway(OrderEntryGatewayOptions options = {}) : gateway_(0, with_default_instrument(options)) {
         started_ = gateway_.start();
     }
 
@@ -52,6 +54,13 @@ public:
     [[nodiscard]] OrderEntryGateway& gateway() { return gateway_; }
 
 private:
+    static const OrderEntryGatewayOptions& with_default_instrument(OrderEntryGatewayOptions& options) {
+        if (options.instruments.empty()) {
+            options.instruments = {kInstrument};
+        }
+        return options;
+    }
+
     OrderEntryGateway gateway_;
     bool started_ = false;
 };

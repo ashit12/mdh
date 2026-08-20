@@ -125,7 +125,14 @@ int main(int argc, char** argv) {
     }
     std::uint64_t next_packet_sequence = 1;
 
+    // Declared here rather than beside the pre-seeding loop below because
+    // the exchange now needs the instrument list before it is constructed,
+    // not just when accounts are seeded: this is the whole tradeable
+    // universe of this process, and an order on anything else is rejected.
+    ui_gateway::UiGatewayOptions ui_options;
+
     OrderEntryGatewayOptions gateway_options;
+    gateway_options.instruments = ui_options.demo_instrument_ids;
     gateway_options.extra_event_sink = [&](const ExchangeEvent& event) {
         publisher.publish(event, [&](const protocol::Event& wire_event) {
             const std::array<protocol::Event, 1> frames{wire_event};
@@ -140,7 +147,6 @@ int main(int argc, char** argv) {
     // ui_gateway.hpp's own class comment on why this ordering, not lazy
     // per-request seeding, is what keeps Ledger's single-writer contract
     // intact once the matching thread is live.
-    ui_gateway::UiGatewayOptions ui_options;
     for (AccountId account_id : ui_options.demo_account_ids) {
         gateway.deposit_cash(account_id, ui_options.demo_starting_cash);
         for (InstrumentId instrument_id : ui_options.demo_instrument_ids) {

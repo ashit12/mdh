@@ -1,0 +1,161 @@
+mdh matching engine, Tier 3(a): front_of_best() returns a pointer, not a copy
+
+The change
+----------
+MatchingBook::front_of_best() returned std::optional<ExchangeRestingOrder> by value,
+so match_and_rest() copied the whole 72-byte resting order (80 bytes with the optional's
+engaged flag and padding) out of the book on every iteration of the matching loop, to
+read five or six scalars from it. It now returns const ExchangeRestingOrder*, valid until
+that side of the book is next mutated.
+
+That lifetime caveat is the whole substance of the change. The loop emits BookOrderRemoved
+*after* calling remove_front(), which destroys the order the pointer refers to, so the
+fields still needed at that point (account, client order id, exchange order id, side,
+price) are now read into locals before the book is touched. Under the old signature the
+copy is what made that safe; the copy was, in effect, paying for five scalars.
+
+Baseline for this comparison is the Tier 0 build (pmr node pooling + reserve), measured
+in the same session as the after numbers.
+
+Allocation behaviour: identical to Tier 0, as expected -- the copy was on the stack, so
+removing it changes no allocation counts. Verified by re-running bench_matching_memory
+and diffing the per-operation table (tier3a-after-memory.txt).
+
+Correctness: all 385 tests pass, including the mixed-command-stream stress test that
+checks every invariant against a reference model and the replay-determinism test.
+
+
+Microbenchmarks (Google Benchmark, 5 repetitions, medians)
+==============================================================================================
+cv is the coefficient of variation over the five repetitions. Where cv is large the
+change column is not meaningful.
+
+benchmark                                         before ns   after ns   change     cv b   cv a
+----------------------------------------------------------------------------------------------
+ BM_Rest_ExistingPriceLevel/1                          72.1       70.8    -1.8%     13.8   11.5
+ BM_Rest_ExistingPriceLevel/16                         72.4       71.9    -0.7%      3.8    4.5
+!BM_Rest_ExistingPriceLevel/256                        86.5       92.6    +7.1%      2.6    4.6
+ BM_Rest_ExistingPriceLevel/4096                      108.0      110.0    +1.9%      1.2    3.5
+ BM_Rest_ExistingPriceLevel/65536                     167.0      170.0    +1.8%      4.3    4.9
+
++BM_Rest_NewPriceLevel/1                              248.0      239.0    -3.6%      5.6    1.6
+ BM_Rest_NewPriceLevel/16                             220.0      225.0    +2.3%      1.5    3.1
+ BM_Rest_NewPriceLevel/256                            220.0      214.0    -2.7%      2.8    3.9
+ BM_Rest_NewPriceLevel/4096                           225.0      223.0    -0.9%      3.4    2.7
+ BM_Rest_NewPriceLevel/65536                          197.0      193.0    -2.0%      3.3    6.8
+
++BM_Match_SingleLevel/1                                60.2       58.0    -3.7%      3.8    2.6
++BM_Match_SingleLevel/4                               168.0      161.0    -4.2%      2.2    2.5
+ BM_Match_SingleLevel/16                              556.0      545.0    -2.0%      0.8    0.9
++BM_Match_SingleLevel/64                             1963.0     1886.0    -3.9%      2.5    2.0
++BM_Match_SingleLevel/256                            7488.0     7107.0    -5.1%      1.4    1.4
+
+ BM_Sweep_Levels/1                                     58.7       59.9    +2.0%      2.4    3.4
+ BM_Sweep_Levels/4                                    205.0      200.0    -2.4%      2.4    1.6
++BM_Sweep_Levels/16                                   775.0      739.0    -4.6%      1.4    1.2
+ BM_Sweep_Levels/64                                  3001.0     2934.0    -2.2%      1.8    1.3
+ BM_Sweep_Levels/256                                11969.0    11646.0    -2.7%      2.2    0.8
+ BM_Sweep_Levels/1024                               47953.0    46784.0    -2.4%      1.5    1.7
+
+ BM_Cancel/1                                           31.6       31.8    +0.6%      1.1    2.0
+ BM_Cancel/16                                         103.0      101.0    -1.9%      4.6    9.0
++BM_Cancel/256                                        160.0      144.0   -10.0%      6.9    4.7
+ BM_Cancel/4096                                       177.0      175.0    -1.1%      9.9    6.8
+ BM_Cancel/65536                                      113.0      112.0    -0.9%      1.6    3.1
+
++BM_Replace_PriorityPreserving/1                       27.3       26.2    -4.0%      2.5    1.0
+ BM_Replace_PriorityPreserving/16                      26.8       26.7    -0.4%      2.4    2.4
+ BM_Replace_PriorityPreserving/256                     28.3       28.0    -1.1%      1.6    2.6
+ BM_Replace_PriorityPreserving/4096                    31.0       30.9    -0.3%      0.9    1.1
+ BM_Replace_PriorityPreserving/65536                   33.3       33.8    +1.5%      2.1    1.9
+
+!BM_Replace_PriorityLosing_QuantityIncrease/1          71.2       83.6   +17.4%     12.0    1.7
+ BM_Replace_PriorityLosing_QuantityIncrease/16        108.0      111.0    +2.8%      3.4    1.0
+ BM_Replace_PriorityLosing_QuantityIncrease/256       162.0      163.0    +0.6%      0.8    1.1
+ BM_Replace_PriorityLosing_QuantityIncrease/4096      214.0      214.0    +0.0%      0.4    0.2
+!BM_Replace_PriorityLosing_QuantityIncrease/65536      652.0      676.0    +3.7%      3.1    1.3
+
+!BM_Replace_PriorityLosing_PriceChange/1               69.5       79.6   +14.5%     12.9    1.6
+ BM_Replace_PriorityLosing_PriceChange/16             105.0      107.0    +1.9%      2.2    1.3
+ BM_Replace_PriorityLosing_PriceChange/256            163.0      161.0    -1.2%      0.9    1.1
+ BM_Replace_PriorityLosing_PriceChange/4096           214.0      213.0    -0.5%      1.3    0.6
+ BM_Replace_PriorityLosing_PriceChange/65536          650.0      668.0    +2.8%      1.5    0.7
+
+ BM_Fok_Rejected_CrossableLevels/1                      7.9        7.9    +0.1%      5.5    0.5
++BM_Fok_Rejected_CrossableLevels/4                     15.4       14.0    -9.1%      4.9    5.2
+ BM_Fok_Rejected_CrossableLevels/16                    46.5       46.8    +0.6%      0.9    1.6
+ BM_Fok_Rejected_CrossableLevels/64                   209.0      208.0    -0.5%      0.5    0.5
+ BM_Fok_Rejected_CrossableLevels/256                  934.0      937.0    +0.3%      0.1    0.3
+ BM_Fok_Rejected_CrossableLevels/1024                7231.0     7148.0    -1.1%      0.1    0.2
+
+ BM_Fok_Rejected_BackgroundDepth/0                      7.9        7.9    +0.1%      0.5    0.3
+ BM_Fok_Rejected_BackgroundDepth/16                     8.2        8.3    +0.5%      2.4    1.8
+ BM_Fok_Rejected_BackgroundDepth/256                    8.2        8.3    +0.4%      0.3    1.7
+ BM_Fok_Rejected_BackgroundDepth/4096                   8.3        8.3    +0.0%      0.9    1.0
+!BM_Fok_Rejected_BackgroundDepth/65536                 12.6       13.0    +3.2%      7.5    5.7
+
+ BM_Fok_Executed/1                                     57.5       57.5    +0.0%      0.6    1.2
+ BM_Fok_Executed/4                                    188.0      187.0    -0.5%      1.0    2.6
+ BM_Fok_Executed/16                                   757.0      754.0    -0.4%      1.4    2.9
+ BM_Fok_Executed/64                                  3159.0     3118.0    -1.3%      1.9    1.0
+ BM_Fok_Executed/256                                13164.0    12900.0    -2.0%      0.4    0.9
+ BM_Fok_Executed/1024                               54445.0    53261.0    -2.2%      0.8    1.4
+
+What to read out of that table
+------------------------------
+The paths that actually run the matching loop improve by a couple of percent on average,
+and the improvement grows with how many fills the operation does -- which is what you
+would expect from removing a per-fill cost:
+
+  17 matching-loop cases: mean change -2.2%, best -5.1%, worst +2.0%
+
+  the single-fill cases (Match/1, Sweep/1, Fok_Executed/1) are flat to slightly noisy;
+  the deep ones (Match/256 -5.1%, Sweep/256 -2.7%, Fok_Executed/1024 -2.2%) all improve.
+
+This is the expected size of the effect. One 72-byte copy per fill is a handful of
+cycles against everything else a fill does (a map lookup to find the best level, a list
+node touch, two event constructions through a std::function sink), so removing it moves
+the deep-sweep cases by a few percent rather than transforming them. It is worth having
+because it is free at runtime and costs only the discipline of reading fields out before
+mutating.
+
+The two cases flagged as slower, BM_Replace_PriorityLosing_*/1, are the ones to be
+careful about: their before figures carry cv of 12.0% and 12.9%, versus 1.7% and 1.6%
+after. A ~10 ns difference between a very noisy measurement and a quiet one is not
+evidence of a regression, and there is no mechanism for one -- on a non-crossing replace
+the loop breaks before it reaches any of the changed code, having done strictly less
+work than before (no copy at all).
+
+
+Workload benchmark
+==============================================================================================
+The mixed-workload figure is too noisy at this effect size to say anything. Four runs,
+the first of the Tier 0 build and the rest of the Tier 3(a) build:
+
+  mixed (realistic 40/25/20/10/5), sustained ns/op
+    Tier 0    :  151.1
+    Tier 3(a) :  155.4, 145.1, 150.1, 151.3
+
+A 7% band across runs of one unchanged binary swamps a 2-5% effect. (For the same
+reason, the earlier Tier 0 run measured this at 158.8 and the pre-change run in this
+session measured 144.2 -- identical code both times.)
+
+The one workload number stable enough to read is the pure crossing stream, which is
+nearly all matching loop and therefore where this change should show up:
+
+  crossing (IOC, one fill each, one level), sustained ns/op
+    Tier 0    :  39.3, 38.2
+    Tier 3(a) :  37.6, 37.6, 37.1, 37.6
+
+Around 2% faster, consistent with the microbenchmarks.
+
+
+Conclusion
+==============================================================================================
+A small, real, no-cost win: 2-5% on every path that runs the matching loop, nothing
+changed anywhere else, no allocation impact, no behaviour change. Tier 3(b) -- shrinking
+ExchangeRestingOrder itself -- is the half of Tier 3 with the large effect still in it,
+and is not simple: instrument_id and side are recoverable from the book, but
+order_sequence and original_quantity are serialized into the persistence state hash
+(src/exchange/persistence/state_hash.cpp) and compared by the snapshot tests, so removing
+them from the stored order changes a durable contract rather than just a layout.

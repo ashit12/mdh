@@ -1,0 +1,27 @@
+mdh order-entry latency: NewOrder -> Accepted, IOC, empty book, loopback TCP
+
+Fully-wired gateway (decode, risk, ledger, matching, encode, two thread handoffs)
+samples: 10000
+min:    56.17 us
+mean:   73.04 us
+p50:    69.79 us
+p90:    78.67 us
+p99:    147.46 us
+p99.9:  224.75 us
+max:    282.88 us
+
+Transport floor (same bytes, same client, canned reply, nothing in between)
+samples: 10000
+min:    41.71 us
+mean:   50.01 us
+p50:    47.75 us
+p90:    53.50 us
+p99:    87.04 us
+p99.9:  157.50 us
+max:    401.46 us
+
+What this codebase adds, floor subtracted at each percentile
+p50       22.04 us  (32% of the round trip)
+p90       25.17 us  (32% of the round trip)
+p99       60.42 us  (41% of the round trip)
+p99.9     67.25 us  (30% of the round trip)

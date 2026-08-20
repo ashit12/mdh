@@ -64,7 +64,7 @@ ExchangeCommand new_order(CommandSequence seq, AccountId account, ClientOrderId 
 TEST(MarketDataE2e, MatchingEngineOutputReplaysIntoAnAgreeingReconstructedBook) {
     TempFile tmp("mdh_test_market_data_e2e_cancel.bin");
 
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     MarketDataPublisher publisher;
     {
         EventFileWriter writer(tmp.path());
@@ -126,7 +126,7 @@ TEST(MarketDataE2e, MatchingEngineOutputReplaysIntoAnAgreeingReconstructedBook) 
 TEST(MarketDataE2e, PartiallyFilledRestingOrderSurvivesTheRoundTripAtItsReducedQuantity) {
     TempFile tmp("mdh_test_market_data_e2e_partial_fill.bin");
 
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     MarketDataPublisher publisher;
     {
         EventFileWriter writer(tmp.path());

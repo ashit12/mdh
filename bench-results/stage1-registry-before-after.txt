@@ -1,0 +1,173 @@
+mdh matching engine: an instrument registry and dense book slots (Stage 1)
+
+The change
+----------
+MatchingEngine used to hold std::unordered_map<InstrumentId, MatchingBook>, and book_for()
+was books_[instrument_id] -- a lazy insert. Instrument ids come from clients, so any id a
+client invented got a book of its own, allocated on the spot, forever. That is the hole
+this stage closes.
+
+The engine now takes its universe at construction and rejects anything else:
+
+  MatchingEngine(std::span<const InstrumentId> universe, std::size_t expected_resting_orders)
+
+  slot_of_id_ : vector<uint32>, direct-mapped, sized to the largest id (capped at 1<<22,
+                so 16 MB worst case). kNoSlot means unregistered -- the bounds check IS
+                the validity check.
+  books_      : vector<MatchingBook>, indexed by slot, dense.
+  by_id_      : sorted (id, slot) pairs, so snapshot() no longer sorts on every call.
+
+A command naming an unregistered instrument is rejected with RejectReason::InvalidInstrument,
+checked ahead of every other field. RiskGatedEngine checks it before the risk check, because
+risk would otherwise answer the wrong question: a sell on an instrument the exchange does
+not trade came back InsufficientPosition, which reads as something a deposit would fix.
+
+register_instrument() exists for replay, which means books_ can grow, which means every
+MatchingBook in it moves. Outstanding handles survive that because a book's pool sits behind
+a unique_ptr (stable address) and moving a pmr container with an equal allocator relinks
+nodes rather than copying them. MatchingEngine.RegisteringAnInstrumentKeepsRestingOrdersReachable
+rests an order, registers 63 more instruments, then cancels and fills through handles taken
+before the moves.
+
+The journal is now self-describing: a fourth frame type, RegisterInstrument (payload:
+instrument_id), written once per instrument when the journal is opened, ahead of any command.
+run_command_replay() registers from those frames as it reads them, so a replay reproduces the
+run that wrote the file without being told the universe out of band. Readers that predate the
+type reject it cleanly as InvalidMessageType rather than misparsing.
+
+Correctness: all 395 tests pass (12 new), clean under ASan. The pipeline's concurrency test
+now submits 20,000 registered instruments, which makes it a scale test of the registry too.
+
+Expectation going in was 3-6% from replacing a hash, a bucket load and a node hop with a
+bounds check and two array loads. That is roughly what the whole-engine numbers show; the
+lookup-dominated microbenchmarks show more.
+
+
+Whole-engine workload (bench_matching_workload)
+==============================================================================================
+                                             before      after     change
+----------------------------------------------------------------------------------------------
+mixed workload, 10k ops                  108.7 ns/op 100.9 ns/op     -7.2%
+mixed workload, 100k ops                  96.5 ns/op  91.0 ns/op     -5.7%
+mixed workload, 1M ops                   106.6 ns/op  92.7 ns/op    -13.0%
+
+resting (GTC, existing level, 1024 lvl)   72.7 ns/op  61.4 ns/op    -15.5%
+crossing (IOC, one fill, one level)       27.9 ns/op  27.3 ns/op     -2.2%
+mixed (realistic 40/25/20/10/5)          103.6 ns/op  92.1 ns/op    -11.1%
+
+Sampled tail, 1M-operation mixed stream (ns)
+----------------------------------------------------------------------------------------------
+                          p50        p90        p99      p99.9        max
+before                    125        250        417        708      62701
+after                      84        167        291        417      27643
+
+The tail moves further than the median, which is the expected shape: what was removed is a
+hash lookup with a data-dependent miss path, and a miss is exactly what a tail sample is.
+Do not read the max too closely -- one sample of one run.
+
+Per-operation tail, 1M-operation stream (ns)
+----------------------------------------------------------------------------------------------
+                       p50 before/after   p99 before/after  p99.9 before/after
+resting                     84 / 83           333 / 209          500 / 334
+crossing                   125 / 84           375 / 268          542 / 375
+cancel                     125 / 125          458 / 250          667 / 334
+replace (priority kept)    125 / 125          500 / 292          750 / 417
+replace (priority lost)    209 / 167          583 / 375          875 / 459
+IOC                         83 / 83           333 / 250          541 / 334
+FOK                         83 / 83           625 / 500         1167 / 708
+
+Scaling: instrument count (~4096 resting orders/side spread across N instruments)
+----------------------------------------------------------------------------------------------
+ instruments      before       after     change
+           1   99.1 ns/op  94.0 ns/op      -5.1%
+           4  107.5 ns/op 100.8 ns/op      -6.2%
+          16  119.2 ns/op 112.0 ns/op      -6.0%
+          64  136.0 ns/op 126.6 ns/op      -6.9%
+
+The 1-to-64 degradation is nearly unchanged (37% before, 35% after), which is the point:
+that gradient is working set, not lookup, exactly as predicted. The registry moves the whole
+curve down by a constant, it does not flatten it.
+
+Scaling: resting orders vs. price levels (ns/op, 1024 levels | 1 order per level)
+----------------------------------------------------------------------------------------------
+   orders     before          after
+     1024   63.0 | 65.6     50.4 | 48.3
+    10240   63.1 | 75.5     48.2 | 69.5
+   102400   59.4 | 129.9    51.6 | 129.9
+  1024000   72.2 | 160.0    60.8 | 156.5
+
+Scaling: cancel vs. price-level count (ns/op)
+----------------------------------------------------------------------------------------------
+   levels     before      after
+        1       19.4       18.7
+       64       57.1       52.6
+     4096      158.2      134.6
+   262144      156.9      157.2
+
+Still the shape stage 3 exists to fix: the tree walk, not the instrument lookup, is what
+makes a cancel against 4096 levels eight times a cancel against one.
+
+
+Microbenchmarks (bench_matching_engine, medians of 5 repetitions, ns)
+==============================================================================================
+                                                       before     after    change
+----------------------------------------------------------------------------------------------
+Rest, existing level, 1 level                            60.6      52.7    -13.0%
+Rest, existing level, 256 levels                         83.8      66.5    -20.6%
+Rest, existing level, 4096 levels                        94.1      87.0     -7.5%
+Rest, existing level, 65536 levels                        141       141      0.0%
+Rest, new level, 256 levels                               193       183     -5.2%
+Rest, new level, 4096 levels                              199       189     -5.0%
+
+Cancel, 1 level                                          21.2      19.0    -10.4%
+Cancel, 16 levels                                        38.1      34.3    -10.0%
+Cancel, 256 levels                                       74.1      58.4    -21.2%
+Cancel, 4096 levels                                       119      75.6    -36.5%
+Cancel, 65536 levels                                      125       125      0.0%
+
+Replace, priority preserving, 1 level                    23.3      21.8     -6.4%
+Replace, priority preserving, 65536 levels               30.5      27.8     -8.9%
+Replace, priority losing (qty increase), 1 level         56.2      50.6    -10.0%
+Replace, priority losing (qty increase), 65536 levels     548       511     -6.8%
+Replace, priority losing (price change), 65536 levels     568       544     -4.2%
+
+Match, single level, 1 order                             47.9      44.6     -6.9%
+Match, single level, 64 orders                           1570      1382    -12.0%
+Match, single level, 256 orders                          6105      5827     -4.6%
+Sweep, 16 levels                                          607       565     -6.9%
+Sweep, 1024 levels                                      37263     36118     -3.1%
+
+FOK rejected, no crossable depth                         14.7      6.51    -55.7%
+FOK rejected, 16 background levels                       8.23      6.82    -17.1%
+FOK rejected, 65536 background levels                    14.3      9.82    -31.3%
+FOK rejected, 1024 crossable levels                      5849      5687     -2.8%
+FOK executed, 1024 levels                               45362     44668     -1.5%
+
+The FOK-rejected row with nothing crossable is the cleanest read on what this stage actually
+did: that path is a lookup and an immediate answer, and it used to pay a hash miss
+(crossable_quantity() called books_.find() and returned 0 when it missed). It is now a bounds
+check and an array load, and the operation more than halved. Cancel at 4096 levels moving 36%
+is larger than a lookup can explain on its own and is probably partly variance; the 65536-level
+rows not moving at all fits -- at that depth the tree walk dominates everything else.
+
+
+Memory (bench_matching_memory)
+==============================================================================================
+Unchanged, as expected: this stage moves a per-instrument container, not a per-order one.
+
+  1,000,000 resting orders, 1 order/level:  345.9 bytes/order before and after
+  1,000,000 resting orders, 100/level:      214.9 bytes/order before and after
+
+Total allocations for a 1,000,000-order book: 815 before, 816 after -- one more, and 112 bytes
+fewer overall. The engine trades one unordered_map's bucket array for three small vectors, and
+at one instrument that is a rounding error. It stops being one at scale: the old map allocated
+a node per instrument on first touch, from a client-supplied id, without limit.
+
+
+Where this leaves things
+------------------------
+The nanoseconds are real but they are not why this stage exists. It exists because the engine
+no longer allocates on client-controlled input, because replay no longer needs to be told what
+the exchange traded, and because a tick ladder is sized instruments x band x 2 sides -- which
+cannot be budgeted until the instrument set is bounded and known. Stage 2 (slab plus intrusive
+FIFO levels) is next, and the cancel and sweep rows above are the ones it should move.

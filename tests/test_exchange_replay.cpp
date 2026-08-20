@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdio>
 #include <string>
 
@@ -28,8 +29,10 @@ private:
 // instruments -- enough variety that a nondeterministic bug (e.g.
 // accidentally iterating an unordered_map without sorting) would show up as
 // a mismatch between two replays of the same file.
+constexpr std::array<InstrumentId, 2> kInstruments{1, 2};
+
 void write_mixed_journal(const std::string& path) {
-    CommandJournalWriter writer(path);
+    CommandJournalWriter writer(path, kInstruments);
     ASSERT_TRUE(writer.is_open());
 
     auto new_order = [](CommandSequence seq, AccountId account, ClientOrderId client_id, InstrumentId instrument,
@@ -76,6 +79,9 @@ TEST(ExchangeReplay, SameJournalProducesIdenticalEventsAcrossTwoRuns) {
     ASSERT_FALSE(run2.stopped_early) << run2.stop_reason;
     EXPECT_EQ(run1.commands_processed, 9u);
     EXPECT_EQ(run1.commands_processed, run2.commands_processed);
+    // Learned from the file, not from this test: nothing here tells
+    // run_command_replay() what the exchange traded.
+    EXPECT_EQ(run1.instruments_registered, kInstruments.size());
 
     // The core requirement: byte-for-byte identical event streams from two
     // independent replays of the same journal.

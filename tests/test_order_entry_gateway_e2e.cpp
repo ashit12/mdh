@@ -123,7 +123,10 @@ private:
 // local to this test file, same rationale as TempFile in test_market_data_e2e.cpp.
 class RunningGateway {
 public:
-    explicit RunningGateway(const OrderEntryGatewayOptions& options = {}) : gateway_(0, options) {
+    // Fills in the one instrument this file trades unless the caller named
+    // its own: a gateway rejects orders on anything it was not told about,
+    // so every test here would otherwise have to repeat the same line.
+    explicit RunningGateway(OrderEntryGatewayOptions options = {}) : gateway_(0, with_default_instrument(options)) {
         started_ = gateway_.start();
     }
 
@@ -132,6 +135,13 @@ public:
     [[nodiscard]] OrderEntryGateway& gateway() { return gateway_; }
 
 private:
+    static const OrderEntryGatewayOptions& with_default_instrument(OrderEntryGatewayOptions& options) {
+        if (options.instruments.empty()) {
+            options.instruments = {kInstrument};
+        }
+        return options;
+    }
+
     OrderEntryGateway gateway_;
     bool started_ = false;
 };

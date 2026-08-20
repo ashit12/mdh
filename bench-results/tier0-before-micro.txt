@@ -1,0 +1,258 @@
+Unable to determine clock rate from sysctl: hw.cpufrequency: No such file or directory
+This does not affect benchmark measurements, only the metadata output.
+***WARNING*** Failed to set thread affinity. Estimated CPU frequency may be incorrect.
+2026-08-19T20:15:57+05:30
+Running ./build/bench_matching_engine
+Run on (12 X 24 MHz CPU s)
+CPU Caches:
+  L1 Data 64 KiB
+  L1 Instruction 128 KiB
+  L2 Unified 4096 KiB (x12)
+Load Average: 5.48, 4.31, 5.25
+-------------------------------------------------------------------------------------------------------------------
+Benchmark                                                                         Time             CPU   Iterations
+-------------------------------------------------------------------------------------------------------------------
+BM_Rest_ExistingPriceLevel/1/iterations:65536_mean                             82.2 ns         81.7 ns            5
+BM_Rest_ExistingPriceLevel/1/iterations:65536_median                           78.7 ns         78.3 ns            5
+BM_Rest_ExistingPriceLevel/1/iterations:65536_stddev                           7.44 ns         7.36 ns            5
+BM_Rest_ExistingPriceLevel/1/iterations:65536_cv                               9.05 %          9.01 %             5
+BM_Rest_ExistingPriceLevel/16/iterations:65536_mean                            92.1 ns         91.8 ns            5
+BM_Rest_ExistingPriceLevel/16/iterations:65536_median                          91.8 ns         91.6 ns            5
+BM_Rest_ExistingPriceLevel/16/iterations:65536_stddev                          1.36 ns         1.18 ns            5
+BM_Rest_ExistingPriceLevel/16/iterations:65536_cv                              1.48 %          1.29 %             5
+BM_Rest_ExistingPriceLevel/256/iterations:65536_mean                            107 ns          107 ns            5
+BM_Rest_ExistingPriceLevel/256/iterations:65536_median                          106 ns          106 ns            5
+BM_Rest_ExistingPriceLevel/256/iterations:65536_stddev                         4.13 ns         3.37 ns            5
+BM_Rest_ExistingPriceLevel/256/iterations:65536_cv                             3.85 %          3.15 %             5
+BM_Rest_ExistingPriceLevel/4096/iterations:65536_mean                           111 ns          110 ns            5
+BM_Rest_ExistingPriceLevel/4096/iterations:65536_median                         111 ns          110 ns            5
+BM_Rest_ExistingPriceLevel/4096/iterations:65536_stddev                        1.63 ns         1.49 ns            5
+BM_Rest_ExistingPriceLevel/4096/iterations:65536_cv                            1.47 %          1.35 %             5
+BM_Rest_ExistingPriceLevel/65536/iterations:65536_mean                          153 ns          153 ns            5
+BM_Rest_ExistingPriceLevel/65536/iterations:65536_median                        152 ns          151 ns            5
+BM_Rest_ExistingPriceLevel/65536/iterations:65536_stddev                       7.70 ns         7.66 ns            5
+BM_Rest_ExistingPriceLevel/65536/iterations:65536_cv                           5.03 %          5.01 %             5
+BM_Rest_NewPriceLevel/1/iterations:65536_mean                                   212 ns          212 ns            5
+BM_Rest_NewPriceLevel/1/iterations:65536_median                                 218 ns          217 ns            5
+BM_Rest_NewPriceLevel/1/iterations:65536_stddev                                13.8 ns         14.0 ns            5
+BM_Rest_NewPriceLevel/1/iterations:65536_cv                                    6.50 %          6.64 %             5
+BM_Rest_NewPriceLevel/16/iterations:65536_mean                                  213 ns          213 ns            5
+BM_Rest_NewPriceLevel/16/iterations:65536_median                                214 ns          214 ns            5
+BM_Rest_NewPriceLevel/16/iterations:65536_stddev                               1.88 ns         1.95 ns            5
+BM_Rest_NewPriceLevel/16/iterations:65536_cv                                   0.88 %          0.92 %             5
+BM_Rest_NewPriceLevel/256/iterations:65536_mean                                 277 ns          230 ns            5
+BM_Rest_NewPriceLevel/256/iterations:65536_median                               243 ns          223 ns            5
+BM_Rest_NewPriceLevel/256/iterations:65536_stddev                              87.7 ns         36.1 ns            5
+BM_Rest_NewPriceLevel/256/iterations:65536_cv                                 31.71 %         15.67 %             5
+BM_Rest_NewPriceLevel/4096/iterations:65536_mean                                198 ns          196 ns            5
+BM_Rest_NewPriceLevel/4096/iterations:65536_median                              195 ns          194 ns            5
+BM_Rest_NewPriceLevel/4096/iterations:65536_stddev                             6.60 ns         5.50 ns            5
+BM_Rest_NewPriceLevel/4096/iterations:65536_cv                                 3.34 %          2.80 %             5
+BM_Rest_NewPriceLevel/65536/iterations:65536_mean                               172 ns          171 ns            5
+BM_Rest_NewPriceLevel/65536/iterations:65536_median                             171 ns          170 ns            5
+BM_Rest_NewPriceLevel/65536/iterations:65536_stddev                            14.2 ns         13.9 ns            5
+BM_Rest_NewPriceLevel/65536/iterations:65536_cv                                8.27 %          8.10 %             5
+BM_Match_SingleLevel/1/iterations:65536_mean                                    100 ns          100 ns            5 items_per_second=9.99457M/s
+BM_Match_SingleLevel/1/iterations:65536_median                                  100 ns          100 ns            5 items_per_second=9.97352M/s
+BM_Match_SingleLevel/1/iterations:65536_stddev                                0.669 ns        0.676 ns            5 items_per_second=67.6533k/s
+BM_Match_SingleLevel/1/iterations:65536_cv                                     0.67 %          0.68 %             5 items_per_second=0.68%
+BM_Match_SingleLevel/4/iterations:65536_mean                                    284 ns          284 ns            5 items_per_second=14.115M/s
+BM_Match_SingleLevel/4/iterations:65536_median                                  282 ns          281 ns            5 items_per_second=14.2261M/s
+BM_Match_SingleLevel/4/iterations:65536_stddev                                 7.57 ns         7.67 ns            5 items_per_second=370.967k/s
+BM_Match_SingleLevel/4/iterations:65536_cv                                     2.66 %          2.70 %             5 items_per_second=2.63%
+BM_Match_SingleLevel/16/iterations:16384_mean                                   979 ns          977 ns            5 items_per_second=16.3855M/s
+BM_Match_SingleLevel/16/iterations:16384_median                                 977 ns          974 ns            5 items_per_second=16.422M/s
+BM_Match_SingleLevel/16/iterations:16384_stddev                                9.07 ns         8.07 ns            5 items_per_second=134.435k/s
+BM_Match_SingleLevel/16/iterations:16384_cv                                    0.93 %          0.83 %             5 items_per_second=0.82%
+BM_Match_SingleLevel/64/iterations:4096_mean                                   3780 ns         3768 ns            5 items_per_second=16.9856M/s
+BM_Match_SingleLevel/64/iterations:4096_median                                 3779 ns         3768 ns            5 items_per_second=16.9837M/s
+BM_Match_SingleLevel/64/iterations:4096_stddev                                 34.8 ns         28.8 ns            5 items_per_second=129.38k/s
+BM_Match_SingleLevel/64/iterations:4096_cv                                     0.92 %          0.76 %             5 items_per_second=0.76%
+BM_Match_SingleLevel/256/iterations:1024_mean                                 14945 ns        14907 ns            5 items_per_second=17.1738M/s
+BM_Match_SingleLevel/256/iterations:1024_median                               14959 ns        14927 ns            5 items_per_second=17.1504M/s
+BM_Match_SingleLevel/256/iterations:1024_stddev                                99.4 ns         90.6 ns            5 items_per_second=104.412k/s
+BM_Match_SingleLevel/256/iterations:1024_cv                                    0.67 %          0.61 %             5 items_per_second=0.61%
+BM_Sweep_Levels/1/iterations:65536_mean                                         102 ns          101 ns            5 items_per_second=9.90556M/s
+BM_Sweep_Levels/1/iterations:65536_median                                       100 ns         99.6 ns            5 items_per_second=10.0392M/s
+BM_Sweep_Levels/1/iterations:65536_stddev                                      3.00 ns         2.61 ns            5 items_per_second=254.203k/s
+BM_Sweep_Levels/1/iterations:65536_cv                                          2.95 %          2.59 %             5 items_per_second=2.57%
+BM_Sweep_Levels/iterations:65536_BigO                                        101.53 (1)      101.01 (1)  
+BM_Sweep_Levels/iterations:65536_RMS                                              3 %             2 %    
+BM_Sweep_Levels/4/iterations:65536_mean                                         367 ns          365 ns            5 items_per_second=10.9853M/s
+BM_Sweep_Levels/4/iterations:65536_median                                       359 ns          357 ns            5 items_per_second=11.2061M/s
+BM_Sweep_Levels/4/iterations:65536_stddev                                      24.8 ns         24.6 ns            5 items_per_second=680.477k/s
+BM_Sweep_Levels/4/iterations:65536_cv                                          6.76 %          6.73 %             5 items_per_second=6.19%
+BM_Sweep_Levels/iterations:65536_BigO                                        366.58 (1)      365.34 (1)  
+BM_Sweep_Levels/iterations:65536_RMS                                              6 %             6 %    
+BM_Sweep_Levels/16/iterations:16384_mean                                       1377 ns         1373 ns            5 items_per_second=11.6534M/s
+BM_Sweep_Levels/16/iterations:16384_median                                     1373 ns         1371 ns            5 items_per_second=11.6721M/s
+BM_Sweep_Levels/16/iterations:16384_stddev                                     9.59 ns         8.91 ns            5 items_per_second=75.1261k/s
+BM_Sweep_Levels/16/iterations:16384_cv                                         0.70 %          0.65 %             5 items_per_second=0.64%
+BM_Sweep_Levels/iterations:16384_BigO                                       1377.19 (1)     1373.03 (1)  
+BM_Sweep_Levels/iterations:16384_RMS                                              1 %             1 %    
+BM_Sweep_Levels/64/iterations:4096_mean                                        5504 ns         5487 ns            5 items_per_second=11.6649M/s
+BM_Sweep_Levels/64/iterations:4096_median                                      5498 ns         5479 ns            5 items_per_second=11.6815M/s
+BM_Sweep_Levels/64/iterations:4096_stddev                                      34.2 ns         31.3 ns            5 items_per_second=66.2673k/s
+BM_Sweep_Levels/64/iterations:4096_cv                                          0.62 %          0.57 %             5 items_per_second=0.57%
+BM_Sweep_Levels/iterations:4096_BigO                                        5504.25 (1)     5486.67 (1)  
+BM_Sweep_Levels/iterations:4096_RMS                                               1 %             1 %    
+BM_Sweep_Levels/256/iterations:1024_mean                                      22003 ns        21954 ns            5 items_per_second=11.6609M/s
+BM_Sweep_Levels/256/iterations:1024_median                                    21984 ns        21949 ns            5 items_per_second=11.6633M/s
+BM_Sweep_Levels/256/iterations:1024_stddev                                     93.7 ns         78.1 ns            5 items_per_second=41.4034k/s
+BM_Sweep_Levels/256/iterations:1024_cv                                         0.43 %          0.36 %             5 items_per_second=0.36%
+BM_Sweep_Levels/iterations:1024_BigO                                       22002.95 (1)    21953.91 (1)  
+BM_Sweep_Levels/iterations:1024_RMS                                               0 %             0 %    
+BM_Sweep_Levels/1024/iterations:256_mean                                      88596 ns        88393 ns            5 items_per_second=11.5856M/s
+BM_Sweep_Levels/1024/iterations:256_median                                    88777 ns        88508 ns            5 items_per_second=11.5696M/s
+BM_Sweep_Levels/1024/iterations:256_stddev                                      966 ns          916 ns            5 items_per_second=120.883k/s
+BM_Sweep_Levels/1024/iterations:256_cv                                         1.09 %          1.04 %             5 items_per_second=1.04%
+BM_Sweep_Levels/iterations:256_BigO                                        88596.03 (1)    88392.97 (1)  
+BM_Sweep_Levels/iterations:256_RMS                                                1 %             1 %    
+BM_Cancel/1/iterations:65536_mean                                              61.0 ns         60.8 ns            5
+BM_Cancel/1/iterations:65536_median                                            60.9 ns         60.8 ns            5
+BM_Cancel/1/iterations:65536_stddev                                            1.25 ns        0.969 ns            5
+BM_Cancel/1/iterations:65536_cv                                                2.05 %          1.59 %             5
+BM_Cancel/16/iterations:65536_mean                                             94.9 ns         94.7 ns            5
+BM_Cancel/16/iterations:65536_median                                           94.7 ns         94.7 ns            5
+BM_Cancel/16/iterations:65536_stddev                                           1.49 ns         1.43 ns            5
+BM_Cancel/16/iterations:65536_cv                                               1.57 %          1.52 %             5
+BM_Cancel/256/iterations:65536_mean                                             112 ns          112 ns            5
+BM_Cancel/256/iterations:65536_median                                           112 ns          112 ns            5
+BM_Cancel/256/iterations:65536_stddev                                          1.89 ns         1.70 ns            5
+BM_Cancel/256/iterations:65536_cv                                              1.69 %          1.52 %             5
+BM_Cancel/4096/iterations:65536_mean                                            175 ns          175 ns            5
+BM_Cancel/4096/iterations:65536_median                                          175 ns          175 ns            5
+BM_Cancel/4096/iterations:65536_stddev                                         4.20 ns         3.96 ns            5
+BM_Cancel/4096/iterations:65536_cv                                             2.40 %          2.26 %             5
+BM_Cancel/65536/iterations:65536_mean                                           143 ns          143 ns            5
+BM_Cancel/65536/iterations:65536_median                                         145 ns          144 ns            5
+BM_Cancel/65536/iterations:65536_stddev                                        2.39 ns         2.36 ns            5
+BM_Cancel/65536/iterations:65536_cv                                            1.67 %          1.65 %             5
+BM_Replace_PriorityPreserving/1/iterations:65536_mean                          51.3 ns         50.9 ns            5
+BM_Replace_PriorityPreserving/1/iterations:65536_median                        50.9 ns         50.9 ns            5
+BM_Replace_PriorityPreserving/1/iterations:65536_stddev                        2.11 ns         1.38 ns            5
+BM_Replace_PriorityPreserving/1/iterations:65536_cv                            4.11 %          2.72 %             5
+BM_Replace_PriorityPreserving/16/iterations:65536_mean                         51.8 ns         51.7 ns            5
+BM_Replace_PriorityPreserving/16/iterations:65536_median                       52.3 ns         52.0 ns            5
+BM_Replace_PriorityPreserving/16/iterations:65536_stddev                      0.923 ns        0.794 ns            5
+BM_Replace_PriorityPreserving/16/iterations:65536_cv                           1.78 %          1.54 %             5
+BM_Replace_PriorityPreserving/256/iterations:65536_mean                        53.0 ns         53.0 ns            5
+BM_Replace_PriorityPreserving/256/iterations:65536_median                      52.5 ns         52.5 ns            5
+BM_Replace_PriorityPreserving/256/iterations:65536_stddev                      1.31 ns         1.18 ns            5
+BM_Replace_PriorityPreserving/256/iterations:65536_cv                          2.47 %          2.23 %             5
+BM_Replace_PriorityPreserving/4096/iterations:65536_mean                       52.4 ns         52.1 ns            5
+BM_Replace_PriorityPreserving/4096/iterations:65536_median                     52.6 ns         52.6 ns            5
+BM_Replace_PriorityPreserving/4096/iterations:65536_stddev                     1.53 ns         1.26 ns            5
+BM_Replace_PriorityPreserving/4096/iterations:65536_cv                         2.92 %          2.41 %             5
+BM_Replace_PriorityPreserving/65536/iterations:65536_mean                      52.6 ns         52.5 ns            5
+BM_Replace_PriorityPreserving/65536/iterations:65536_median                    52.3 ns         52.3 ns            5
+BM_Replace_PriorityPreserving/65536/iterations:65536_stddev                   0.456 ns        0.383 ns            5
+BM_Replace_PriorityPreserving/65536/iterations:65536_cv                        0.87 %          0.73 %             5
+BM_Replace_PriorityLosing_QuantityIncrease/1/iterations:65536_mean              185 ns          184 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/1/iterations:65536_median            185 ns          184 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/1/iterations:65536_stddev           2.05 ns         2.03 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/1/iterations:65536_cv               1.11 %          1.11 %             5
+BM_Replace_PriorityLosing_QuantityIncrease/16/iterations:65536_mean             230 ns          229 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/16/iterations:65536_median           230 ns          229 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/16/iterations:65536_stddev         0.601 ns        0.581 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/16/iterations:65536_cv              0.26 %          0.25 %             5
+BM_Replace_PriorityLosing_QuantityIncrease/256/iterations:65536_mean            256 ns          255 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/256/iterations:65536_median          256 ns          256 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/256/iterations:65536_stddev         1.92 ns         1.72 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/256/iterations:65536_cv             0.75 %          0.67 %             5
+BM_Replace_PriorityLosing_QuantityIncrease/4096/iterations:65536_mean           295 ns          295 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/4096/iterations:65536_median         295 ns          295 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/4096/iterations:65536_stddev        1.29 ns         1.44 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/4096/iterations:65536_cv            0.44 %          0.49 %             5
+BM_Replace_PriorityLosing_QuantityIncrease/65536/iterations:65536_mean          574 ns          573 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/65536/iterations:65536_median        586 ns          584 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/65536/iterations:65536_stddev       31.9 ns         31.5 ns            5
+BM_Replace_PriorityLosing_QuantityIncrease/65536/iterations:65536_cv           5.55 %          5.50 %             5
+BM_Replace_PriorityLosing_PriceChange/1/iterations:65536_mean                   190 ns          189 ns            5
+BM_Replace_PriorityLosing_PriceChange/1/iterations:65536_median                 191 ns          191 ns            5
+BM_Replace_PriorityLosing_PriceChange/1/iterations:65536_stddev                2.46 ns         2.42 ns            5
+BM_Replace_PriorityLosing_PriceChange/1/iterations:65536_cv                    1.29 %          1.28 %             5
+BM_Replace_PriorityLosing_PriceChange/16/iterations:65536_mean                  233 ns          233 ns            5
+BM_Replace_PriorityLosing_PriceChange/16/iterations:65536_median                233 ns          232 ns            5
+BM_Replace_PriorityLosing_PriceChange/16/iterations:65536_stddev               1.21 ns         1.25 ns            5
+BM_Replace_PriorityLosing_PriceChange/16/iterations:65536_cv                   0.52 %          0.54 %             5
+BM_Replace_PriorityLosing_PriceChange/256/iterations:65536_mean                 258 ns          257 ns            5
+BM_Replace_PriorityLosing_PriceChange/256/iterations:65536_median               259 ns          258 ns            5
+BM_Replace_PriorityLosing_PriceChange/256/iterations:65536_stddev              2.35 ns         1.86 ns            5
+BM_Replace_PriorityLosing_PriceChange/256/iterations:65536_cv                  0.91 %          0.72 %             5
+BM_Replace_PriorityLosing_PriceChange/4096/iterations:65536_mean                301 ns          300 ns            5
+BM_Replace_PriorityLosing_PriceChange/4096/iterations:65536_median              302 ns          301 ns            5
+BM_Replace_PriorityLosing_PriceChange/4096/iterations:65536_stddev             2.25 ns         2.26 ns            5
+BM_Replace_PriorityLosing_PriceChange/4096/iterations:65536_cv                 0.75 %          0.75 %             5
+BM_Replace_PriorityLosing_PriceChange/65536/iterations:65536_mean               577 ns          575 ns            5
+BM_Replace_PriorityLosing_PriceChange/65536/iterations:65536_median             579 ns          578 ns            5
+BM_Replace_PriorityLosing_PriceChange/65536/iterations:65536_stddev            11.3 ns         11.2 ns            5
+BM_Replace_PriorityLosing_PriceChange/65536/iterations:65536_cv                1.96 %          1.94 %             5
+BM_Fok_Rejected_CrossableLevels/1/iterations:65536_mean                        7.88 ns         7.89 ns            5
+BM_Fok_Rejected_CrossableLevels/1/iterations:65536_median                      7.87 ns         7.89 ns            5
+BM_Fok_Rejected_CrossableLevels/1/iterations:65536_stddev                     0.029 ns        0.027 ns            5
+BM_Fok_Rejected_CrossableLevels/1/iterations:65536_cv                          0.37 %          0.35 %             5
+BM_Fok_Rejected_CrossableLevels/4/iterations:65536_mean                        16.1 ns         16.1 ns            5
+BM_Fok_Rejected_CrossableLevels/4/iterations:65536_median                      15.9 ns         15.9 ns            5
+BM_Fok_Rejected_CrossableLevels/4/iterations:65536_stddev                     0.536 ns        0.509 ns            5
+BM_Fok_Rejected_CrossableLevels/4/iterations:65536_cv                          3.33 %          3.17 %             5
+BM_Fok_Rejected_CrossableLevels/16/iterations:65536_mean                       53.7 ns         53.5 ns            5
+BM_Fok_Rejected_CrossableLevels/16/iterations:65536_median                     54.0 ns         53.5 ns            5
+BM_Fok_Rejected_CrossableLevels/16/iterations:65536_stddev                    0.700 ns        0.629 ns            5
+BM_Fok_Rejected_CrossableLevels/16/iterations:65536_cv                         1.31 %          1.17 %             5
+BM_Fok_Rejected_CrossableLevels/64/iterations:65536_mean                        209 ns          208 ns            5
+BM_Fok_Rejected_CrossableLevels/64/iterations:65536_median                      209 ns          208 ns            5
+BM_Fok_Rejected_CrossableLevels/64/iterations:65536_stddev                     1.18 ns        0.885 ns            5
+BM_Fok_Rejected_CrossableLevels/64/iterations:65536_cv                         0.57 %          0.42 %             5
+BM_Fok_Rejected_CrossableLevels/256/iterations:65536_mean                       904 ns          901 ns            5
+BM_Fok_Rejected_CrossableLevels/256/iterations:65536_median                     904 ns          900 ns            5
+BM_Fok_Rejected_CrossableLevels/256/iterations:65536_stddev                    3.02 ns         2.69 ns            5
+BM_Fok_Rejected_CrossableLevels/256/iterations:65536_cv                        0.33 %          0.30 %             5
+BM_Fok_Rejected_CrossableLevels/1024/iterations:62500_mean                     3869 ns         3836 ns            5
+BM_Fok_Rejected_CrossableLevels/1024/iterations:62500_median                   3793 ns         3786 ns            5
+BM_Fok_Rejected_CrossableLevels/1024/iterations:62500_stddev                    181 ns          125 ns            5
+BM_Fok_Rejected_CrossableLevels/1024/iterations:62500_cv                       4.67 %          3.27 %             5
+BM_Fok_Rejected_BackgroundDepth/0/iterations:65536_mean                        8.04 ns         8.01 ns            5
+BM_Fok_Rejected_BackgroundDepth/0/iterations:65536_median                      8.10 ns         8.00 ns            5
+BM_Fok_Rejected_BackgroundDepth/0/iterations:65536_stddev                     0.118 ns        0.104 ns            5
+BM_Fok_Rejected_BackgroundDepth/0/iterations:65536_cv                          1.46 %          1.30 %             5
+BM_Fok_Rejected_BackgroundDepth/16/iterations:65536_mean                       12.0 ns         12.0 ns            5
+BM_Fok_Rejected_BackgroundDepth/16/iterations:65536_median                     12.0 ns         12.0 ns            5
+BM_Fok_Rejected_BackgroundDepth/16/iterations:65536_stddev                    0.064 ns        0.069 ns            5
+BM_Fok_Rejected_BackgroundDepth/16/iterations:65536_cv                         0.54 %          0.57 %             5
+BM_Fok_Rejected_BackgroundDepth/256/iterations:65536_mean                      10.5 ns         10.4 ns            5
+BM_Fok_Rejected_BackgroundDepth/256/iterations:65536_median                    10.4 ns         10.4 ns            5
+BM_Fok_Rejected_BackgroundDepth/256/iterations:65536_stddev                   0.086 ns        0.097 ns            5
+BM_Fok_Rejected_BackgroundDepth/256/iterations:65536_cv                        0.82 %          0.93 %             5
+BM_Fok_Rejected_BackgroundDepth/4096/iterations:15621_mean                     10.4 ns         10.4 ns            5
+BM_Fok_Rejected_BackgroundDepth/4096/iterations:15621_median                   10.4 ns         10.4 ns            5
+BM_Fok_Rejected_BackgroundDepth/4096/iterations:15621_stddev                  0.058 ns        0.057 ns            5
+BM_Fok_Rejected_BackgroundDepth/4096/iterations:15621_cv                       0.56 %          0.55 %             5
+BM_Fok_Rejected_BackgroundDepth/65536/iterations:976_mean                      14.5 ns         15.0 ns            5
+BM_Fok_Rejected_BackgroundDepth/65536/iterations:976_median                    14.7 ns         14.3 ns            5
+BM_Fok_Rejected_BackgroundDepth/65536/iterations:976_stddev                   0.998 ns         1.37 ns            5
+BM_Fok_Rejected_BackgroundDepth/65536/iterations:976_cv                        6.86 %          9.19 %             5
+BM_Fok_Executed/1/iterations:8000_mean                                          102 ns          102 ns            5 items_per_second=9.83775M/s
+BM_Fok_Executed/1/iterations:8000_median                                        102 ns          102 ns            5 items_per_second=9.8401M/s
+BM_Fok_Executed/1/iterations:8000_stddev                                      0.348 ns        0.298 ns            5 items_per_second=28.8932k/s
+BM_Fok_Executed/1/iterations:8000_cv                                           0.34 %          0.29 %             5 items_per_second=0.29%
+BM_Fok_Executed/4/iterations:4000_mean                                          356 ns          356 ns            5 items_per_second=11.2432M/s
+BM_Fok_Executed/4/iterations:4000_median                                        357 ns          357 ns            5 items_per_second=11.2045M/s
+BM_Fok_Executed/4/iterations:4000_stddev                                       3.50 ns         3.58 ns            5 items_per_second=113.402k/s
+BM_Fok_Executed/4/iterations:4000_cv                                           0.98 %          1.01 %             5 items_per_second=1.01%
+BM_Fok_Executed/16/iterations:2000_mean                                        1416 ns         1416 ns            5 items_per_second=11.3029M/s
+BM_Fok_Executed/16/iterations:2000_median                                      1422 ns         1422 ns            5 items_per_second=11.2518M/s
+BM_Fok_Executed/16/iterations:2000_stddev                                      15.1 ns         15.1 ns            5 items_per_second=122.136k/s
+BM_Fok_Executed/16/iterations:2000_cv                                          1.07 %          1.07 %             5 items_per_second=1.08%
+BM_Fok_Executed/64/iterations:1000_mean                                        5786 ns         5785 ns            5 items_per_second=11.064M/s
+BM_Fok_Executed/64/iterations:1000_median                                      5770 ns         5771 ns            5 items_per_second=11.0899M/s
+BM_Fok_Executed/64/iterations:1000_stddev                                      29.8 ns         26.3 ns            5 items_per_second=50.0779k/s
+BM_Fok_Executed/64/iterations:1000_cv                                          0.51 %          0.45 %             5 items_per_second=0.45%
+BM_Fok_Executed/256/iterations:500_mean                                       23741 ns        23741 ns            5 items_per_second=10.7836M/s
+BM_Fok_Executed/256/iterations:500_median                                     23811 ns        23810 ns            5 items_per_second=10.7518M/s
+BM_Fok_Executed/256/iterations:500_stddev                                       212 ns          211 ns            5 items_per_second=96.0634k/s
+BM_Fok_Executed/256/iterations:500_cv                                          0.89 %          0.89 %             5 items_per_second=0.89%
+BM_Fok_Executed/1024/iterations:256_mean                                      96147 ns        96070 ns            5 items_per_second=10.6595M/s
+BM_Fok_Executed/1024/iterations:256_median                                    96157 ns        96082 ns            5 items_per_second=10.6576M/s
+BM_Fok_Executed/1024/iterations:256_stddev                                      862 ns          823 ns            5 items_per_second=91.3525k/s
+BM_Fok_Executed/1024/iterations:256_cv                                         0.90 %          0.86 %             5 items_per_second=0.86%

@@ -66,7 +66,7 @@ bool holds(const ExchangeEvent& ev) {
 }
 
 TEST(MatchingEngine, NonCrossingOrderRestsOnEmptyBook) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Buy, 100, 10), out.sink());
 
@@ -80,7 +80,7 @@ TEST(MatchingEngine, NonCrossingOrderRestsOnEmptyBook) {
 }
 
 TEST(MatchingEngine, CrossingBuyTradesAgainstRestingSell) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 10), out.sink());
     out.events.clear();
@@ -100,7 +100,7 @@ TEST(MatchingEngine, CrossingBuyTradesAgainstRestingSell) {
 }
 
 TEST(MatchingEngine, CrossingSellTradesAgainstRestingBuy) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Buy, 100, 10), out.sink());
     out.events.clear();
@@ -116,7 +116,7 @@ TEST(MatchingEngine, CrossingSellTradesAgainstRestingBuy) {
 }
 
 TEST(MatchingEngine, IncomingBuyMatchesBestAskFirst) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Sell, 110, 5), out.sink());
     engine.process(new_order(2, 100, 2, Side::Sell, 105, 5), out.sink());
@@ -129,7 +129,7 @@ TEST(MatchingEngine, IncomingBuyMatchesBestAskFirst) {
 }
 
 TEST(MatchingEngine, FifoAtOnePriceGivesEarliestOrderPriority) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 5), out.sink());
     engine.process(new_order(2, 100, 2, Side::Sell, 100, 5), out.sink());
@@ -144,7 +144,7 @@ TEST(MatchingEngine, FifoAtOnePriceGivesEarliestOrderPriority) {
 }
 
 TEST(MatchingEngine, PartialFillOfRestingOrderLeavesItOnBookReduced) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 10), out.sink());
     out.events.clear();
@@ -161,7 +161,7 @@ TEST(MatchingEngine, PartialFillOfRestingOrderLeavesItOnBookReduced) {
 }
 
 TEST(MatchingEngine, PartialFillOfIncomingOrderRestsRemainderAsGtc) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 4), out.sink());
     out.events.clear();
@@ -175,7 +175,7 @@ TEST(MatchingEngine, PartialFillOfIncomingOrderRestsRemainderAsGtc) {
 }
 
 TEST(MatchingEngine, OneIncomingOrderMatchesMultipleRestingOrdersAtSamePrice) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 3), out.sink());
     engine.process(new_order(2, 100, 2, Side::Sell, 100, 4), out.sink());
@@ -194,7 +194,7 @@ TEST(MatchingEngine, OneIncomingOrderMatchesMultipleRestingOrdersAtSamePrice) {
 }
 
 TEST(MatchingEngine, MultiLevelMatchingWalksThroughSeveralPriceLevels) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 5), out.sink());
     engine.process(new_order(2, 100, 2, Side::Sell, 101, 5), out.sink());
@@ -216,7 +216,7 @@ TEST(MatchingEngine, MultiLevelMatchingWalksThroughSeveralPriceLevels) {
 }
 
 TEST(MatchingEngine, IocRemainderIsDiscardedNotRested) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 4), out.sink());
     out.events.clear();
@@ -236,7 +236,7 @@ TEST(MatchingEngine, IocRemainderIsDiscardedNotRested) {
 }
 
 TEST(MatchingEngine, FokSucceedsWhenFullQuantityIsImmediatelyAvailable) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 6), out.sink());
     engine.process(new_order(2, 100, 2, Side::Sell, 101, 6), out.sink());
@@ -252,7 +252,7 @@ TEST(MatchingEngine, FokSucceedsWhenFullQuantityIsImmediatelyAvailable) {
 }
 
 TEST(MatchingEngine, FokRejectionLeavesBookCompletelyUntouched) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink setup;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 5), setup.sink());
 
@@ -272,7 +272,7 @@ TEST(MatchingEngine, FokRejectionLeavesBookCompletelyUntouched) {
 }
 
 TEST(MatchingEngine, DuplicateLiveClientOrderIdIsRejected) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink first;
     engine.process(new_order(1, 100, 1, Side::Buy, 100, 5), first.sink());
 
@@ -285,7 +285,7 @@ TEST(MatchingEngine, DuplicateLiveClientOrderIdIsRejected) {
 }
 
 TEST(MatchingEngine, SameClientOrderIdIsFineAcrossDifferentAccounts) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink a;
     engine.process(new_order(1, 100, 1, Side::Buy, 100, 5), a.sink());
     CollectingSink b;
@@ -296,7 +296,7 @@ TEST(MatchingEngine, SameClientOrderIdIsFineAcrossDifferentAccounts) {
 }
 
 TEST(MatchingEngine, ReusingClientOrderIdAfterCancelIsAllowed) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Buy, 100, 5), out.sink());
     engine.process(cancel_order(2, 100, 1), out.sink());
@@ -307,7 +307,7 @@ TEST(MatchingEngine, ReusingClientOrderIdAfterCancelIsAllowed) {
 }
 
 TEST(MatchingEngine, UnknownCancelIsRejected) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(cancel_order(1, 100, 999), out.sink());
 
@@ -317,7 +317,7 @@ TEST(MatchingEngine, UnknownCancelIsRejected) {
 }
 
 TEST(MatchingEngine, CancelOfLiveOrderRemovesItFromTheBook) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink setup;
     engine.process(new_order(1, 100, 1, Side::Buy, 100, 5), setup.sink());
 
@@ -336,7 +336,7 @@ TEST(MatchingEngine, CancelOfLiveOrderRemovesItFromTheBook) {
 }
 
 TEST(MatchingEngine, EmptyLevelIsCleanedUpAfterFullFill) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink setup;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 5), setup.sink());
     engine.process(new_order(2, 200, 2, Side::Buy, 100, 5), setup.sink());
@@ -350,7 +350,7 @@ TEST(MatchingEngine, EmptyLevelIsCleanedUpAfterFullFill) {
 }
 
 TEST(MatchingEngine, ReplaceQuantityDecreaseAtSamePricePreservesPriority) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink setup;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 10), setup.sink());
     engine.process(new_order(2, 100, 2, Side::Sell, 100, 5), setup.sink());
@@ -376,7 +376,7 @@ TEST(MatchingEngine, ReplaceQuantityDecreaseAtSamePricePreservesPriority) {
 }
 
 TEST(MatchingEngine, ReplacePriceChangeLosesPriorityAndCanCrossImmediately) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink setup;
     engine.process(new_order(1, 100, 1, Side::Buy, 100, 10), setup.sink());   // resting buy to replace
     engine.process(new_order(2, 200, 2, Side::Sell, 104, 10), setup.sink()); // resting ask, would not have crossed at 100
@@ -396,7 +396,7 @@ TEST(MatchingEngine, ReplacePriceChangeLosesPriorityAndCanCrossImmediately) {
 }
 
 TEST(MatchingEngine, ReplaceQuantityIncreaseAlsoLosesPriority) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink setup;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 5), setup.sink());
     engine.process(new_order(2, 100, 2, Side::Sell, 100, 5), setup.sink());
@@ -415,7 +415,7 @@ TEST(MatchingEngine, ReplaceQuantityIncreaseAlsoLosesPriority) {
 }
 
 TEST(MatchingEngine, ReplaceOfUnknownOrderIsRejected) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(replace_order(1, 100, 999, 1000, 100, 5), out.sink());
 
@@ -425,7 +425,7 @@ TEST(MatchingEngine, ReplaceOfUnknownOrderIsRejected) {
 }
 
 TEST(MatchingEngine, ReplaceWithInvalidPriceOrQuantityIsRejected) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink setup;
     engine.process(new_order(1, 100, 1, Side::Buy, 100, 5), setup.sink());
 
@@ -447,7 +447,7 @@ TEST(MatchingEngine, ReplaceWithInvalidPriceOrQuantityIsRejected) {
 }
 
 TEST(MatchingEngine, SameAccountOrdersCrossNormally) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink setup;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 5), setup.sink());
 
@@ -461,7 +461,7 @@ TEST(MatchingEngine, SameAccountOrdersCrossNormally) {
 }
 
 TEST(MatchingEngine, EventSequenceNumbersAreStrictlyIncreasingAcrossCommands) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink out;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 5), out.sink());
     engine.process(new_order(2, 200, 2, Side::Buy, 100, 5), out.sink());
@@ -476,7 +476,7 @@ TEST(MatchingEngine, EventSequenceNumbersAreStrictlyIncreasingAcrossCommands) {
 }
 
 TEST(MatchingEngine, DeterministicEventOrderForMultiFillScenario) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     CollectingSink setup;
     engine.process(new_order(1, 100, 1, Side::Sell, 100, 3), setup.sink());
     engine.process(new_order(2, 100, 2, Side::Sell, 101, 3), setup.sink());
@@ -497,8 +497,8 @@ TEST(MatchingEngine, DeterministicEventOrderForMultiFillScenario) {
 }
 
 TEST(MatchingEngine, DeterministicFinalBookStateAfterMixedSequence) {
-    MatchingEngine engine1;
-    MatchingEngine engine2;
+    MatchingEngine engine1{kInstrument};
+    MatchingEngine engine2{kInstrument};
     CollectingSink out1;
     CollectingSink out2;
 
@@ -532,6 +532,152 @@ TEST(MatchingEngine, DeterministicFinalBookStateAfterMixedSequence) {
     // replace) is the only thing left to trade against.
     ASSERT_TRUE(holds<TradeExecuted>(verify1.events[1]));
     EXPECT_EQ(verify1.at<TradeExecuted>(1).quantity, 1u);
+}
+
+// ── The instrument registry ────────────────────────────────────────────────
+
+TEST(MatchingEngine, OrderOnAnUnregisteredInstrumentIsRejected) {
+    MatchingEngine engine{kInstrument};
+    CollectingSink out;
+
+    auto order = new_order(1, 100, 1, Side::Buy, 100, 5);
+    order.instrument_id = kInstrument + 1;
+    engine.process(order, out.sink());
+
+    ASSERT_EQ(out.events.size(), 1u);
+    ASSERT_TRUE(holds<OrderRejected>(out.events[0]));
+    EXPECT_EQ(out.at<OrderRejected>(0).reason, RejectReason::InvalidInstrument);
+    EXPECT_TRUE(engine.snapshot().instruments.empty());
+}
+
+TEST(MatchingEngine, UnknownInstrumentIsReportedAheadOfAnyOtherProblemWithTheOrder) {
+    // Both the instrument and the price are invalid. The instrument is the
+    // more useful answer: the order was sent to the wrong venue, and fixing
+    // the price would not help.
+    MatchingEngine engine{kInstrument};
+    CollectingSink out;
+
+    auto order = new_order(1, 100, 1, Side::Buy, /*price=*/0, 5);
+    order.instrument_id = 999;
+    engine.process(order, out.sink());
+
+    ASSERT_EQ(out.events.size(), 1u);
+    EXPECT_EQ(out.at<OrderRejected>(0).reason, RejectReason::InvalidInstrument);
+}
+
+TEST(MatchingEngine, CancelOnAnUnregisteredInstrumentReportsTheInstrumentNotTheOrderId) {
+    MatchingEngine engine{kInstrument};
+    CollectingSink out;
+
+    auto cancel = cancel_order(1, 100, 1);
+    cancel.instrument_id = 999;
+    engine.process(cancel, out.sink());
+
+    ASSERT_EQ(out.events.size(), 1u);
+    EXPECT_EQ(out.at<OrderRejected>(0).reason, RejectReason::InvalidInstrument);
+}
+
+TEST(MatchingEngine, ReplaceOnAnUnregisteredInstrumentIsRejected) {
+    MatchingEngine engine{kInstrument};
+    CollectingSink out;
+
+    auto replace = replace_order(1, 100, 1, 2, 100, 5);
+    replace.instrument_id = 999;
+    engine.process(replace, out.sink());
+
+    ASSERT_EQ(out.events.size(), 1u);
+    const auto& rejected = out.at<OrderRejected>(0);
+    EXPECT_EQ(rejected.reason, RejectReason::InvalidInstrument);
+    // Reported under the original id, like every other replace rejection.
+    EXPECT_EQ(rejected.client_order_id, 1u);
+}
+
+TEST(MatchingEngine, SnapshotOrdersInstrumentsByIdWhateverOrderTheyWereRegisteredIn) {
+    MatchingEngine engine{5, 1, 3};
+    CollectingSink out;
+
+    CommandSequence sequence = 1;
+    for (const InstrumentId instrument_id : {InstrumentId{3}, InstrumentId{5}, InstrumentId{1}}) {
+        auto order = new_order(sequence, 100, /*client_order_id=*/sequence, Side::Buy, 100, 5);
+        order.instrument_id = instrument_id;
+        engine.process(order, out.sink());
+        ++sequence;
+    }
+
+    const auto snapshot = engine.snapshot();
+    ASSERT_EQ(snapshot.instruments.size(), 3u);
+    EXPECT_EQ(snapshot.instruments[0].instrument_id, 1u);
+    EXPECT_EQ(snapshot.instruments[1].instrument_id, 3u);
+    EXPECT_EQ(snapshot.instruments[2].instrument_id, 5u);
+}
+
+TEST(MatchingEngine, RegisteringAnInstrumentIsIdempotentAndBoundedById) {
+    MatchingEngine engine{kInstrument};
+
+    EXPECT_FALSE(engine.register_instrument(kInstrument)) << "already registered";
+    EXPECT_TRUE(engine.register_instrument(2));
+    EXPECT_EQ(engine.instrument_count(), 2u);
+
+    // The cap is what stops a single careless id from sizing the
+    // direct-mapped table to whatever number was in the command.
+    EXPECT_FALSE(engine.register_instrument(MatchingEngine::kMaxInstrumentId + 1));
+    EXPECT_FALSE(engine.knows_instrument(MatchingEngine::kMaxInstrumentId + 1));
+    EXPECT_EQ(engine.instrument_count(), 2u);
+}
+
+// Registering after construction grows the vector of books, which moves
+// every book already in it. Handles into those books are held by the
+// engine's own order directory and must survive the move -- they do because
+// each book's pool sits behind a unique_ptr, so its address does not change,
+// and moving a pmr container with an equal allocator relinks nodes rather
+// than copying them. This test is what keeps that argument honest.
+TEST(MatchingEngine, RegisteringAnInstrumentKeepsRestingOrdersReachable) {
+    MatchingEngine engine{kInstrument};
+    CollectingSink setup;
+    engine.process(new_order(1, 100, 1, Side::Buy, 100, 5), setup.sink());
+    engine.process(new_order(2, 100, 2, Side::Sell, 200, 7), setup.sink());
+
+    // Well past the one slot reserved at construction, so the books really
+    // do get reallocated (repeatedly) underneath the resting orders.
+    for (InstrumentId instrument_id = 2; instrument_id <= 64; ++instrument_id) {
+        ASSERT_TRUE(engine.register_instrument(instrument_id));
+    }
+
+    CollectingSink out;
+    engine.process(cancel_order(3, 100, 1), out.sink());
+    ASSERT_EQ(out.events.size(), 2u);
+    ASSERT_TRUE(holds<OrderCancelled>(out.events[0]));
+    EXPECT_EQ(out.at<BookOrderRemoved>(1).price, 100);
+
+    // The order that stayed is still matchable, and still has its original
+    // quantity -- the move preserved contents, not just addressability.
+    CollectingSink fill;
+    engine.process(new_order(4, 200, 3, Side::Buy, 200, 7), fill.sink());
+    ASSERT_EQ(fill.events.size(), 3u);
+    EXPECT_TRUE(holds<TradeExecuted>(fill.events[1]));
+    EXPECT_EQ(fill.at<TradeExecuted>(1).quantity, 7u);
+    EXPECT_TRUE(engine.snapshot().instruments.empty());
+}
+
+TEST(MatchingEngine, AnInstrumentRegisteredAfterTheFactAcceptsOrders) {
+    MatchingEngine engine{kInstrument};
+    CollectingSink rejected;
+
+    auto order = new_order(1, 100, 1, Side::Buy, 100, 5);
+    order.instrument_id = 7;
+    engine.process(order, rejected.sink());
+    ASSERT_EQ(rejected.events.size(), 1u);
+    EXPECT_EQ(rejected.at<OrderRejected>(0).reason, RejectReason::InvalidInstrument);
+
+    ASSERT_TRUE(engine.register_instrument(7));
+
+    CollectingSink accepted;
+    auto retry = new_order(2, 100, 2, Side::Buy, 100, 5);
+    retry.instrument_id = 7;
+    engine.process(retry, accepted.sink());
+    ASSERT_EQ(accepted.events.size(), 2u);
+    EXPECT_TRUE(holds<OrderAccepted>(accepted.events[0]));
+    EXPECT_TRUE(holds<BookOrderAdded>(accepted.events[1]));
 }
 
 } // namespace

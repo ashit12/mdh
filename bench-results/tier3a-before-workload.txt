@@ -1,0 +1,109 @@
+mdh matching-engine baseline: latency distribution, throughput, scaling
+workload seed: 0xC0FFEE12345678
+
+=== Environment ===============================================================
+Compiler:                   clang 21.0.0
+C++ standard:               202002
+NDEBUG:                     defined (optimised build)
+sizeof(ExchangeRestingOrder): 72 bytes
+sizeof(ExchangeCommand):      64 bytes
+sizeof(ExchangeEvent):        120 bytes
+
+=== Timer =====================================================================
+Timer source:               AArch64 CNTVCT_EL0 (isb-serialised)
+  declared rate:            1000000000 Hz (1 tick = 1.000 ns nominal)
+  measured rate:            999999790 Hz
+  effective resolution:     42.00 ns  <- single samples quantise to multiples of this
+  smallest advance seen:    17.00 ns
+  cost of one read:         11.47 ns  (a sampled interval pays this twice)
+  zero-work interval p50:   0.00 ns  <- what a 0 ns operation measures as
+  zero-work interval p99:   42.00 ns
+
+Every per-operation percentile below is quantised to the effective resolution and
+includes the cost of the two reads that delimit it. Batch ns/op figures divide both
+of those across the whole run and are the ones to trust for means and throughput.
+
+=== Mixed workload: latency distribution and throughput =======================
+Mix: 40% resting / 25% crossing / 20% cancel / 10% replace / 5% IOC-FOK,
+one instrument, 1000 resting orders per side before the measured stream begins.
+
+       ops     p50 ns     p90 ns     p99 ns   p99.9 ns     max ns  smpl mean |  batch ns/op        ops/sec
+------------------------------------------------------------------------------------------------------------------------
+     10000        125        208        292        541      33977        127 |        115.5        8657055
+    100000        125        208        292        583     166171        132 |        119.8        8345289
+   1000000        125        292        542        834    2283153        166 |        144.2        6933261
+
+Same 1000000 samples, split by what the operation was. This is what the aggregate
+tail above is actually made of.
+
+operation                       count     p50 ns     p90 ns     p99 ns   p99.9 ns     max ns
+--------------------------------------------------------------------------------------------
+resting                        399927        125        167        333        459    2283153
+crossing                       249970        125        250        375        583      19809
+cancel                         200288        167        375        625        834      23810
+replace (priority kept)         50280        166        375        625        875       4875
+replace (priority lost)         49609        292        541        792       1125      57077
+IOC                             24963         84        167        333        518       6934
+FOK                             24963         83        375        792       1334       4875
+
+Composition of the 1000000-operation stream (as actually emitted):
+  resting                         399927
+  crossing                        249970
+  cancel                          200288
+  replace, priority preserved      50280
+  replace, priority lost           49609
+  IOC                              24963
+  FOK                              24963
+  downgraded to resting                0  (wanted liquidity or a live order, found none)
+  resting orders after seed         2000
+  resting orders at end            79826
+  price levels at end                 75 bid / 70 ask
+
+=== Sustained throughput ======================================================
+stream                                                ns/op        ops/sec
+--------------------------------------------------------------------------
+resting (GTC, existing level, 1024 levels)            150.3        6654576
+crossing (IOC, one fill each, one level)               38.2       26147642
+mixed (realistic 40/25/20/10/5)                       151.1        6618757
+
+=== Scaling: resting orders vs. price levels ==================================
+Both columns time the same operation -- a GTC order onto an already-existing price
+level -- against books built two different ways, so the difference isolates which
+dimension the cost actually follows.
+
+resting orders |  1024 levels      (ns/op) | 1 order/level      (ns/op)
+------------------------------------------------------------------------
+          1024 |                      86.0 |                      88.0
+         10240 |                      88.2 |                      99.0
+        102400 |                      92.9 |                     182.5
+       1024000 |                    1370.1 |                    1346.7
+
+=== Scaling: cancel vs. price-level count =====================================
+  price levels   orders/level |        ns/op
+----------------------------------------------
+             1         100001 |         30.4
+            64           1563 |        130.1
+          4096             25 |        218.4
+        262144              2 |        163.8
+
+=== Scaling: depth swept by one aggressive order ==============================
+    levels     sweeps |        ns/op   ns per level
+----------------------------------------------------
+         1     262144 |         57.6          57.60
+         4      65536 |        222.1          55.52
+        16      16384 |        736.5          46.03
+        64       4096 |       2882.9          45.05
+       256       1024 |      11530.0          45.04
+      1024        256 |      46863.7          45.77
+
+=== Scaling: instrument count =================================================
+Total resting depth is held at ~4096 orders per side across all instruments, so
+what varies is how that depth is partitioned, not how much of it there is.
+
+ instruments    orders/side/instr |        ns/op        ops/sec       p99 ns
+------------------------------------------------------------------------------
+           1                 4096 |        123.5        8094505          334
+           4                 1024 |        136.3        7334741          375
+          16                  256 |        152.1        6574502          417
+          64                   64 |        164.0        6095860          458
+

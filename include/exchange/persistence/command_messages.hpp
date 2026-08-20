@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "common/types.hpp"
 #include "exchange/core/types.hpp"
 
 // Wire format for journaling ExchangeCommand (Milestone 3). This is a
@@ -33,6 +34,17 @@ enum class CommandMessageType : std::uint8_t {
     NewOrder = 1,
     CancelOrder = 2,
     ReplaceOrder = 3,
+    // Not a command: names an instrument the engine that wrote this journal
+    // traded. A MatchingEngine rejects commands on instruments it was not
+    // told about, so a journal that only listed commands would no longer be
+    // enough to reproduce the run that wrote it -- a replay would need the
+    // universe handed to it out of band, and would silently diverge if it
+    // were given the wrong one. Written before any command, and carried in
+    // the file rather than in a file header so the format stays what it has
+    // always been: a bare concatenation of frames, which readers that
+    // predate this type reject cleanly as InvalidMessageType instead of
+    // misparsing.
+    RegisterInstrument = 4,
 };
 
 struct CommandHeader {
@@ -58,8 +70,23 @@ struct CommandHeader {
         // + instrument_id(4) + new_price(8) + new_quantity(8)
         case CommandMessageType::ReplaceOrder:
             return 8 + 8 + 8 + 4 + 8 + 8; // 44
+        // instrument_id(4)
+        case CommandMessageType::RegisterInstrument:
+            return 4;
     }
     return 0;
 }
+
+// The decoded form of a RegisterInstrument frame. Deliberately not an
+// alternative of ExchangeCommand: it is not something a client can send, it
+// mutates no book, and it produces no event -- keeping it out of that
+// variant is what stops every switch over a command from having to pretend
+// this is one. Its frame's command_sequence is 0, since it consumes no
+// sequence number.
+struct RegisterInstrumentRecord {
+    InstrumentId instrument_id;
+
+    bool operator==(const RegisterInstrumentRecord&) const = default;
+};
 
 } // namespace mdh::exchange::persistence

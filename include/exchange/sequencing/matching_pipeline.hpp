@@ -6,6 +6,7 @@
 #include <functional>
 #include <stop_token>
 #include <thread>
+#include <vector>
 
 #include "common/spsc_queue.hpp"
 #include "exchange/core/commands.hpp"
@@ -59,6 +60,13 @@ namespace mdh::exchange::sequencing {
 
 struct MatchingPipelineOptions {
     std::size_t queue_capacity = 1024;
+
+    // Every instrument the MatchingEngine this pipeline owns will trade.
+    // Commands naming anything else are rejected -- see MatchingEngine's
+    // constructor. Empty means an engine that rejects everything, which is
+    // the right default for a type whose whole job is transport: a caller
+    // that does not say what it trades has not finished configuring it.
+    std::vector<InstrumentId> instruments;
 
     // Passed straight to the MatchingEngine this pipeline owns -- see
     // MatchingEngine::kDefaultExpectedRestingOrders for what it buys and

@@ -1,0 +1,72 @@
+Unable to determine clock rate from sysctl: hw.cpufrequency: No such file or directory
+This does not affect benchmark measurements, only the metadata output.
+***WARNING*** Failed to set thread affinity. Estimated CPU frequency may be incorrect.
+2026-08-18T23:29:29+05:30
+Running ./mdh/build/bench_matching_engine
+Run on (12 X 24 MHz CPU s)
+CPU Caches:
+  L1 Data 64 KiB
+  L1 Instruction 128 KiB
+  L2 Unified 4096 KiB (x12)
+Load Average: 3.93, 4.20, 4.33
+------------------------------------------------------------------------------------------------------------
+Benchmark                                                                  Time             CPU   Iterations
+------------------------------------------------------------------------------------------------------------
+BM_Rest_ExistingPriceLevel/1/iterations:65536                           91.8 ns         91.8 ns        65536
+BM_Rest_ExistingPriceLevel/16/iterations:65536                          89.9 ns         89.9 ns        65536
+BM_Rest_ExistingPriceLevel/256/iterations:65536                          101 ns          101 ns        65536
+BM_Rest_ExistingPriceLevel/4096/iterations:65536                         110 ns          110 ns        65536
+BM_Rest_ExistingPriceLevel/65536/iterations:65536                        158 ns          158 ns        65536
+BM_Rest_NewPriceLevel/1/iterations:65536                                 209 ns          209 ns        65536
+BM_Rest_NewPriceLevel/16/iterations:65536                                209 ns          209 ns        65536
+BM_Rest_NewPriceLevel/256/iterations:65536                               210 ns          210 ns        65536
+BM_Rest_NewPriceLevel/4096/iterations:65536                              206 ns          206 ns        65536
+BM_Rest_NewPriceLevel/65536/iterations:65536                             170 ns          170 ns        65536
+BM_Match_SingleLevel/1/iterations:65536                                 97.5 ns         97.5 ns        65536 items_per_second=10.2608M/s
+BM_Match_SingleLevel/4/iterations:65536                                  287 ns          286 ns        65536 items_per_second=13.9624M/s
+BM_Match_SingleLevel/16/iterations:16384                                 951 ns          951 ns        16384 items_per_second=16.8268M/s
+BM_Match_SingleLevel/64/iterations:4096                                 3694 ns         3694 ns         4096 items_per_second=17.325M/s
+BM_Match_SingleLevel/256/iterations:1024                               14491 ns        14491 ns         1024 items_per_second=17.6659M/s
+BM_Sweep_Levels/1/iterations:65536                                      99.0 ns         98.8 ns        65536 items_per_second=10.1261M/s
+BM_Sweep_Levels/4/iterations:65536                                       347 ns          347 ns        65536 items_per_second=11.5284M/s
+BM_Sweep_Levels/16/iterations:16384                                     1325 ns         1326 ns        16384 items_per_second=12.0709M/s
+BM_Sweep_Levels/64/iterations:4096                                      5512 ns         5507 ns         4096 items_per_second=11.6209M/s
+BM_Sweep_Levels/256/iterations:1024                                    21608 ns        21600 ns         1024 items_per_second=11.8521M/s
+BM_Sweep_Levels/1024/iterations:256                                    86064 ns        85949 ns          256 items_per_second=11.914M/s
+BM_Cancel/1/iterations:65536                                            60.2 ns         59.7 ns        65536
+BM_Cancel/16/iterations:65536                                           93.0 ns         92.5 ns        65536
+BM_Cancel/256/iterations:65536                                           116 ns          116 ns        65536
+BM_Cancel/4096/iterations:65536                                          148 ns          148 ns        65536
+BM_Cancel/65536/iterations:65536                                         137 ns          137 ns        65536
+BM_Replace_PriorityPreserving/1/iterations:65536                        53.8 ns         53.8 ns        65536
+BM_Replace_PriorityPreserving/16/iterations:65536                       50.9 ns         50.9 ns        65536
+BM_Replace_PriorityPreserving/256/iterations:65536                      55.4 ns         55.4 ns        65536
+BM_Replace_PriorityPreserving/4096/iterations:65536                     52.8 ns         52.8 ns        65536
+BM_Replace_PriorityPreserving/65536/iterations:65536                    51.0 ns         51.0 ns        65536
+BM_Replace_PriorityLosing_QuantityIncrease/1/iterations:65536            159 ns          159 ns        65536
+BM_Replace_PriorityLosing_QuantityIncrease/16/iterations:65536           224 ns          224 ns        65536
+BM_Replace_PriorityLosing_QuantityIncrease/256/iterations:65536          259 ns          258 ns        65536
+BM_Replace_PriorityLosing_QuantityIncrease/4096/iterations:65536         297 ns          297 ns        65536
+BM_Replace_PriorityLosing_QuantityIncrease/65536/iterations:65536        547 ns          547 ns        65536
+BM_Replace_PriorityLosing_PriceChange/1/iterations:65536                 173 ns          173 ns        65536
+BM_Replace_PriorityLosing_PriceChange/16/iterations:65536                229 ns          229 ns        65536
+BM_Replace_PriorityLosing_PriceChange/256/iterations:65536               257 ns          257 ns        65536
+BM_Replace_PriorityLosing_PriceChange/4096/iterations:65536              300 ns          300 ns        65536
+BM_Replace_PriorityLosing_PriceChange/65536/iterations:65536             571 ns          571 ns        65536
+BM_Fok_Rejected_CrossableLevels/1/iterations:65536                      8.05 ns         8.06 ns        65536
+BM_Fok_Rejected_CrossableLevels/4/iterations:65536                      15.9 ns         15.9 ns        65536
+BM_Fok_Rejected_CrossableLevels/16/iterations:65536                     53.1 ns         53.1 ns        65536
+BM_Fok_Rejected_CrossableLevels/64/iterations:65536                      207 ns          207 ns        65536
+BM_Fok_Rejected_CrossableLevels/256/iterations:65536                     895 ns          895 ns        65536
+BM_Fok_Rejected_CrossableLevels/1024/iterations:62500                   4479 ns         4477 ns        62500
+BM_Fok_Rejected_BackgroundDepth/0/iterations:65536                      7.87 ns         7.86 ns        65536
+BM_Fok_Rejected_BackgroundDepth/16/iterations:65536                     12.1 ns         12.1 ns        65536
+BM_Fok_Rejected_BackgroundDepth/256/iterations:65536                    10.8 ns         10.8 ns        65536
+BM_Fok_Rejected_BackgroundDepth/4096/iterations:15621                   10.4 ns         10.4 ns        15621
+BM_Fok_Rejected_BackgroundDepth/65536/iterations:976                    13.8 ns         14.3 ns          976
+BM_Fok_Executed/1/iterations:8000                                        103 ns          102 ns         8000 items_per_second=9.7561M/s
+BM_Fok_Executed/4/iterations:4000                                        367 ns          367 ns         4000 items_per_second=10.9066M/s
+BM_Fok_Executed/16/iterations:2000                                      1429 ns         1429 ns         2000 items_per_second=11.1927M/s
+BM_Fok_Executed/64/iterations:1000                                      5746 ns         5746 ns         1000 items_per_second=11.1382M/s
+BM_Fok_Executed/256/iterations:500                                     23032 ns        23030 ns          500 items_per_second=11.1159M/s
+BM_Fok_Executed/1024/iterations:256                                    92549 ns        92547 ns          256 items_per_second=11.0647M/s

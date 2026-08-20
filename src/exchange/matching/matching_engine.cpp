@@ -17,21 +17,75 @@ namespace {
 constexpr std::size_t kLargestPooledBlock = 1024;
 constexpr std::size_t kMaxBlocksPerChunk = 4096;
 
-constexpr std::size_t kInitialInstrumentBuckets = 16;
-
 } // namespace
 
-MatchingEngine::MatchingEngine(std::size_t expected_resting_orders)
+MatchingEngine::MatchingEngine(std::span<const InstrumentId> universe, std::size_t expected_resting_orders)
     : pool_(std::make_unique<std::pmr::unsynchronized_pool_resource>(
           std::pmr::pool_options{.max_blocks_per_chunk = kMaxBlocksPerChunk,
                                  .largest_required_pool_block = kLargestPooledBlock})),
       orders_(pool_.get()) {
-    books_.reserve(kInitialInstrumentBuckets);
+    // Size the id table once from the widest id rather than letting
+    // register_instrument() grow it per instrument, and reserve the books so
+    // registration does not move them repeatedly. Both are just avoided
+    // work; nothing below depends on them having happened.
+    InstrumentId widest = 0;
+    for (const InstrumentId instrument_id : universe) {
+        if (instrument_id <= kMaxInstrumentId) {
+            widest = std::max(widest, instrument_id);
+        }
+    }
+    if (!universe.empty()) {
+        slot_of_id_.assign(static_cast<std::size_t>(widest) + 1, kNoSlot);
+        // expected_resting_orders counts every instrument's orders, so each
+        // book gets an equal share of it. Split evenly rather than cleverly:
+        // the engine has no way to know which instruments will be busy, and
+        // being wrong per book costs only the relocations a wrong figure was
+        // always going to cost. An engine constructed with no universe at
+        // all -- replay, which learns its instruments from the journal --
+        // reserves nothing, since the share would be a division by the
+        // number of instruments it does not yet have.
+        expected_orders_per_book_ = expected_resting_orders / universe.size();
+        // Sized from the whole universe before the first book is built, so
+        // that every book in it gets the same band -- registering them one
+        // at a time and re-deriving as the count grew would give the first
+        // instruments a wider ladder than the last for no reason.
+        band_ticks_ = MatchingBook::band_for(universe.size(), kLadderByteBudget);
+    }
+    books_.reserve(universe.size());
+    by_id_.reserve(universe.size());
+    for (const InstrumentId instrument_id : universe) {
+        register_instrument(instrument_id);
+    }
+
     orders_.reserve(expected_resting_orders);
 }
 
-MatchingBook& MatchingEngine::book_for(InstrumentId instrument_id) {
-    return books_[instrument_id];
+MatchingEngine::MatchingEngine(std::initializer_list<InstrumentId> universe, std::size_t expected_resting_orders)
+    : MatchingEngine(std::span<const InstrumentId>(universe.begin(), universe.size()), expected_resting_orders) {}
+
+bool MatchingEngine::register_instrument(InstrumentId instrument_id) {
+    if (instrument_id > kMaxInstrumentId || knows_instrument(instrument_id)) {
+        return false;
+    }
+    if (instrument_id >= slot_of_id_.size()) {
+        slot_of_id_.resize(static_cast<std::size_t>(instrument_id) + 1, kNoSlot);
+    }
+
+    const auto slot = static_cast<std::uint32_t>(books_.size());
+    // Never widens: a universe that keeps growing past what it was sized for
+    // narrows the band for the books still to come, which is the only part
+    // of the budget still unspent.
+    band_ticks_ = std::min(band_ticks_, MatchingBook::band_for(books_.size() + 1, kLadderByteBudget));
+    books_.emplace_back(expected_orders_per_book_, band_ticks_);
+    slot_of_id_[instrument_id] = slot;
+
+    // Kept sorted on insert so snapshot() can walk it directly. Registration
+    // happens at startup (or once per instrument during replay), never on
+    // the order path, so the shift this costs is not worth avoiding.
+    const auto at = std::lower_bound(by_id_.begin(), by_id_.end(), instrument_id,
+                                     [](const auto& entry, InstrumentId id) { return entry.first < id; });
+    by_id_.insert(at, {instrument_id, slot});
+    return true;
 }
 
 ExchangeRestingOrder MatchingEngine::compose(const BookOrder& order, InstrumentId instrument_id) const {
@@ -52,18 +106,19 @@ ExchangeRestingOrder MatchingEngine::compose(const BookOrder& order, InstrumentI
     };
 }
 
-EngineStateSnapshot MatchingEngine::snapshot() const {
-    std::vector<InstrumentId> instrument_ids;
-    instrument_ids.reserve(books_.size());
-    for (const auto& [instrument_id, book] : books_) {
-        instrument_ids.push_back(instrument_id);
+std::size_t MatchingEngine::out_of_band_levels() const {
+    std::size_t total = 0;
+    for (const MatchingBook& book : books_) {
+        total += book.out_of_band_levels();
     }
-    std::sort(instrument_ids.begin(), instrument_ids.end());
+    return total;
+}
 
+EngineStateSnapshot MatchingEngine::snapshot() const {
     EngineStateSnapshot snap;
-    snap.instruments.reserve(instrument_ids.size());
-    for (const auto instrument_id : instrument_ids) {
-        const MatchingBook& book = books_.at(instrument_id);
+    snap.instruments.reserve(by_id_.size());
+    for (const auto& [instrument_id, slot] : by_id_) {
+        const MatchingBook& book = books_[slot];
         const auto compose_all = [&](const std::vector<BookOrder>& orders) {
             std::vector<ExchangeRestingOrder> composed;
             composed.reserve(orders.size());
@@ -75,12 +130,13 @@ EngineStateSnapshot MatchingEngine::snapshot() const {
         auto bids = compose_all(book.all_bids());
         auto asks = compose_all(book.all_asks());
         if (bids.empty() && asks.empty()) {
-            // books_ never erases an instrument entry once touched, even
-            // after every resting order on it is gone (Cancel/full-fill
-            // don't remove the MatchingBook itself, only its contents) --
-            // an instrument with nothing resting on either side carries no
-            // meaningful state, so it's omitted rather than reported as an
-            // empty pair of vectors.
+            // Every registered instrument has a book from the moment the
+            // engine is constructed, whether or not anything ever traded on
+            // it, and a book keeps its entry after its last order leaves.
+            // Either way an instrument with nothing resting carries no
+            // meaningful state, so it is omitted rather than reported as an
+            // empty pair of vectors -- which is also what keeps the snapshot
+            // comparable between two engines configured differently.
             continue;
         }
         snap.instruments.push_back(InstrumentBookSnapshot{
@@ -132,12 +188,8 @@ void MatchingEngine::reject_replace_order(const ReplaceOrderCommand& command, Re
 
 Quantity MatchingEngine::crossable_quantity(InstrumentId instrument_id, Side incoming_side, Price price,
                                              Quantity quantity) const {
-    auto it = books_.find(instrument_id);
-    if (it == books_.end()) {
-        return 0;
-    }
     const Side contra_side = incoming_side == Side::Buy ? Side::Sell : Side::Buy;
-    return it->second.crossable_quantity(contra_side, price, quantity);
+    return book_for(instrument_id).crossable_quantity(contra_side, price, quantity);
 }
 
 void MatchingEngine::match_and_rest(ExchangeRestingOrder& incoming, CommandSequence command_sequence,
@@ -238,9 +290,9 @@ void MatchingEngine::rest_remainder_if_applicable(const ExchangeRestingOrder& or
     });
     orders_.insert_or_assign(LiveKey{order.account_id, order.client_order_id},
                              OrderRef{
-                                 .handle = handle,
                                  .original_quantity = order.original_quantity,
                                  .order_sequence = order.order_sequence,
+                                 .handle = handle,
                                  .instrument_id = order.instrument_id,
                              });
     sink(BookOrderAdded{
@@ -254,6 +306,21 @@ void MatchingEngine::rest_remainder_if_applicable(const ExchangeRestingOrder& or
 }
 
 void MatchingEngine::process_new_order(const NewOrderCommand& cmd, const EventSink& sink) {
+    // Checked before anything else, price and quantity included: an
+    // instrument this engine does not trade is not a malformed order, it is
+    // an order sent to the wrong venue, and saying so is more useful than
+    // reporting whichever other field happens to also be wrong.
+    if (!knows_instrument(cmd.instrument_id)) {
+        sink(OrderRejected{
+            .event_sequence = next_event_sequence_++,
+            .command_sequence = cmd.command_sequence,
+            .account_id = cmd.account_id,
+            .client_order_id = cmd.client_order_id,
+            .instrument_id = cmd.instrument_id,
+            .reason = RejectReason::InvalidInstrument,
+        });
+        return;
+    }
     if (cmd.price <= 0) {
         sink(OrderRejected{
             .event_sequence = next_event_sequence_++,
@@ -340,6 +407,21 @@ void MatchingEngine::process_new_order(const NewOrderCommand& cmd, const EventSi
 }
 
 void MatchingEngine::process_cancel(const CancelOrderCommand& cmd, const EventSink& sink) {
+    // Ahead of the order-id lookup, so a cancel naming an instrument this
+    // engine does not trade reports that rather than UnknownOrderId -- which
+    // would be true but would send the client looking in the wrong place.
+    if (!knows_instrument(cmd.instrument_id)) {
+        sink(OrderRejected{
+            .event_sequence = next_event_sequence_++,
+            .command_sequence = cmd.command_sequence,
+            .account_id = cmd.account_id,
+            .client_order_id = cmd.client_order_id,
+            .instrument_id = cmd.instrument_id,
+            .reason = RejectReason::InvalidInstrument,
+        });
+        return;
+    }
+
     const LiveKey key{cmd.account_id, cmd.client_order_id};
     auto it = orders_.find(key);
     if (it == orders_.end() || it->second.instrument_id != cmd.instrument_id) {
@@ -376,6 +458,17 @@ void MatchingEngine::process_cancel(const CancelOrderCommand& cmd, const EventSi
 }
 
 void MatchingEngine::process_replace(const ReplaceOrderCommand& cmd, const EventSink& sink) {
+    if (!knows_instrument(cmd.instrument_id)) {
+        sink(OrderRejected{
+            .event_sequence = next_event_sequence_++,
+            .command_sequence = cmd.command_sequence,
+            .account_id = cmd.account_id,
+            .client_order_id = cmd.original_client_order_id,
+            .instrument_id = cmd.instrument_id,
+            .reason = RejectReason::InvalidInstrument,
+        });
+        return;
+    }
     if (cmd.new_price <= 0 || cmd.new_quantity == 0) {
         sink(OrderRejected{
             .event_sequence = next_event_sequence_++,

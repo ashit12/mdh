@@ -32,6 +32,15 @@ CommandReplayOutcome run_command_replay(const std::string& journal_path, const C
             }
             continue; // skip this frame, keep reading
         }
+        if (const auto* registration = std::get_if<RegisterInstrumentRecord>(&*frame)) {
+            // Ordering is the journal's, not ours: these frames are written
+            // before any command, so by the time a command arrives its
+            // instrument is already registered.
+            if (outcome.engine.register_instrument(registration->instrument_id)) {
+                ++outcome.instruments_registered;
+            }
+            continue;
+        }
 
         outcome.engine.process(std::get<ExchangeCommand>(*frame), sink);
         ++outcome.commands_processed;

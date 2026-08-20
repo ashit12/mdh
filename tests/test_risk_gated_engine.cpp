@@ -49,7 +49,7 @@ bool holds(const ExchangeEvent& ev) {
 } // namespace
 
 TEST(RiskGatedEngine, InsufficientFundsRejectsBeforeTouchingEngineOrLedger) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     ledger::Ledger ledger;
     ledger.deposit_cash(kBuyer, 500); // needs 1,000
     RiskGatedEngine gated(engine, ledger);
@@ -66,7 +66,7 @@ TEST(RiskGatedEngine, InsufficientFundsRejectsBeforeTouchingEngineOrLedger) {
 }
 
 TEST(RiskGatedEngine, ApprovedOrderBehavesExactlyLikeTheBareEngineAndUpdatesTheLedger) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     ledger::Ledger ledger;
     ledger.deposit_cash(kBuyer, 10'000);
     RiskGatedEngine gated(engine, ledger);
@@ -84,7 +84,7 @@ TEST(RiskGatedEngine, ApprovedOrderBehavesExactlyLikeTheBareEngineAndUpdatesTheL
 }
 
 TEST(RiskGatedEngine, EventSequenceStaysGaplessAcrossARiskRejectionAndASubsequentApproval) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     ledger::Ledger ledger;
     ledger.deposit_cash(kBuyer, 10'000);
     RiskGatedEngine gated(engine, ledger);
@@ -106,7 +106,7 @@ TEST(RiskGatedEngine, EventSequenceStaysGaplessAcrossARiskRejectionAndASubsequen
 }
 
 TEST(RiskGatedEngine, CancelBypassesRiskCheck) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     ledger::Ledger ledger;
     ledger.deposit_cash(kBuyer, 10'000);
     RiskGatedEngine gated(engine, ledger);
@@ -136,7 +136,7 @@ ReplaceOrderCommand replace_buy(CommandSequence seq, ClientOrderId original, Cli
 }
 
 TEST(RiskGatedEngine, ReplaceBuyHigherPriceThatFitsAvailableCashSucceedsAndReservesNewNotional) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     ledger::Ledger ledger;
     ledger.deposit_cash(kBuyer, 1'500);
     RiskGatedEngine gated(engine, ledger);
@@ -159,7 +159,7 @@ TEST(RiskGatedEngine, ReplaceBuyHigherPriceThatFitsAvailableCashSucceedsAndReser
 }
 
 TEST(RiskGatedEngine, ReplaceBuyHigherPriceExceedingAvailableCashIsRejectedWithoutTouchingBookOrHold) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     ledger::Ledger ledger;
     ledger.deposit_cash(kBuyer, 1'200);
     RiskGatedEngine gated(engine, ledger);
@@ -195,7 +195,7 @@ TEST(RiskGatedEngine, ReplaceBuyHigherPriceExceedingAvailableCashIsRejectedWitho
 }
 
 TEST(RiskGatedEngine, ReplaceBuyLargerQuantityExceedingAvailableCashIsRejectedPreservingOriginalHold) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     ledger::Ledger ledger;
     ledger.deposit_cash(kBuyer, 1'200);
     RiskGatedEngine gated(engine, ledger);
@@ -214,7 +214,7 @@ TEST(RiskGatedEngine, ReplaceBuyLargerQuantityExceedingAvailableCashIsRejectedPr
 }
 
 TEST(RiskGatedEngine, ReplaceBuyReducingExposureSucceeds) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     ledger::Ledger ledger;
     ledger.deposit_cash(kBuyer, 1'000);
     RiskGatedEngine gated(engine, ledger);
@@ -231,7 +231,7 @@ TEST(RiskGatedEngine, ReplaceBuyReducingExposureSucceeds) {
 }
 
 TEST(RiskGatedEngine, ReplaceSellIncreasingQuantityBeyondAvailableInventoryIsRejected) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     ledger::Ledger ledger;
     ledger.deposit_position(kSeller, kInstrument, 20);
     RiskGatedEngine gated(engine, ledger);
@@ -266,7 +266,7 @@ TEST(RiskGatedEngine, ReplaceSellIncreasingQuantityBeyondAvailableInventoryIsRej
 }
 
 TEST(RiskGatedEngine, ReplaceSellReducingQuantitySucceeds) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     ledger::Ledger ledger;
     ledger.deposit_position(kSeller, kInstrument, 10);
     RiskGatedEngine gated(engine, ledger);
@@ -299,7 +299,7 @@ TEST(RiskGatedEngine, ReplaceSellReducingQuantitySucceeds) {
 }
 
 TEST(RiskGatedEngine, CrossingOrdersProduceCorrectTradesAndConsistentLedgerState) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     ledger::Ledger ledger;
     ledger.deposit_cash(kBuyer, 10'000);
     ledger.deposit_position(kSeller, kInstrument, 50);
@@ -335,6 +335,55 @@ TEST(RiskGatedEngine, CrossingOrdersProduceCorrectTradesAndConsistentLedgerState
     EXPECT_EQ(ledger.balances(kSeller).position_total.at(kInstrument), 40u);
     EXPECT_EQ(ledger.balances(kBuyer).cash_reserved, 0);
     EXPECT_EQ(ledger.balances(kSeller).position_reserved.at(kInstrument), 0u);
+}
+
+// The instrument check has to come before the risk check, not after: a sell
+// on an instrument the exchange does not trade would otherwise be reported
+// as InsufficientPosition, because the account genuinely holds none of it.
+// That reads as a funding problem the client could fix by depositing, which
+// it is not.
+TEST(RiskGatedEngine, SellOnAnUnknownInstrumentReportsTheInstrumentNotThePosition) {
+    MatchingEngine engine{kInstrument};
+    ledger::Ledger ledger;
+    ledger.deposit_position(kSeller, kInstrument, 50);
+    RiskGatedEngine gated(engine, ledger);
+    CollectingSink out;
+
+    gated.process(NewOrderCommand{.command_sequence = 1,
+                                   .account_id = kSeller,
+                                   .client_order_id = 1,
+                                   .instrument_id = kInstrument + 1,
+                                   .side = Side::Sell,
+                                   .price = 100,
+                                   .quantity = 10,
+                                   .order_type = OrderType::Limit,
+                                   .time_in_force = TimeInForce::GTC},
+                  out.sink());
+
+    ASSERT_EQ(out.events.size(), 1u);
+    EXPECT_EQ(out.at<OrderRejected>(0).reason, RejectReason::InvalidInstrument);
+    EXPECT_EQ(ledger.available_position(kSeller, kInstrument), 50u); // nothing reserved
+}
+
+TEST(RiskGatedEngine, ReplaceOnAnUnknownInstrumentIsRejectedBeforeRisk) {
+    MatchingEngine engine{kInstrument};
+    ledger::Ledger ledger;
+    ledger.deposit_cash(kBuyer, 10'000);
+    RiskGatedEngine gated(engine, ledger);
+    CollectingSink out;
+
+    gated.process(ReplaceOrderCommand{.command_sequence = 1,
+                                       .account_id = kBuyer,
+                                       .original_client_order_id = 1,
+                                       .new_client_order_id = 2,
+                                       .instrument_id = kInstrument + 1,
+                                       .new_price = 100,
+                                       .new_quantity = 5},
+                  out.sink());
+
+    ASSERT_EQ(out.events.size(), 1u);
+    EXPECT_EQ(out.at<OrderRejected>(0).reason, RejectReason::InvalidInstrument);
+    EXPECT_EQ(ledger.balances(kBuyer).cash_reserved, 0);
 }
 
 } // namespace mdh::exchange::risk

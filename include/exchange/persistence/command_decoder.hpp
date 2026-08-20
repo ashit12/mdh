@@ -9,6 +9,11 @@
 
 namespace mdh::exchange::persistence {
 
+// What one journal frame turns into: a command, an instrument registration
+// (see CommandMessageType::RegisterInstrument), or the error that made the
+// frame unreadable.
+using DecodedFrame = std::variant<ExchangeCommand, RegisterInstrumentRecord, CommandDecodeError>;
+
 // Decodes just the fixed 12-byte header. Returns
 // CommandDecodeError::TruncatedHeader if fewer than HEADER_SIZE bytes are
 // available, or InvalidReserved if the reserved byte is non-zero. Does NOT
@@ -18,11 +23,11 @@ namespace mdh::exchange::persistence {
 [[nodiscard]] std::variant<CommandHeader, CommandDecodeError> decode_command_header(std::span<const std::byte> data);
 
 // Decodes a full frame: `data` must contain exactly the header bytes
-// followed by exactly the payload bytes for that header's command type
-// (i.e. data.size() == HEADER_SIZE + header.payload_size). Callers that
-// read frames incrementally from a stream (see command_journal_reader.hpp)
-// are expected to peek the header first to learn how many payload bytes to
-// read before calling this. Mirrors protocol::decode_event.
-[[nodiscard]] std::variant<ExchangeCommand, CommandDecodeError> decode_command(std::span<const std::byte> data);
+// followed by exactly the payload bytes for that header's type (i.e.
+// data.size() == HEADER_SIZE + header.payload_size). Callers that read
+// frames incrementally from a stream (see command_journal_reader.hpp) are
+// expected to peek the header first to learn how many payload bytes to read
+// before calling this. Mirrors protocol::decode_event.
+[[nodiscard]] DecodedFrame decode_journal_frame(std::span<const std::byte> data);
 
 } // namespace mdh::exchange::persistence

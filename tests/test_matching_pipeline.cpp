@@ -7,11 +7,19 @@
 #include <vector>
 
 #include "exchange/sequencing/matching_pipeline.hpp"
+#include "exchange/testing/matching_scenarios.hpp"
 
 namespace mdh::exchange::sequencing {
 namespace {
 
 using namespace std::chrono_literals;
+
+// These tests number their instruments from 0, which the registry accepts
+// as an ordinary id. Each one has to declare the instruments it submits:
+// the engine behind the pipeline rejects anything else.
+[[nodiscard]] std::vector<InstrumentId> instruments_from_zero(std::size_t count) {
+    return exchange::testing::instrument_universe(count, /*first=*/0);
+}
 
 NewOrderCommand new_order(AccountId account, ClientOrderId client_id, InstrumentId instrument, Side side,
                            Price price, Quantity qty, TimeInForce tif = TimeInForce::GTC) {
@@ -77,7 +85,7 @@ bool wait_until(Pred pred, std::chrono::milliseconds timeout = 2s) {
 
 TEST(MatchingPipeline, SubmitAcceptsAndProcessesACommand) {
     ThreadSafeCollectingSink out;
-    MatchingPipeline pipeline(out.sink());
+    MatchingPipeline pipeline(out.sink(), MatchingPipelineOptions{.instruments = {1}});
 
     EXPECT_TRUE(pipeline.submit(new_order(100, 1, /*instrument=*/1, Side::Buy, 100, 10)));
     ASSERT_TRUE(wait_until([&] { return pipeline.commands_processed() == 1; }));
@@ -95,9 +103,9 @@ TEST(MatchingPipeline, SubmitAcceptsAndProcessesACommand) {
 
 TEST(MatchingPipeline, SubmitAssignsStrictlyIncreasingSequenceInSubmissionOrder) {
     ThreadSafeCollectingSink out;
-    MatchingPipeline pipeline(out.sink());
-
     constexpr int kCount = 20;
+    MatchingPipeline pipeline(out.sink(), MatchingPipelineOptions{.instruments = instruments_from_zero(kCount)});
+
     for (int i = 0; i < kCount; ++i) {
         // Distinct instruments so nothing crosses -- keeps this test about
         // sequencing/ordering, not matching semantics (already covered by
@@ -123,11 +131,12 @@ TEST(MatchingPipeline, SubmitAssignsStrictlyIncreasingSequenceInSubmissionOrder)
 
 TEST(MatchingPipeline, StopDrainsEveryAcceptedCommandBeforeReturning) {
     ThreadSafeCollectingSink out;
+    constexpr int kCount = 10;
     MatchingPipelineOptions options;
+    options.instruments = instruments_from_zero(kCount);
     options.matching_delay = 2ms; // slow enough that submissions below outrun processing
     MatchingPipeline pipeline(out.sink(), options);
 
-    constexpr int kCount = 10;
     int accepted = 0;
     for (int i = 0; i < kCount; ++i) {
         if (pipeline.submit(new_order(100, static_cast<ClientOrderId>(i), static_cast<InstrumentId>(i), Side::Buy, 100, 1))) {
@@ -144,6 +153,7 @@ TEST(MatchingPipeline, StopDrainsEveryAcceptedCommandBeforeReturning) {
 TEST(MatchingPipeline, SubmitRejectsWithoutDroppingWhenQueueIsFull) {
     ThreadSafeCollectingSink out;
     MatchingPipelineOptions options;
+    options.instruments = {1};
     options.queue_capacity = 1; // rounds up to a power of two internally, but stays tiny
     options.matching_delay = 20ms; // slow enough to reliably keep the queue full while flooding submissions
     MatchingPipeline pipeline(out.sink(), options);
@@ -194,7 +204,7 @@ TEST(MatchingPipeline, CustomProcessorIsInvokedInsteadOfBareEngine) {
         });
     };
 
-    MatchingPipeline pipeline(out.sink(), MatchingPipelineOptions{}, processor);
+    MatchingPipeline pipeline(out.sink(), MatchingPipelineOptions{.instruments = {1}}, processor);
     ASSERT_TRUE(pipeline.submit(new_order(100, 1, /*instrument=*/1, Side::Buy, 100, 10)));
     ASSERT_TRUE(wait_until([&] { return pipeline.commands_processed() == 1; }));
     pipeline.stop();
@@ -221,11 +231,15 @@ TEST(MatchingPipeline, CustomProcessorIsInvokedInsteadOfBareEngine) {
 // SpscQueue's concurrent tests do (test_spsc_queue.cpp).
 TEST(MatchingPipeline, ConcurrentProducerThreadCommandsAllProcessedExactlyOnce) {
     ThreadSafeCollectingSink out;
+    constexpr int kCount = 20'000;
     MatchingPipelineOptions options;
+    // One instrument per command, so this doubles as the registry's scale
+    // case: 20,000 books built at construction, and 20,000 direct-mapped
+    // slots looked up while a second thread floods the queue.
+    options.instruments = instruments_from_zero(kCount);
     options.queue_capacity = 64; // small on purpose: forces frequent full/empty contention
     MatchingPipeline pipeline(out.sink(), options);
 
-    constexpr int kCount = 20'000;
     std::atomic<int> submitted{0};
 
     {

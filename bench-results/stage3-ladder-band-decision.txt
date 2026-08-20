@@ -1,0 +1,103 @@
+mdh matching engine: choosing the price band for the tick ladder (Stage 3, decision)
+
+The question
+------------
+A tick ladder is an array indexed by price, so it needs a bounded band of prices to cover.
+The plan left three options open, to be decided from measured level distributions rather
+than guessed at: reject out-of-band prices, keep an overflow map for them, or slide the band
+with a reference price. This is the measurement and the decision.
+
+
+What the books actually look like
+---------------------------------
+From bench_matching_workload's new "Price-level distribution" section. Span is the distance
+in ticks between the lowest and highest occupied price on a side; levels is how many of those
+ticks hold an order; "in band" is the share of resting orders within that many ticks of the
+touch.
+
+scenario                                   orders    levels       span   in 1024   in 8192
+------------------------------------------------------------------------------------------
+realistic workload, 1 instrument             8918        74         84    100.0%    100.0%
+realistic workload, 16 instruments           1342        67         85    100.0%    100.0%
+realistic workload, 64 instruments           1033        60         86    100.0%    100.0%
+benchmark seed, 1024 levels                  1024      1024       1024    100.0%    100.0%
+benchmark seed, 4096 levels                  4096      4096       4096     25.0%    100.0%
+benchmark seed, 65536 levels                65536     65536      65536      1.6%     12.5%
+benchmark seed, 262144 levels              262144    262144     262144      0.4%      3.1%
+benchmark seed, 1000000 levels            1000000   1000000    1000000      0.1%      0.8%
+
+Two things stand out.
+
+The realistic workload is tiny and dense: 84 ticks of span holding 74 occupied levels, so
+88% of the ticks in its range are in use. That is close to the ideal case for a ladder --
+almost none of the array would be wasted -- and a 1024-tick band covers it twelve times over.
+The caveat is that this generator anchors passive prices to a static mid, so it has no drift
+by construction; a real instrument's band moves during a session and this measurement cannot
+say anything about how fast.
+
+The benchmark's own scaling rows are the opposite, by design: they seed one order per tick
+across up to a million consecutive ticks to push the price index until it breaks. They are
+not markets, but they are what the rest of the suite measures, so which of them a ladder
+covers decides which rows it can move.
+
+
+The decision
+------------
+1. Out-of-band prices go to an overflow std::map, consulted only when it is non-empty.
+
+   Rejecting them is a behaviour change, and the measurement says it would be a large one:
+   it would reject the majority of the orders in four of this suite's own scaling rows, and
+   several tests place orders far from any anchor. Real exchanges do band prices, but they
+   do it as a risk control with published limits, not as an artefact of a data structure --
+   and adopting it here to avoid writing a fallback would be letting the implementation
+   choose the semantics.
+
+   A sliding band is the option the measurement cannot justify. Its purpose is to follow
+   drift, and this workload has none, so anything I built would be tuned against a constant.
+   It also would not help the wide rows: no anchor covers a million-tick span. If drift is
+   ever measured, sliding is the natural follow-up, and the overflow map is what makes it
+   optional rather than urgent.
+
+2. The band is 8192 ticks per side, scaled down by a whole-engine memory budget.
+
+   8192 is where the curve above stops paying: it covers the realistic workload with a
+   factor of ninety-five to spare and the 1024- and 4096-level rows completely, while the
+   next row up (65,536) would need a 512 KB-per-side ladder and still leave two rows out.
+
+   A ladder costs instruments x band x 2 sides, which is exactly why stage 1 came first.
+   The engine divides an 8 MB budget across its universe and rounds down to a power of two:
+
+     instruments      band      per instrument     total
+               1      8192            128 KB      128 KB
+              64      8192            128 KB        8 MB
+             128      4096             64 KB        8 MB
+             512      1024             16 KB        8 MB
+           1024+      none                 -            -
+
+   Below 1024 ticks the band stops being worth the fixed cost, so the book falls back to
+   the map alone -- which is stage 2's structure, still correct and still measured. This is
+   what keeps the 20,000-instrument pipeline test affordable: those books get no ladder.
+
+3. Ladders are allocated per side on first use and left uninitialised.
+
+   A level's contents are only meaningful where the occupancy bitmap says so, so the array
+   never needs zeroing and its untouched pages are never faulted in. Only the bitmap (1 KB
+   per side at full band) is zeroed. An instrument that never trades costs nothing, and one
+   that trades on one side pays for one side.
+
+4. An empty side re-anchors on its next insert.
+
+   Not a sliding band -- no re-anchoring of live orders, no cost on any hot path -- just the
+   observation that a side with nothing in it has no reason to keep its old base. A book that
+   drains and re-forms somewhere else recovers its ladder for free.
+
+
+What this predicts
+------------------
+The realistic workload and the 1024/4096-level rows should move; the 65,536-, 262,144- and
+1,000,000-level rows should not, because they will be in the overflow map, and the honest
+expectation for them is "unchanged, plus a predictable branch".
+
+Worth restating a caveat from the stage 2 report: the plan's stage 3 targets were extrapolated
+from the *pre-slab* tree cost, and the slab already took cancel-at-4096-levels from 155 ns to
+80 by shrinking the map node. The remaining headroom is smaller than the plan assumed.

@@ -104,11 +104,11 @@ struct UiGatewayOptions {
     std::vector<exchange::AccountId> demo_account_ids{1001, 1002, 1003};
 
     // Instruments seeded with a starting position for every demo account
-    // (see class-level comment) -- purely so a fresh account can
-    // demonstrate selling immediately too, not a claim that these are the
-    // only instruments tradeable (submit_new_order() accepts any
-    // InstrumentId; the exchange side has no static instrument catalog
-    // either, see MatchingEngine).
+    // (see class-level comment), so a fresh account can demonstrate selling
+    // immediately. This UI accepts an order on any InstrumentId, but the
+    // exchange behind it does not: apps/trading_server hands this same list
+    // to OrderEntryGatewayOptions::instruments, so an order on anything else
+    // comes back rejected with InvalidInstrument.
     std::vector<InstrumentId> demo_instrument_ids{1, 2};
 
     trader::positions::Balance demo_starting_cash = 1'000'000'0000; // ticks; see common/types.hpp's Price scale

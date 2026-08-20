@@ -317,7 +317,7 @@ TEST(Ledger, ReplaceCancelPlusNewMovesTheHoldToTheNewPriceAndQuantity) {
 }
 
 TEST(Ledger, EndToEndCrossingOrdersConservesValueAcrossBothAccounts) {
-    MatchingEngine engine;
+    MatchingEngine engine{kInstrument};
     Ledger ledger;
     ledger.deposit_cash(kBuyer, 100'000);
     ledger.deposit_position(kSeller, kInstrument, 100);

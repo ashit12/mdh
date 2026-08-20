@@ -467,7 +467,7 @@ TEST(MatchingEngineStress, MixedCommandStreamPreservesEveryInvariant) {
     config.stale_reference_pct = 20;
     const auto workload = mt::generate_workload(config);
 
-    MatchingEngine engine;
+    MatchingEngine engine(config.instruments());
     InvariantChecker checker;
     std::vector<ExchangeEvent> events;
     const EventSink sink = [&events](const ExchangeEvent& event) { events.push_back(event); };
@@ -538,7 +538,7 @@ TEST(MatchingEngineStress, ReplayingTheSameCommandsProducesIdenticalEventsAndSta
     const auto workload = mt::generate_workload(config);
 
     const auto play = [&workload]() {
-        MatchingEngine engine;
+        MatchingEngine engine(workload.config.instruments());
         EventDigest digest;
         const EventSink sink = [&digest](const ExchangeEvent& event) { digest.add(event); };
         mt::replay(engine, workload.seed, sink);
@@ -562,19 +562,28 @@ TEST(MatchingEngineStress, ReplayingTheSameCommandsProducesIdenticalEventsAndSta
 // reported as the touch. The reference model is built from plain vectors, so
 // a bug in how MatchingBook drives std::list/std::map cannot be mirrored by
 // the thing it is compared against.
-TEST(MatchingBookStress, PriceLevelLifecycleMatchesReferenceModel) {
+// Differential test of MatchingBook against a std::map reference model.
+// `spread` is how many ticks the random prices span, which is what decides
+// whether they land in the ladder or in the out-of-band map: a spread inside
+// `band_ticks` never leaves the ladder, while a wider one keeps both indexes
+// non-empty and makes every best-price and every walk a merge of the two.
+void check_price_level_lifecycle(Price spread, std::uint32_t band_ticks) {
     const std::size_t operations = stress_operations(/*optimised=*/400'000, /*debug=*/40'000);
 
-    MatchingBook book{1};
-    std::map<Price, std::vector<ExchangeRestingOrder>, std::greater<Price>> reference_bids;
-    std::map<Price, std::vector<ExchangeRestingOrder>> reference_asks;
+    MatchingBook book(/*expected_resting_orders=*/0, band_ticks);
+    std::map<Price, std::vector<BookOrder>, std::greater<Price>> reference_bids;
+    std::map<Price, std::vector<BookOrder>> reference_asks;
 
-    // O(1) uniform pick and erase over the live set.
+    // O(1) uniform pick and erase over the live set. Keeping a handle
+    // alongside each live id mirrors what the engine now does for real: the
+    // book cannot find an order by id, so whoever put it there holds on to
+    // where it went.
     std::vector<ExchangeOrderId> live_ids;
     struct Location {
         Side side;
         Price price;
         std::size_t slot;
+        MatchingBook::Handle handle;
     };
     std::unordered_map<ExchangeOrderId, Location> located;
 
@@ -590,7 +599,7 @@ TEST(MatchingBookStress, PriceLevelLifecycleMatchesReferenceModel) {
     };
     const auto erase_from = [](auto& levels, Price price, ExchangeOrderId victim) {
         auto& level = levels.at(price);
-        level.erase(std::find_if(level.begin(), level.end(), [victim](const ExchangeRestingOrder& candidate) {
+        level.erase(std::find_if(level.begin(), level.end(), [victim](const BookOrder& candidate) {
             return candidate.exchange_order_id == victim;
         }));
         if (level.empty()) {
@@ -614,7 +623,7 @@ TEST(MatchingBookStress, PriceLevelLifecycleMatchesReferenceModel) {
         }
     };
     const auto flatten = [](const auto& levels) {
-        std::vector<ExchangeRestingOrder> flat;
+        std::vector<BookOrder> flat;
         for (const auto& [price, level] : levels) {
             flat.insert(flat.end(), level.begin(), level.end());
         }
@@ -628,34 +637,30 @@ TEST(MatchingBookStress, PriceLevelLifecycleMatchesReferenceModel) {
         const auto choice = live_ids.empty() ? 0U : static_cast<unsigned>(rng.below(100));
         if (choice < 45) {
             const Side side = (rng.next() & 1U) != 0 ? Side::Buy : Side::Sell;
-            const auto price = static_cast<Price>(1'000 + rng.below(64));
-            const ExchangeRestingOrder order{
+            const auto price = static_cast<Price>(1'000 + rng.below(static_cast<std::uint64_t>(spread)));
+            const BookOrder order{
                 .exchange_order_id = next_id,
                 .client_order_id = next_id,
                 .account_id = 1,
                 .price = price,
-                .original_quantity = 100,
                 .remaining_quantity = 100,
-                .order_sequence = next_id,
-                .instrument_id = 1,
                 .side = side,
                 .time_in_force = TimeInForce::GTC,
             };
-            book.add(order);
+            const auto handle = book.add(order);
             if (side == Side::Buy) {
                 reference_bids[price].push_back(order);
             } else {
                 reference_asks[price].push_back(order);
             }
-            located[next_id] = Location{side, price, live_ids.size()};
+            located[next_id] = Location{side, price, live_ids.size(), handle};
             live_ids.push_back(next_id);
             ++next_id;
         } else if (choice < 75) {
             const ExchangeOrderId victim = live_ids[rng.below(live_ids.size())];
             const Location location = located.at(victim);
-            const auto removed = book.remove(victim);
-            ASSERT_TRUE(removed.has_value()) << "at operation " << op;
-            EXPECT_EQ(removed->exchange_order_id, victim);
+            const BookOrder removed = book.remove_at(location.handle);
+            EXPECT_EQ(removed.exchange_order_id, victim) << "at operation " << op;
             if (location.side == Side::Buy) {
                 erase_from(reference_bids, location.price, victim);
             } else {
@@ -676,7 +681,7 @@ TEST(MatchingBookStress, PriceLevelLifecycleMatchesReferenceModel) {
             const ExchangeOrderId victim = live_ids[rng.below(live_ids.size())];
             const Location location = located.at(victim);
             const auto new_quantity = static_cast<Quantity>(1 + rng.below(99));
-            EXPECT_TRUE(book.reduce(victim, new_quantity));
+            book.reduce_at(location.handle, new_quantity);
             if (location.side == Side::Buy) {
                 reduce_in(reference_bids, location.price, victim, new_quantity);
             } else {
@@ -703,6 +708,21 @@ TEST(MatchingBookStress, PriceLevelLifecycleMatchesReferenceModel) {
 
     EXPECT_TRUE(book.all_bids() == flatten(reference_bids));
     EXPECT_TRUE(book.all_asks() == flatten(reference_asks));
+}
+
+TEST(MatchingBookStress, PriceLevelLifecycleMatchesReferenceModel) {
+    check_price_level_lifecycle(/*spread=*/64, MatchingBook::kMaxBandTicks);
+}
+
+TEST(MatchingBookStress, PriceLevelLifecycleMatchesReferenceModelAcrossTheBandEdge) {
+    // Five times the band, so roughly four out of five prices land outside
+    // it and the two indexes stay interleaved for the whole run.
+    check_price_level_lifecycle(/*spread=*/5 * MatchingBook::kMaxBandTicks, MatchingBook::kMaxBandTicks);
+}
+
+TEST(MatchingBookStress, PriceLevelLifecycleMatchesReferenceModelWithNoLadder) {
+    // What a universe too large to afford a ladder runs on.
+    check_price_level_lifecycle(/*spread=*/1'024, /*band_ticks=*/0);
 }
 
 } // namespace

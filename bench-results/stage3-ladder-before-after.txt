@@ -1,0 +1,207 @@
+mdh matching engine: a tick ladder with a hierarchical occupancy bitmap (Stage 3)
+
+The change
+----------
+The price index was a std::pmr::map<Price, LevelSlot> per side: finding a level meant a
+red-black tree descent, and finding the touch meant walking to one end of it. It is now a flat
+array indexed by tick, over a band of prices, with a three-level occupancy bitmap over the top:
+
+  LevelSlot ladder_[band];        // uninitialised; meaningless unless the bitmap says otherwise
+  uint64 occupancy_[band/64];     // one bit per tick
+  uint64 mid_summary_[band/4096]; // one bit per occupancy_ word
+  uint64 summary_;                // one bit per mid_summary_ word
+
+Finding a level is now an array index. Finding the touch is three dependent loads and three
+count-leading-zeros, over 1 KB of bitmap that stays in L1. Stepping to the next level is a
+masked word plus, usually, no summary lookup at all.
+
+Prices outside the band go to a std::pmr::map, which is exactly stage 2's structure, and the
+walks merge the two indexes. bench-results/stage3-ladder-band-decision.txt is the measurement
+that chose that policy over rejecting out-of-band prices or sliding the band, and chose the
+8192-tick band and the 8 MB whole-engine budget that scales it down across a large universe.
+
+Because the map-only path is stage 2 unchanged, before/after here is one binary with the
+budget set to zero and the same binary with it set to 8 MB -- same allocator, same session, one
+variable. The "before" arm therefore also pays the in-band branch, which slightly understates
+the change; everything else about the comparison is tighter than a rebuild would be.
+
+Correctness: all 407 tests pass (9 new). The two that matter are differential: the existing
+400,000-operation MatchingBookStress comparison against an independent std::map reference model
+now also runs at a price spread five times the band, so four prices in five are out of band and
+every best-price and every walk is a live merge of the two indexes, and again with no ladder at
+all, which is what a large universe gets.
+
+A level no longer allocates. In-band levels are array slots, so creating and destroying price
+levels is now allocation-free -- visible below as two book shapes that used to differ in
+footprint reporting identical figures.
+
+Run-to-run variance: medians of three runs, on an otherwise-loaded laptop. Most rows reproduce
+within a few percent; the cancel-scaling rows do not, and are marked.
+
+
+Whole-engine workload (bench_matching_workload)
+==============================================================================================
+                                             before      after     change
+----------------------------------------------------------------------------------------------
+resting (GTC, existing level, 1024 lvl)   51.0 ns/op  32.7 ns/op    -35.9%
+crossing (IOC, one fill, one level)       28.5 ns/op  29.2 ns/op     +2.5%
+mixed (realistic 40/25/20/10/5)          134.0 ns/op  80.3 ns/op    -40.1%
+
+mixed workload, 1M ops (batch)           135.1 ns/op  81.9 ns/op    -39.4%
+
+Per-operation tail, 1M-operation stream (ns; p99.9 and max omitted as run-to-run noise)
+----------------------------------------------------------------------------------------------
+                          p50 before/after   p90 before/after   p99 before/after
+aggregate                      125 ->  83        250 -> 167        417 -> 292
+resting                        125 ->  83        167 -> 125        250 -> 208
+crossing                       167 -> 101        292 -> 167        458 -> 291
+cancel                         125 ->  84        208 -> 166        333 -> 292
+replace (priority kept)        125 -> 125        208 -> 167        334 -> 334
+replace (priority lost)        209 -> 142        333 -> 209        458 -> 375
+IOC                            167 ->  84        291 -> 167        417 -> 250
+FOK                            125 ->  83        583 -> 292       1083 -> 625
+
+Priority-preserving replace is the control: it never touches the price index (it writes a
+quantity or a client order id into the slab and stops), and it is the one row that does not
+move. That is the shape the change predicts.
+
+Insert cost against book size (ns/op)
+----------------------------------------------------------------------------------------------
+resting orders     1024 levels          1 order per level
+                before / after          before / after
+        1024      49.6 ->  28.6          47.0 ->  28.0
+       10240      45.4 ->  27.7          63.5 ->  50.5
+      102400      51.4 ->  31.3          98.9 ->  94.2
+     1024000      53.2 ->  33.2         135.8 -> 130.3
+
+The left column is a book that fits the band: uniformly a third faster, and now flat in the
+order count. The right column builds one level per order, so past 8192 orders it is mostly out
+of band and mostly unchanged -- which is the honest, predicted outcome, not a disappointment.
+A book with a million occupied price levels is not a market.
+
+Cancel against level count (ns/op; this row is noisy -- spread across three runs in brackets)
+----------------------------------------------------------------------------------------------
+         1 level        15.9 ->  15.8      -0.6%   [15.9-17.1 / 15.7-15.9]
+        64 levels       43.3 ->  35.5     -18.0%   [42.3-43.6 / 33.8-41.4]
+      4096 levels       84.6 ->  64.1     -24.2%   [84.3-101.9 / 54.1-81.3]
+    262144 levels      102.0 ->  98.7      -3.2%   [101.6-102.4 / 98.5-99.1]
+
+Sweep, one aggressive order consuming N levels (ns per level)
+----------------------------------------------------------------------------------------------
+         1 level       221.4 -> 209.6      -5.3%
+        16 levels      205.2 -> 188.6      -8.1%
+       256 levels      195.2 -> 185.6      -4.9%
+      1024 levels      224.8 -> 181.2     -19.4%
+
+Instrument count, total depth held at ~4096 orders per side
+----------------------------------------------------------------------------------------------
+  instruments      ns/op before/after     p99 before/after
+            1        132.2 ->  79.7          416 -> 250
+            4        135.1 ->  84.0          416 -> 250
+           16        144.9 ->  88.9          417 -> 291
+           64        166.5 ->  98.7          458 -> 292
+
+This is the row the memory budget was designed for: 64 instruments each get the full 8192-tick
+band, which is 8 MB of ladder in total, and the engine gets 40% faster at the widest universe it
+measures rather than paying for the structure. Past 512 instruments the share stops buying a
+useful band and books fall back to the map -- which is why the 20,000-instrument pipeline test
+still costs what it always did.
+
+
+Microbenchmarks (bench_matching_engine, medians of 5 repetitions, CV under 3% throughout)
+==============================================================================================
+The argument is price-level count unless noted.
+
+Where the ladder does the most (ns)
+----------------------------------------------------------------------------------------------
+FOK rejected, 1024 crossable levels     45088 ->  5255    -88.3%
+FOK rejected, 256 crossable levels       9270 ->  1325    -85.7%
+FOK rejected, 64 crossable levels        1738 ->   290    -83.3%
+FOK rejected, 16 crossable levels         269 ->    71    -73.5%
+replace priority-lost (qty), 4096         175 ->  45.9    -73.8%
+replace priority-lost, 256                131 ->  44.4    -66.1%
+match one level of 64 orders             3074 ->  1320    -57.1%
+cancel, 4096 levels                      70.5 ->  39.1    -44.5%
+cancel, 256 levels                       61.0 ->  35.0    -42.6%
+insert at existing level, 4096           87.6 ->  53.6    -38.8%
+
+The FOK preflight rows are the clearest single result in this stage. crossable_quantity walks
+levels from the touch until the price bound stops it, and walking N levels used to be N tree
+hops through pooled nodes scattered across memory. It is now N steps through a bitmap that fits
+in L1, and at 1024 levels that is 45 microseconds down to 5.
+
+Where it does nothing, and where it costs (ns)
+----------------------------------------------------------------------------------------------
+replace priority-lost, 1 level           47.1 ->  58.3    +23.8%
+FOK rejected, 1 crossable level          10.8 ->  12.6    +16.7%
+FOK rejected, no background depth        10.9 ->  12.5    +14.7%
+replace priority-preserving (all depths) 21.4 ->  22.5     +5.1%
+insert at new level, 65536 levels         134 ->   123     -8.2%
+replace priority-lost, 65536 levels        210 ->   213     +1.4%
+cancel, 1 level                          17.2 ->  17.4     +1.2%
+
+Three separate things, worth keeping apart.
+
+The depth-1 replace regression is real and structural. That benchmark leaves exactly one order
+on the book and repeatedly cancels and re-adds it, so every iteration empties a side and
+re-creates it. Creating and destroying a level costs six dependent accesses across three arrays
+(the tick, its occupancy word, its summary word) where a one-node map costs a single pooled
+node already in cache. The ladder's fixed per-level cost is higher; it wins by making the
+*count* of levels stop mattering. The crossover is visible in the same family: 1 level is 24%
+worse, 16 levels is 38% better, 256 levels is 66% better.
+
+The FOK rows at zero and one level are the same effect at 11 ns: about 1.7 ns of extra
+indirection on an operation that has almost nothing else in it.
+
+The priority-preserving replace rows move by about 1 ns at every depth. That path does not
+touch the price index at all, so this is not work -- it is code layout, and it is at the edge
+of what these runs resolve. Recorded rather than explained away.
+
+
+Memory (bench_matching_memory)
+==============================================================================================
+Footprint of a resting book (bytes per order)
+----------------------------------------------------------------------------------------------
+      orders    shape                before    after    change
+        1000    1 order/level         221.9    215.6     -2.8%
+        1000    100 orders/level      150.5    215.6    +43.3%
+       10000    1 order/level         253.8    235.9     -7.1%
+       10000    100 orders/level      181.1    186.8     +3.1%
+      100000    1 order/level         277.7    275.6     -0.8%
+      100000    100 orders/level      209.0    208.9     -0.0%
+     1000000    1 order/level         208.0    207.8     -0.1%
+     1000000    100 orders/level      140.5    140.3     -0.1%
+
+A ladder is a fixed cost per book -- 64 KB of array plus 1 KB of bitmap per side that has ever
+held an order -- and it replaces a per-level cost of a 48-byte pooled map node. So the sign of
+the change depends entirely on how many levels the book has.
+
+The two 1000-order rows landing on the same figure is the point: a thousand orders spread over
+a thousand levels and a thousand orders stacked ten deep now cost the same, because in-band
+levels are array slots and no longer allocate. The 43% on the shallow row is the ladder's fixed
+65 KB divided by only a thousand orders; by ten thousand it is 3%, and by a hundred thousand it
+has disappeared. A book too small to amortise a ladder is also a book too small for any of this
+to matter.
+
+Allocations per operation are unchanged at 0.000-0.003, and the histogram for a million-order
+book is unchanged at ~560 allocations: this stage moves bytes between structures, it does not
+change how often the allocator is reached.
+
+
+What this stage did not do
+==============================================================================================
+Out-of-band books are unchanged, by construction. The 65,536-, 262,144- and 1,000,000-level
+rows spill 94%, 98% and 99.6% of their levels into the map and measure within a few percent of
+where they started. That was the prediction in the band decision and it held.
+
+The band does not slide. A side re-anchors when it empties, which costs nothing and handles a
+book that drains and re-forms elsewhere, but a book that drifts steadily out of its band will
+degrade to map performance rather than following the market. The workload generator anchors
+prices to a static mid, so there is no drift here to tune against -- inventing one would be
+measuring my own guess. The overflow map is what makes that a graceful degradation instead of
+an outage, and it is what would make sliding an optimisation rather than a rewrite.
+
+Stage 3's targets in the plan were extrapolated from pre-slab numbers and are not all reachable
+from here: cancel at 4096 levels was projected 184 -> 40-60 ns, but stage 2 had already taken it
+to 85, and this stage takes it to 64. The two stages together are what the projection was
+about.

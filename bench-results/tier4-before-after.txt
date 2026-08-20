@@ -1,0 +1,201 @@
+mdh matching engine: one order directory instead of two (Tier 4)
+
+The change
+----------
+Every resting order used to live in two hash tables. MatchingEngine::live_orders_ mapped
+(account_id, client_order_id) -> (instrument_id, exchange_order_id); MatchingBook::index_
+then mapped that exchange_order_id -> Location. Cancel and replace paid both, strictly in
+series: the second lookup could not start until the first returned. Every resting order
+carried two hash nodes, in two tables that grew and rehashed independently.
+
+They are now one table, owned by the engine:
+
+  orders_ : (account_id, client_order_id) -> { book handle, original_quantity,
+                                               order_sequence, instrument_id }
+
+MatchingBook stops being an order directory and becomes only a book. It cannot find an
+order by id and no longer knows its own instrument. add() returns an opaque Handle (side,
+price, list iterator) and remove_at/reduce_at/set_client_order_id_at/at take it back. The
+matching walk is unaffected: it works front-of-level and never needed a lookup.
+
+What made this possible now is the Tier 3b split -- BookOrder carries account_id and
+client_order_id, so a node found through the book can produce its own directory key. That
+is what lets one table keyed by client identity serve the book's purposes too.
+
+Behaviour is unchanged, deliberately including the awkward parts: the key is global rather
+than per-instrument, so a client order id already live on a *different* instrument is still
+a duplicate, and a cancel naming the wrong instrument is still UnknownOrderId.
+
+Correctness: all 383 tests pass (three MatchingBook tests for unknown-id lookups no longer
+have a subject and were dropped; one new test pins the handle-stability invariant the
+scheme rests on). Clean under ASan, which matters more than usual here -- the engine now
+holds list iterators across arbitrary other book traffic.
+
+
+Whole-engine workload (bench_matching_workload)
+==============================================================================================
+                                             before      after     change
+----------------------------------------------------------------------------------------------
+mixed workload, 10k ops                  113.5 ns/op  93.5 ns/op    -17.6%
+mixed workload, 100k ops                 119.8 ns/op  93.6 ns/op    -21.9%
+mixed workload, 1M ops                   149.8 ns/op 107.9 ns/op    -28.0%
+mixed sustained throughput                  6.73 M/s    9.47 M/s    +40.7%
+crossing stream (IOC, one fill)            41.3 ns/op  29.5 ns/op   -28.6%
+p99, 1M ops                                   708 ns      375 ns    -47.0%
+max, 1M ops                                  3.11 ms     1.26 ms    -59.4%
+
+Cancel and replace are where the second lookup was, but the gains are broader than that:
+one table means half the hash nodes, half the rehash volume, and half the resident
+directory to keep in cache.
+
+
+Microbenchmarks (5 repetitions, medians), against the Tier 3b build
+==============================================================================================
+benchmark                                         before ns   after ns   change     cv b   cv a
+----------------------------------------------------------------------------------------------
++BM_Rest_ExistingPriceLevel/1                          71.4       60.6   -15.1%     14.1   14.1
++BM_Rest_ExistingPriceLevel/16                         73.2       63.0   -13.9%      2.4    6.3
++BM_Rest_ExistingPriceLevel/256                        87.1       83.8    -3.8%      2.7    1.8
++BM_Rest_ExistingPriceLevel/4096                      101.0       94.1    -6.8%      2.1    2.4
+ BM_Rest_ExistingPriceLevel/65536                     144.0      141.0    -2.1%      5.4    6.7
+
+ BM_Rest_NewPriceLevel/1                              199.0      194.0    -2.5%      3.4    1.9
+ BM_Rest_NewPriceLevel/16                             204.0      198.0    -2.9%      4.7    2.8
++BM_Rest_NewPriceLevel/256                            201.0      193.0    -4.0%      0.8    4.0
++BM_Rest_NewPriceLevel/4096                           211.0      199.0    -5.7%      1.6    2.4
++BM_Rest_NewPriceLevel/65536                          165.0      155.0    -6.1%      4.7    7.3
+
++BM_Match_SingleLevel/1                                58.3       47.9   -17.8%      1.2    1.7
++BM_Match_SingleLevel/4                               153.0      113.0   -26.1%      2.7    0.8
++BM_Match_SingleLevel/16                              486.0      368.0   -24.3%      1.9    2.0
++BM_Match_SingleLevel/64                             1793.0     1570.0   -12.4%      1.7    1.2
++BM_Match_SingleLevel/256                            6976.0     6105.0   -12.5%      1.0    3.3
+
++BM_Sweep_Levels/1                                     59.5       48.8   -18.0%      1.4    3.2
++BM_Sweep_Levels/4                                    194.0      165.0   -14.9%      0.8    2.3
++BM_Sweep_Levels/16                                   718.0      607.0   -15.5%      1.0    1.0
++BM_Sweep_Levels/64                                  2824.0     2313.0   -18.1%      0.9    2.3
++BM_Sweep_Levels/256                                11255.0     9242.0   -17.9%      0.9    1.5
++BM_Sweep_Levels/1024                               45435.0    37263.0   -18.0%      1.1    1.5
+
++BM_Cancel/1                                           30.6       21.2   -30.7%      1.6    3.9
++BM_Cancel/16                                          87.6       38.1   -56.5%      8.8   16.8
++BM_Cancel/256                                        151.0       74.1   -50.9%      7.8   12.0
++BM_Cancel/4096                                       147.0      119.0   -19.0%      7.6    9.7
++BM_Cancel/65536                                      157.0      125.0   -20.4%      1.3    2.6
+
++BM_Replace_PriorityPreserving/1                       27.0       23.3   -13.7%      0.7    1.3
++BM_Replace_PriorityPreserving/16                      28.7       24.8   -13.6%      3.1    1.7
++BM_Replace_PriorityPreserving/256                     28.4       24.2   -14.8%      4.7    2.1
++BM_Replace_PriorityPreserving/4096                    32.1       28.8   -10.3%      1.4    1.2
++BM_Replace_PriorityPreserving/65536                   35.3       30.5   -13.6%      3.1    1.5
+
++BM_Replace_PriorityLosing_QuantityIncrease/1          74.6       56.2   -24.7%      1.4    2.2
++BM_Replace_PriorityLosing_QuantityIncrease/16         99.7       85.4   -14.3%      2.0    0.4
++BM_Replace_PriorityLosing_QuantityIncrease/256       157.0      136.0   -13.4%      0.9    0.4
++BM_Replace_PriorityLosing_QuantityIncrease/4096      211.0      175.0   -17.1%      0.4    1.3
+ BM_Replace_PriorityLosing_QuantityIncrease/65536     540.0      548.0    +1.5%      1.2    1.7
+
++BM_Replace_PriorityLosing_PriceChange/1               73.8       55.1   -25.3%      1.7    1.5
++BM_Replace_PriorityLosing_PriceChange/16             100.0       84.8   -15.2%      0.3    2.6
++BM_Replace_PriorityLosing_PriceChange/256            156.0      135.0   -13.5%      0.7    0.8
++BM_Replace_PriorityLosing_PriceChange/4096           211.0      176.0   -16.6%      1.0    1.0
+!BM_Replace_PriorityLosing_PriceChange/65536          538.0      568.0    +5.6%      1.3    1.1
+
+ BM_Fok_Rejected_CrossableLevels/1                      7.9        7.9    +0.1%      0.7    5.5
+!BM_Fok_Rejected_CrossableLevels/4                     14.2       15.3    +7.7%      5.7    5.6
+ BM_Fok_Rejected_CrossableLevels/16                    46.2       45.4    -1.7%      1.6    0.9
+ BM_Fok_Rejected_CrossableLevels/64                   235.0      233.0    -0.9%      0.4    0.3
+!BM_Fok_Rejected_CrossableLevels/256                 1245.0     1471.0   +18.2%      0.3    0.4
+ BM_Fok_Rejected_CrossableLevels/1024                5863.0     5849.0    -0.2%      0.2    0.9
+
+!BM_Fok_Rejected_BackgroundDepth/0                      8.0       14.7   +84.7%      0.8    9.7
+ BM_Fok_Rejected_BackgroundDepth/16                     8.2        8.2    +0.0%      0.7   44.2
+ BM_Fok_Rejected_BackgroundDepth/256                    8.2        8.2    +0.2%      0.0   12.5
+ BM_Fok_Rejected_BackgroundDepth/4096                   8.3        8.3    -0.7%      0.9    0.6
+!BM_Fok_Rejected_BackgroundDepth/65536                 12.8       14.3   +11.7%      4.1    9.6
+
++BM_Fok_Executed/1                                     58.2       48.8   -16.2%      2.7   11.9
++BM_Fok_Executed/4                                    190.0      153.0   -19.5%      1.2    9.0
++BM_Fok_Executed/16                                   737.0      590.0   -19.9%      0.7    3.2
++BM_Fok_Executed/64                                  3101.0     2487.0   -19.8%      1.1    8.6
++BM_Fok_Executed/256                                12714.0    10319.0   -18.8%      1.0    1.9
++BM_Fok_Executed/1024                               54218.0    45362.0   -16.3%      0.6    1.3
+
+median change across all 58 benchmarks: -13.8%
+
+Reading it
+----------
+Cancel is the headline, which is what the design predicted: -19% to -56%, and BM_Cancel/65536
+lands at 125 ns, better than the 131 ns it measured two tiers ago before Tier 3b's stride
+change regressed it. Matching, sweeping and FOK execution all improve 12-26% -- not from
+the lookup (they do none) but from the smaller, denser directory. Replace improves 10-25%
+everywhere except the 65536-level cases, which are flat.
+
+The one genuine regression is BM_Fok_Rejected_CrossableLevels/256, 1245 -> 1471 ns at a cv
+of 0.3%. It is the same lone case that regressed in Tier 3b (+36% then, +18% now) while its
+/64 and /1024 neighbours stay flat, which continues to look like cache-set aliasing at that
+one level count rather than a cost that scales.
+
+BM_Fok_Rejected_BackgroundDepth/0 printed +85% at a cv of 9.7% next to neighbours at cv 44%;
+that block of the run was disturbed, not changed.
+
+
+Memory (bench_matching_memory, exact)
+==============================================================================================
+                                              before      after     change
+----------------------------------------------------------------------------------------------
+bytes per resting order, 100 orders/level      231.7      214.9      -16.8 B
+bytes per resting order, 1 order/level         362.7      345.9      -16.8 B
+bytes/op, new order onto existing level        294.9      260.3
+allocations per resting order                  0.002      0.001
+
+The per-order node count is unchanged in bytes -- one 128-byte block replaces two 64-byte
+ones -- so the saving is the second table's bucket array, 8 bytes per order, plus the
+allocator traffic of one fewer node.
+
+
+What this exposed, and the second half of the change
+----------------------------------------------------
+At the extreme end the collapse on its own makes things worse, not better:
+
+  1,024,000 resting orders, 1024 levels    1187 -> 1814 ns/op
+  resting-only stream, sustained          156.4 -> 183.3 ns/op
+
+Both are table-growth artefacts. One large table rehashes more expensively than two small
+ones did, and at a million orders that dominates everything else.
+
+So the directory is now sized rather than guessed. MatchingEngine takes an expected resting
+order count (default 1024, unchanged behaviour for tests and small books) and reserves once;
+MatchingPipelineOptions and OrderEntryGatewayOptions pass it through, so the two production
+embedders can say what they expect. Getting it wrong is not a correctness problem, and
+over-estimating costs 8 bytes per unused slot in exactly one array.
+
+The reason this is worth doing now, when the same experiment was rejected two tiers ago, is
+that the thing being sized has changed. Over-reserving used to mean a bucket array in every
+MatchingBook -- 64 instruments, 64 arrays, and measurably worse p99 for the trouble. There
+is now exactly one directory in the engine, so pre-sizing it is one allocation and one
+policy decision, independent of how many instruments are trading.
+
+bench_matching_workload now sizes each scenario's engine to what that scenario will actually
+hold (workload.resting_orders_at_end, or the seeded depth), which is how a production engine
+would be configured. Final numbers, against the Tier 3b build:
+
+                                              before        after      change
+  ----------------------------------------------------------------------------
+  mixed workload, 10k ops                 113.5 ns/op  103.7 ns/op      -8.6%
+  mixed workload, 100k ops                119.8 ns/op   96.8 ns/op     -19.2%
+  mixed workload, 1M ops                  149.8 ns/op  104.2 ns/op     -30.4%
+  mixed sustained throughput                 6.73 M/s    9.65 M/s     +43.4%
+  resting-only stream                     156.4 ns/op   72.7 ns/op     -53.5%
+  crossing stream                          41.3 ns/op   27.9 ns/op     -32.4%
+  p99, 1M ops                                  708 ns       375 ns     -47.0%
+  p99.9, 1M ops                               1000 ns       542 ns     -45.8%
+  max, 1M ops                                 3.11 ms      0.03 ms       -99%
+
+  102,400 resting orders, 1024 levels      93.4 ns/op   59.4 ns/op     -36.4%
+  1,024,000 resting orders, 1024 levels  1187.3 ns/op   72.2 ns/op     -93.9%
+  1,024,000 resting orders, 1/level      1216.1 ns/op  160.0 ns/op     -86.8%
+
+The million-order cliff is gone: an insert at a million resting orders now costs 72 ns
+against 63 ns at a thousand, where it used to cost 1187.

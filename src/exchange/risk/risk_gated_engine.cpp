@@ -9,6 +9,16 @@ RiskGatedEngine::RiskGatedEngine(MatchingEngine& engine, ledger::Ledger& ledger,
 
 void RiskGatedEngine::process(const ExchangeCommand& command, const EventSink& sink) {
     if (const auto* new_order = std::get_if<NewOrderCommand>(&command)) {
+        // Ahead of the risk check, because risk would answer the wrong
+        // question about an instrument the exchange does not trade: a sell
+        // would come back InsufficientPosition (the account holds none of an
+        // instrument that does not exist here), which reads as a funding
+        // problem the client could fix. MatchingEngine::process_new_order
+        // makes the same check for callers that skip this class.
+        if (!engine_.knows_instrument(new_order->instrument_id)) {
+            engine_.reject_new_order(*new_order, RejectReason::InvalidInstrument, sink);
+            return;
+        }
         const RejectReason reason = risk_.check(*new_order, ledger_);
         if (reason != RejectReason::None) {
             // Rejected before ever reaching process(): no OrderAccepted was
@@ -19,6 +29,10 @@ void RiskGatedEngine::process(const ExchangeCommand& command, const EventSink& s
             return;
         }
     } else if (const auto* replace = std::get_if<ReplaceOrderCommand>(&command)) {
+        if (!engine_.knows_instrument(replace->instrument_id)) {
+            engine_.reject_replace_order(*replace, RejectReason::InvalidInstrument, sink);
+            return;
+        }
         const RejectReason reason = risk_.check(*replace, ledger_);
         if (reason != RejectReason::None) {
             // Same pre-process rejection as NewOrder: the resting order and

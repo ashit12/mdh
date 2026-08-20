@@ -7,7 +7,7 @@ namespace mdh::exchange::persistence {
 
 CommandJournalReader::CommandJournalReader(const std::string& path) : file_(path, std::ios::binary) {}
 
-std::optional<std::variant<ExchangeCommand, CommandDecodeError>> CommandJournalReader::next() {
+std::optional<DecodedFrame> CommandJournalReader::next() {
     frame_buf_.resize(HEADER_SIZE);
     file_.read(reinterpret_cast<char*>(frame_buf_.data()), static_cast<std::streamsize>(HEADER_SIZE));
     const auto header_bytes_read = static_cast<std::size_t>(file_.gcount());
@@ -16,12 +16,12 @@ std::optional<std::variant<ExchangeCommand, CommandDecodeError>> CommandJournalR
         return std::nullopt; // clean EOF, nothing left to read
     }
     if (header_bytes_read < HEADER_SIZE) {
-        return std::variant<ExchangeCommand, CommandDecodeError>(CommandDecodeError::TruncatedHeader);
+        return DecodedFrame(CommandDecodeError::TruncatedHeader);
     }
 
     auto header_result = decode_command_header(frame_buf_);
     if (std::holds_alternative<CommandDecodeError>(header_result)) {
-        return std::variant<ExchangeCommand, CommandDecodeError>(std::get<CommandDecodeError>(header_result));
+        return DecodedFrame(std::get<CommandDecodeError>(header_result));
     }
     const auto& header = std::get<CommandHeader>(header_result);
 
@@ -31,14 +31,10 @@ std::optional<std::variant<ExchangeCommand, CommandDecodeError>> CommandJournalR
     const auto payload_bytes_read = static_cast<std::size_t>(file_.gcount());
 
     if (payload_bytes_read < header.payload_size) {
-        return std::variant<ExchangeCommand, CommandDecodeError>(CommandDecodeError::TruncatedPayload);
+        return DecodedFrame(CommandDecodeError::TruncatedPayload);
     }
 
-    auto command_result = decode_command(frame_buf_);
-    if (std::holds_alternative<CommandDecodeError>(command_result)) {
-        return std::variant<ExchangeCommand, CommandDecodeError>(std::get<CommandDecodeError>(command_result));
-    }
-    return std::variant<ExchangeCommand, CommandDecodeError>(std::get<ExchangeCommand>(command_result));
+    return decode_journal_frame(frame_buf_);
 }
 
 } // namespace mdh::exchange::persistence
