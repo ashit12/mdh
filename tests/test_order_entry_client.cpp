@@ -13,7 +13,7 @@
 #include "protocol/order_entry/encoder.hpp"
 #include "trader/oms/order_entry_client.hpp"
 
-// Transport-level unit tests for OrderEntryClient (Milestone 8) -- a raw
+// Transport-level unit tests for OrderEntryClient -- a raw
 // net::TcpSocket stands in for the gateway here (same style as
 // tests/test_tcp_socket.cpp's own loopback tests), so these pin the
 // framing/threading contract in isolation from any real

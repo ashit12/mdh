@@ -1,17 +1,13 @@
-# Benchmarks (Milestone 13)
+# Benchmarks
 
 **Status:** implemented and run for real; every number below was produced by an actual
 execution of the benchmarks in this repository on the date noted, not invented or
 estimated — same documentation discipline this project applies everywhere else (see
 e.g. `include/replay/replay_stats.hpp`'s own non-benchmark disclaimer, which is exactly
-the gap this milestone closes).
+the gap these benchmarks close).
 
-This was this project's own long-deferred milestone (originally named "allocation
-profiling, decode throughput benchmarks, end-to-end latency (p50/p99/p99.9), comparison
-of alternative book representations" back when the project was market-data-feed-handler
-only — see `docs/current_system_assessment.md` §9/§12 group 1/§13 Milestone... well,
-the point stands regardless of the old numbering: benchmarking was named and never
-built until now).
+The scope: allocation profiling, decode throughput, end-to-end latency (p50/p99/p99.9),
+and how the trader-side book representation behaves as depth grows.
 
 ---
 
@@ -157,7 +153,7 @@ going from 1 to 1024 price levels (1024x) costs well under 2x more, consistent w
 depth `n` against a book with 1024 distinct levels: ~30 ns for the top 1, ~3.75 μs for
 all 1024 — consistent with `top_bids()` walking `n` `std::map` iterator steps and
 copying `n` `PriceLevelView`s, no unexpected superlinear behavior. This is the read
-path `GET /api/book/:id` and every SSE `"book"` event (Milestone 12) actually exercise
+path `GET /api/book/:id` and every SSE `"book"` event actually exercise
 at `options_.book_depth` (default 10) — ~52 ns per call at that depth, negligible next
 to the HTTP/SSE framing cost around it.
 
@@ -295,23 +291,19 @@ Nagle's algorithm.
   real-network latency number: the live order-entry gateway's request/response round
   trip.
 - **The gateway's own connection-writer poll interval (1 ms) *was* that bottleneck**,
-  identified from a real measurement plus a source read, not assumed — exactly the
-  "measure before optimizing" discipline `docs/current_system_assessment.md` §9
-  explicitly called out as absent in the pre-exchange codebase. Unlike the original
-  version of this document, this was not left as a recorded-but-unfixed finding:
+  identified from a real measurement plus a source read, not assumed — measure
+  before optimizing. It was not left as a recorded-but-unfixed finding:
   §7.2 replaced the sleep-based poll with a condition-variable wakeup notified
   directly from `route_event()` (plus `TCP_NODELAY`, a second latency source the same
   investigation turned up), re-measured p50 end-to-end latency dropping ~17x (~1272 μs
   → ~73 μs) as a direct, verified result — not a projection.
 - **`OrderBook`'s `O(log P)` cancel/modify cost is real but small** at every depth
   tested up to 1024 distinct price levels, consistent with its own documented
-  complexity analysis (`order_book.hpp`) and with `docs/current_system_assessment.md`
-  §10's judgment that `std::map`/`std::list` is "fine for book reconstruction at
-  today's scale."
+  complexity analysis (`order_book.hpp`): `std::map`/`std::list` is fine for book
+  reconstruction at this scale.
 - **No object pools, no allocation-avoidance work, and no CPU affinity/pinning were
-  added anywhere in this milestone** — consistent with this project's own stated
-  principle (`docs/current_system_assessment.md` §9's "premature vs. useful
-  optimizations" framing) of not reaching for those without a measured need, and
+  added anywhere for these benchmarks** — consistent with this project's principle of
+  not reaching for those without a measured need, and
   nothing measured here shows one: every hot-path cost identified is either already
   small (codec/matching/book/queue) or dominated by a design choice (the writer
   thread's poll interval) that no allocator or cache-layout change would fix.

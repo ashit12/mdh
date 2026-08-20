@@ -8,20 +8,16 @@
 
 // Explicit big-endian (network byte order) byte encode/decode helpers.
 //
-// Milestone 1 used little-endian, since it was a file-only format with no
-// wire transport. Milestone 2 adds UDP, and there is no good reason for a
-// replay file to use a different byte order than what actually goes out on
-// the wire -- a market-data recording should be a raw capture of exactly
-// what a receiver would see. So both file replay and UDP now share this
-// one encoding, and it is big-endian to match the conventional "network
-// byte order" of every other wire protocol (the same reason htons/htonl
-// exist in the sockets API).
+// Files and UDP share one encoding, so a replay file is a raw capture of
+// exactly the bytes a receiver would see. It is big-endian to match the
+// "network byte order" convention every other wire protocol follows, and
+// that htons/htonl exist for.
 //
-// We deliberately do not memcpy structs onto/off of the wire: struct layout
-// depends on compiler padding, alignment, and host endianness, none of which
-// are safe assumptions for a binary protocol. Every helper here reads or
-// writes one byte at a time via shifts, so the result is correct regardless
-// of host endianness and never performs an unaligned/reinterpret_cast read.
+// Structs are deliberately never memcpy'd onto or off the wire: their layout
+// depends on the compiler's padding and alignment and on host endianness,
+// none of which are safe assumptions for a binary protocol. Every helper
+// here reads and writes a byte at a time with shifts, so it is correct on
+// any host and never performs an unaligned or reinterpreted read.
 //
 // Callers (encoder.cpp/decoder.cpp) only ever call put_u16/get_u16 etc. --
 // they never needed to know or care which byte order this file picks, which

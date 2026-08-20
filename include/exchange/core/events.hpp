@@ -5,36 +5,31 @@
 #include "common/types.hpp"
 #include "exchange/core/types.hpp"
 
-// Transport-independent exchange events -- the exchange's outbound
-// vocabulary, to be emitted by the matching engine (Milestone 2) via an
-// EventSink (see event_sink.hpp). Each event carries enough information for
-// every downstream consumer -- execution reports, ledger updates,
-// market-data publication, journaling, tests -- to act independently,
-// without reaching back into matcher-internal state. One command can, and
-// often will, produce more than one of these: a single crossing
-// NewOrderCommand can emit an OrderAccepted, one or more TradeExecuted, and
-// one or more BookOrder{Reduced,Removed} for the resting side(s) it traded
-// against. Aggregate counters are not a substitute for this -- a consumer
-// needs the discrete sequence, not just how many of each kind occurred.
+// The exchange's outbound vocabulary: what the matching engine emits through
+// an EventSink, with no knowledge of any transport. Each event carries
+// enough for every consumer -- execution reports, the ledger, market data,
+// the journal, tests -- to act on its own without reaching back into engine
+// internals.
 //
-// BookOrderAdded/BookOrderReduced/BookOrderRemoved deliberately do NOT carry
-// account_id/client_order_id: they describe changes to visible book depth
-// the way a market observer would see them (comparable to an L3 feed, which
-// shows an exchange_order_id but never whose order it is), whereas
-// OrderAccepted/OrderRejected/OrderCancelled/OrderReplaced/TradeExecuted are
-// private, account-addressed events. Keeping that split in the type system
-// now is what lets Milestone 6's market-data publisher forward the Book*
-// events (and only those) without a filtering step that could otherwise leak
-// private data by omission.
+// One command usually produces several. A crossing new order emits an
+// OrderAccepted, a TradeExecuted per fill, and a BookOrderReduced or
+// BookOrderRemoved for each resting order it consumed. Consumers need that
+// discrete sequence, not a count of how many of each kind occurred.
 //
-// Every struct below also defines a defaulted operator== (Milestone 3):
-// replaying the same command journal twice must produce byte-for-byte
-// identical event streams, and the most direct way to assert that in a test
-// is std::vector<ExchangeEvent> equality, which requires each alternative
-// (and std::variant itself) to support ==. Purely additive -- no behavior
-// changes, and defaulted comparison operators do not disqualify these types
-// from remaining aggregates (designated-initializer construction throughout
-// the existing tests is unaffected).
+// ── Public and private events ─────────────────────────────────────────────
+// BookOrderAdded, BookOrderReduced and BookOrderRemoved deliberately carry
+// no account_id or client_order_id. They describe visible book depth the way
+// any market observer sees it -- an exchange order id, never whose order it
+// is. OrderAccepted, OrderRejected, OrderCancelled, OrderReplaced and
+// TradeExecuted are private and addressed to an account.
+//
+// Keeping that split in the type system is what lets the market-data
+// publisher forward the public events, and only those, without a filtering
+// step that could leak private data by omission.
+//
+// Every struct defines a defaulted operator== because replaying the same
+// journal twice must produce identical event streams, and the most direct
+// way to assert that is to compare two vectors of them.
 namespace mdh::exchange {
 
 struct OrderAccepted {
@@ -89,16 +84,16 @@ struct OrderReplaced {
     bool operator==(const OrderReplaced&) const = default;
 };
 
-// One resting-order counterparty to a trade. TradeExecuted carries one of
-// these per side so a single event fully describes both legs -- no consumer
-// needs to correlate two separate events to build one execution report.
+// One side of a trade. TradeExecuted carries one per side, so a single event
+// describes both legs and no consumer has to correlate two events to build
+// one execution report.
 struct TradeCounterparty {
     AccountId account_id;
     ClientOrderId client_order_id;
     ExchangeOrderId exchange_order_id;
-    // Remaining quantity on this order after this trade (0 if now fully
-    // filled) -- lets a consumer distinguish a partial from a complete fill
-    // without re-deriving it from prior state.
+    // What is left on this order after the trade, zero if it is now fully
+    // filled, so a consumer can tell a partial fill from a complete one
+    // without re-deriving it from earlier state.
     Quantity remaining_quantity;
 
     bool operator==(const TradeCounterparty&) const = default;

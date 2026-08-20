@@ -4,26 +4,19 @@
 #include "exchange/core/types.hpp"
 #include "trader/positions/position_tracker.hpp"
 
-// Pre-trade risk checks performed on the trader's own side, before an order
-// is even sent to the exchange (Milestone 9) -- the trader-side mirror of
-// exchange::risk::RiskEngine, checked against trader::positions::
-// PositionTracker instead of exchange::ledger::Ledger. Reuses
-// exchange::RejectReason wholesale rather than inventing a parallel
-// trader-side enum: "insufficient funds," "insufficient position," and
-// "order too large" mean the same thing on both sides of the wire, and
-// RejectReason's own doc comment already scopes it to "only the reasons the
-// next few milestones actually need" -- this is exactly that.
+// Risk checks on the trader's own side, before an order is ever sent -- the
+// mirror of the exchange's risk engine, checked against this trader's own
+// position tracker rather than the exchange's ledger. It reuses the same
+// RejectReason enum instead of inventing a parallel one: insufficient funds,
+// insufficient position and order too large mean the same thing on both
+// sides of the wire.
 //
-// ── Why this exists at all, given the exchange already checks this ───────
-// A real trading firm never trusts a venue's own risk check as its only
-// line of defense -- a firm-side check catches a bad order (or a bug in a
-// future Milestone 10 strategy) *before* it even leaves the building,
-// without waiting on a round trip to find out it would have been rejected
-// anyway, and can enforce firm-specific limits the exchange has no way to
-// know about. See docs/end_to_end_architecture.md's system diagram, which
-// draws "Exchange validation + pre-trade risk" (Milestone 5) and
-// "Trader-side risk" (Milestone 9) as two separate boxes for exactly this
-// reason.
+// ── Why this exists when the exchange checks the same things ─────────────
+// A real trading firm never treats the venue's check as its only line of
+// defence. A firm-side check catches a bad order, or a bug in a strategy,
+// before it leaves the building -- no round trip needed to find out it would
+// have been rejected -- and can enforce firm-specific limits the exchange
+// has no way to know about.
 //
 // ── Why this checks *settled* exposure only, like PositionTracker itself ──
 // See position_tracker.hpp's own class comment: this is a best-effort

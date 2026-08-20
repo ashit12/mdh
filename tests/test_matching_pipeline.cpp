@@ -187,7 +187,7 @@ TEST(MatchingPipeline, CustomProcessorIsInvokedInsteadOfBareEngine) {
 
     // Deliberately never touches a MatchingEngine at all -- proves the
     // pipeline truly substitutes this in place of engine_.process()
-    // (Milestone 7's seam) rather than calling both. Emits a distinctive
+    // (the Processor seam) rather than calling both. Emits a distinctive
     // event a bare engine would never produce for a NewOrderCommand
     // (OrderRejected instead of OrderAccepted+BookOrderAdded), so the
     // assertions below can tell which code path actually ran.

@@ -9,7 +9,7 @@
 
 namespace mdh::book {
 
-// Trade messages carry no order_id in this milestone's protocol, so there
+// Trade messages carry no order_id in this protocol, so there
 // is nothing to match a trade back to a specific resting order -- they are
 // treated as informational (statistics only) and do not mutate book depth.
 // AddOrder/CancelOrder/ModifyOrder are the only book mutators.

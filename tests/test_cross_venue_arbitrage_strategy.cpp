@@ -6,7 +6,7 @@
 #include "book/order_book.hpp"
 #include "trader/strategies/cross_venue_arbitrage_strategy.hpp"
 
-// Composition-level unit tests for CrossVenueArbStrategy (Milestone 11) --
+// Composition-level unit tests for CrossVenueArbStrategy --
 // two fake Senders stand in for two independent venues' wires (same
 // FakeSender pattern test_market_maker_strategy.cpp and
 // test_trader_risk_gated_oms.cpp use), and book::OrderBook instances are

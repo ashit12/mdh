@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <vector>
 
-// Milestone 15: a high-resolution monotonic tick source, plus the honest
+// A high-resolution monotonic tick source, plus the honest
 // characterisation of its own limits, for measuring individual
 // matching-engine operations whose true cost is in the low hundreds of
 // nanoseconds.

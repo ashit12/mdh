@@ -1,15 +1,13 @@
-# Failure injection (Milestone 14)
+# Failure injection
 
 **Status:** implemented and run for real, including under ThreadSanitizer (see §4) —
-same documentation discipline `docs/benchmarks.md` applies to Milestone 13's numbers,
-applied here to *behavior* instead: every claim below is backed by an actual test in
+same documentation discipline `docs/benchmarks.md` applies to its numbers, applied
+here to *behavior* instead: every claim below is backed by an actual test in
 this repository that drives the live, networked gateway (not the codec in isolation)
 with deliberately adversarial bytes and asserts on the observed outcome.
 
-This closes the other half of the milestone `docs/current_system_assessment.md`
-originally named "failure injection tests (drop packets, corrupt messages, disconnect
-mid-stream)" — Milestone 13 (`docs/benchmarks.md`) covered *performance*; this covers
-*robustness*.
+Where `docs/benchmarks.md` covers *performance*, this covers *robustness*: dropped
+packets, corrupt messages, and disconnects mid-stream.
 
 ---
 
@@ -86,7 +84,7 @@ both cases over a real socket.
 
 ## 4. UI gateway UDP market-data fault matrix (`tests/test_failure_injection_market_data.cpp`)
 
-Five tests against `UiGateway::market_data_loop()` (Milestone 12), sending hand-built
+Five tests against `UiGateway::market_data_loop()`, sending hand-built
 raw UDP datagrams directly to its market-data port — bypassing `MarketDataPublisher`
 entirely so every test has full, deliberate control over exactly what "goes wrong" on
 the wire, then asserting on the live order book exposed via `GET /api/book/:id`.

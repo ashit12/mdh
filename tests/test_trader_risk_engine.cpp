@@ -2,7 +2,7 @@
 
 #include "trader/risk/trader_risk_engine.hpp"
 
-// Pure-logic unit tests for TraderRiskEngine (Milestone 9) -- mirrors
+// Pure-logic unit tests for TraderRiskEngine -- mirrors
 // test_risk_engine.cpp's own structure exactly, checked against a
 // PositionTracker instead of an exchange::ledger::Ledger.
 using namespace mdh;

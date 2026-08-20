@@ -1,4 +1,4 @@
-// Milestone 13: SpscQueue<T> throughput -- single-threaded push/pop cost in
+// SpscQueue<T> throughput -- single-threaded push/pop cost in
 // isolation, and genuine two-thread producer/consumer throughput (the
 // number that actually matters for every pipeline this queue backs:
 // net::run_udp_listen()'s producer/consumer pair and every per-connection

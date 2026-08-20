@@ -1,12 +1,10 @@
-// Milestone 13: real end-to-end order-entry latency -- submit a NewOrder
+// Real end-to-end order-entry latency -- submit a NewOrder
 // over a real loopback TCP connection to a real, fully-wired
 // OrderEntryGateway (risk + ledger + matching, exactly as
 // tests/test_order_entry_gateway_e2e.cpp exercises it) and measure the wall
 //-clock time until this same connection's Accepted response is fully
-// decoded. This is the "end-to-end latency (p50/p99/p99.9)" this project's
-// own roadmap named as a deferred benchmark
-// (docs/current_system_assessment.md §9/§12) and it is measured here for
-// real, with real numbers recorded in docs/benchmarks.md -- never invented,
+// decoded. This is the end-to-end latency distribution (p50/p99/p99.9),
+// measured for real, with real numbers recorded in docs/benchmarks.md -- never invented,
 // matching this project's own documentation discipline (see e.g.
 // replay_stats.hpp's explicit non-benchmark disclaimer this project already
 // carries).

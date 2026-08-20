@@ -19,96 +19,70 @@
 #include "trader/positions/position_tracker.hpp"
 #include "trader/risk/trader_risk_gated_oms.hpp"
 
-// httplib.h is a single vendored header (FetchContent, see CMakeLists.txt) --
-// forward-declared here instead of #included so every other translation
-// unit that merely includes this header (e.g. apps/trading_server/main.cpp)
-// does not have to compile against it too; only ui_gateway.cpp needs the
-// full definition. Every handler below takes/returns these only by
-// reference/pointer, so a forward declaration is enough.
+// httplib.h is a single vendored header, forward-declared here rather than
+// included so that every translation unit including this one does not have
+// to compile it too -- only ui_gateway.cpp needs the definition. Every
+// handler below takes these by reference or pointer, so this is enough.
 namespace httplib {
 class Server;
 struct Request;
 struct Response;
 } // namespace httplib
 
-// Milestone 12: the UI gateway -- a REST + Server-Sent-Events front door
-// that finally lets a browser dashboard (ui/, a separate React project)
-// observe and trade against a *live*, running exchange, closing two gaps
-// documented as open in docs/exchange_flow.md's "Integration status":
-// there was previously no long-running gateway process, and
-// market_data::MarketDataPublisher was never wired into one. See
-// apps/trading_server/main.cpp, the first thing in this codebase that
-// actually does both.
+// A REST and Server-Sent-Events front door, so a browser dashboard (ui/, a
+// separate React project) can watch and trade against a live exchange. See
+// apps/trading_server, which runs this alongside the exchange gateway.
 //
-// ── Why a library (cpp-httplib) instead of hand-rolling HTTP, unlike every
-//    other wire protocol in this project ──────────────────────────────────
-// Milestones 1-11 all hand-rolled their own wire format on purpose (see
-// e.g. protocol/order_entry/messages.hpp's own class comment) because the
-// *point* of those milestones was understanding and implementing exactly
-// those bytes. HTTP/1.1 framing and RFC6455 WebSocket handshakes are not
-// this milestone's teaching point -- exposing exchange/trader state to a
-// browser is -- so a small, mature, single-header library is used instead,
-// the same "don't reinvent what isn't the point" judgment call this
-// project applies elsewhere (e.g. using std::function instead of a
-// hand-rolled vtable for EventSink, see event_sink.hpp).
+// ── Why a library for HTTP, when every other protocol here is hand-rolled ─
+// The other wire formats in this project are hand-rolled on purpose: the
+// point of writing them was understanding exactly those bytes. HTTP framing
+// is not the point here -- getting exchange state into a browser is -- so a
+// small, mature, single-header library does that job instead. The same
+// judgement that uses std::function for EventSink rather than a hand-rolled
+// vtable.
 //
-// ── Why Server-Sent Events, not a WebSocket, for the live push channel ───
-// cpp-httplib has no WebSocket support at all, and every actively-maintained
-// standalone C++ WebSocket library evaluated for this milestone was either
-// far too new/unproven to depend on or dragged in a much larger dependency
-// footprint (Boost.Asio, OpenSSL, etc.) than this read-mostly dashboard
-// warrants. SSE needs nothing beyond what cpp-httplib already provides
-// (chunked responses over plain HTTP, see UiGateway::handle_stream()'s own
-// comment) and the browser's native EventSource API needs zero client-side
-// dependencies either -- a better fit than pulling in a second, riskier
-// library just to satisfy the letter of "WebSocket" when the actual
-// requirement (server -> browser live push) is served just as well by SSE.
+// ── Why Server-Sent Events rather than a WebSocket ────────────────────────
+// The traffic is one-directional: the server pushes updates, and the browser
+// sends orders over ordinary REST. SSE is just a long-lived chunked HTTP
+// response, which the HTTP library already supports and the browser's native
+// EventSource API consumes with no client-side dependency at all. Every
+// standalone C++ WebSocket library considered was either too new to rely on
+// or brought a far larger dependency (Boost.Asio, OpenSSL) than a
+// read-mostly dashboard justifies.
 //
-// ── Why per-account trading sessions reuse Milestones 8-9 wholesale ───────
-// Each UI account is backed by exactly the same TraderRiskGatedOms +
-// OrderEntryClient pair a Milestone 10/11 strategy uses -- the UI gateway
-// process connects to the exchange gateway's TCP port over real loopback
-// TCP, exactly like a strategy or a CLI trader would, rather than reaching
-// into RiskGatedEngine/MatchingPipeline directly. Slower than an in-process
-// call, immaterially so for a browser-driven dashboard, and it means this
-// class adds zero new trading logic of its own -- it is purely a protocol
-// adapter (HTTP/SSE <-> the existing order-entry wire protocol).
+// ── Why sessions go over real TCP instead of calling in-process ───────────
+// Each account here is backed by the same trader-side OMS and client a
+// strategy uses, connected to the exchange gateway's TCP port over loopback
+// exactly as an external strategy would be. Slower than an in-process call,
+// immaterially so for a dashboard, and it means this class holds no trading
+// logic of its own -- it is purely an adapter between HTTP and the
+// order-entry protocol.
 //
-// ── Why a fixed, pre-seeded demo account catalog, not free-form account_id ──
-// exchange::ledger::Ledger::deposit_cash()/deposit_position() are
-// documented as safe only "before traffic that could race with it begins"
-// (ledger.hpp's own class comment) -- Ledger has no internal
-// synchronization, by design, because the matching thread is its only
-// normal caller. Seeding a brand-new account the instant an HTTP request
-// mentions it for the first time would call deposit_cash() concurrently
-// with the matching thread possibly processing *other* accounts' live
-// commands, a genuine data race on Ledger's internal accounts_ map (e.g. a
-// concurrent rehash). Pre-seeding a small fixed set of demo accounts once,
-// before the exchange gateway's start() is ever called (see
-// apps/trading_server/main.cpp), sidesteps that race entirely without
-// weakening Ledger's existing single-writer contract -- exactly the
-// deliberate, narrow, documented scope choice this codebase prefers over a
-// speculative concurrency fix nothing else in Milestones 1-11 needed. Each
-// Session's own local PositionTracker mirror (trader/positions/) has no
-// such restriction -- it is UI-gateway-process-local state, guarded by
-// sessions_mutex_ below, so lazily constructing a Session's local mirror
-// balances the first time a *pre-seeded* account_id is referenced is safe.
+// ── Why a fixed set of pre-seeded demo accounts ───────────────────────────
+// The ledger has no internal locking, by design, because the matching thread
+// is its only normal caller -- so seeding is safe only before any traffic
+// that could race with it. Creating an account the moment an HTTP request
+// first mentioned it would call into the ledger while the matching thread
+// was processing other accounts' commands, a real data race on its account
+// map. Seeding a small fixed set once, before the exchange gateway starts,
+// avoids that without weakening the ledger's single-writer contract.
+//
+// Each session's own local position mirror has no such restriction: it is
+// local to this process and guarded by sessions_mutex_, so building one
+// lazily for an already-seeded account is fine.
 namespace mdh::ui_gateway {
 
 struct UiGatewayOptions {
-    // The complete set of account ids this UI gateway will ever serve --
-    // see class-level comment on why this must be decided up front rather
-    // than accepting an arbitrary account_id from an HTTP request. A
-    // request naming any other account_id gets a 404 (see
-    // UiGateway::find_or_create_session()).
+    // Every account this gateway will ever serve -- see the class comment on
+    // why this is fixed up front rather than taken from a request. Any other
+    // account id gets a 404.
     std::vector<exchange::AccountId> demo_account_ids{1001, 1002, 1003};
 
-    // Instruments seeded with a starting position for every demo account
-    // (see class-level comment), so a fresh account can demonstrate selling
-    // immediately. This UI accepts an order on any InstrumentId, but the
-    // exchange behind it does not: apps/trading_server hands this same list
-    // to OrderEntryGatewayOptions::instruments, so an order on anything else
-    // comes back rejected with InvalidInstrument.
+    // Instruments seeded with a starting position for every demo account, so
+    // a fresh account can sell straight away. This UI will accept an order
+    // on any instrument, but the exchange behind it will not: trading_server
+    // hands this same list to the exchange gateway, so anything else comes
+    // back rejected with InvalidInstrument.
     std::vector<InstrumentId> demo_instrument_ids{1, 2};
 
     trader::positions::Balance demo_starting_cash = 1'000'000'0000; // ticks; see common/types.hpp's Price scale
@@ -120,12 +94,10 @@ struct UiGatewayOptions {
     // included in every SSE book snapshot.
     std::size_t book_depth = 10;
 
-    // If non-empty and the directory exists, served as static files at "/"
-    // (cpp-httplib's set_mount_point) -- e.g. ui/dist after `npm run
-    // build`, so `trading_server` alone can serve the whole dashboard with
-    // no separate web server. Left empty (the default) serves no static
-    // files at all -- e.g. every test in tests/test_ui_gateway.cpp, which
-    // only cares about the JSON API and never runs `npm run build` first.
+    // If set and the directory exists, served as static files at "/" -- e.g.
+    // ui/dist after `npm run build`, so trading_server alone can serve the
+    // whole dashboard with no separate web server. Empty serves nothing,
+    // which is what the tests want: they only exercise the JSON API.
     std::string static_files_dir;
 };
 
@@ -140,22 +112,17 @@ struct BookLevel {
 
 class UiGateway {
 public:
-    // `exchange_gateway` must already have every id in
-    // options.demo_account_ids pre-seeded (deposit_cash()/
-    // deposit_position()) and must NOT have start() called yet when this
-    // constructor runs -- see class-level comment. `exchange_tcp_port` is
-    // where this gateway's own per-account OrderEntryClients will connect
-    // (127.0.0.1 only, same restriction as OrderEntryClient::connect());
-    // `market_data_udp_port` is where this gateway's own background
-    // book-reconstruction thread listens -- must match whatever port
-    // `exchange_gateway`'s OrderEntryGatewayOptions::extra_event_sink was
-    // wired to publish market data on (see apps/trading_server/main.cpp;
-    // neither this class nor OrderEntryGateway itself enforces that
-    // agreement -- it is the caller's responsibility, the same way a real
-    // market-data multicast address/port is agreed out of band).
-    // `http_port` of 0 lets the OS assign an ephemeral port, discoverable
-    // via local_http_port() once started() -- the same convention
-    // OrderEntryGateway::local_port() uses.
+    // `exchange_gateway` must already have every demo account seeded, and
+    // must not have been started yet -- see the class comment.
+    //
+    // `exchange_tcp_port` is where this gateway's own per-account clients
+    // connect, on 127.0.0.1 only. `market_data_udp_port` is where its
+    // book-reconstruction thread listens, and must match the port the
+    // exchange gateway was wired to publish on; nothing enforces that
+    // agreement, exactly as a real feed's address is agreed out of band.
+    //
+    // An `http_port` of 0 lets the OS pick one, readable afterwards from
+    // local_http_port().
     UiGateway(exchange::gateway::OrderEntryGateway& exchange_gateway, std::uint16_t exchange_tcp_port,
                std::uint16_t market_data_udp_port, std::uint16_t http_port, UiGatewayOptions options = {});
 
@@ -172,11 +139,10 @@ public:
     // bind fails (e.g. market_data_udp_port is already in use).
     [[nodiscard]] bool start();
 
-    // Stops the HTTP server, requests-stop and joins the market-data
-    // thread, and disconnects every per-account Session's OrderEntryClient
-    // (which itself joins that client's reader thread -- see
-    // OrderEntryClient::disconnect()). Safe to call more than once,
-    // including implicitly via the destructor.
+    // Stops the HTTP server, stops and joins the market-data thread, and
+    // disconnects every session's client, which joins that client's own
+    // reader thread. Safe to call more than once, including from the
+    // destructor.
     void stop();
 
     [[nodiscard]] std::optional<std::uint16_t> local_http_port() const;
@@ -187,48 +153,39 @@ private:
                  const trader::risk::TraderRiskLimits& limits,
                  trader::oms::OrderManagementSystem::OrderUpdateSink on_update);
 
-        // Declared (and therefore destroyed) before client_ -- client_'s
-        // reader thread calls into gated_ asynchronously, so client_ must
-        // finish tearing down first. Same rationale, same order, as every
-        // RiskGatedTrader test helper in tests/test_*_e2e.cpp.
+        // Declared, and so destroyed, before client_: that client's reader
+        // thread calls into gated_ asynchronously, so the client has to
+        // finish tearing down first.
         trader::risk::TraderRiskGatedOms gated_;
         trader::oms::OrderEntryClient client_;
         bool connected_ = false;
     };
 
-    // Looks up an existing Session for `account_id`, or -- iff account_id
-    // is one of options_.demo_account_ids -- lazily constructs and seeds
-    // one (see class-level comment on why this is safe: only the
-    // process-local PositionTracker mirror is touched here, never
-    // exchange_gateway_'s Ledger). Returns nullptr for any account_id
-    // outside the demo catalog.
+    // Finds the session for `account_id`, or builds one if it is a demo
+    // account. Safe to build lazily because only this process's own position
+    // mirror is touched, never the exchange's ledger. Returns nullptr for
+    // any account outside the demo catalog.
     [[nodiscard]] Session* find_or_create_session(exchange::AccountId account_id);
 
-    // The market-data background thread: a persistent (never idle-timeout
-    // stopping, unlike net::run_udp_listen()) version of the
-    // receive -> unpack_frames -> replay::apply_frame_result() pipeline
-    // apps/market_data_replay's --listen mode already uses, reusing that
-    // exact same decode/sequence/book-application logic -- only "run
-    // forever until stop_source_ says otherwise" is new here. Broadcasts a
-    // fresh book snapshot over SSE for every instrument touched by a batch
-    // (see broadcast_book()). `receiver` is bound by start() itself (so
-    // start() can fail fast and return false if the port is already taken)
-    // and then moved onto this thread -- avoids the alternative of binding
-    // twice (a probe bind that is closed and immediately reopened on the
-    // background thread), which would be a real, if narrow, TOCTOU race.
+    // The market-data thread: the same receive, unpack and apply pipeline
+    // market_data_replay's listen mode uses, except that it runs until
+    // stopped rather than timing out when the feed goes quiet. Broadcasts a
+    // fresh book over SSE for every instrument a batch touched.
+    //
+    // `receiver` is bound by start(), so start() can fail fast on a port
+    // already in use, and then moved onto this thread. Binding twice instead
+    // -- a probe bind, closed and reopened here -- would be a narrow but
+    // real race.
     void market_data_loop(std::stop_token token, net::UdpReceiver receiver);
 
-    // Pushes a "book" SSE event for `instrument_id`'s current top-of-book
-    // (options_.book_depth levels per side).
+    // Pushes a "book" event with the top book_depth levels of each side.
     void broadcast_book(InstrumentId instrument_id);
-    // Pushed as this Session's OrderUpdateSink (see Session's constructor)
-    // -- an "order" SSE event carrying the updated ClientOrder.
+    // Installed as each session's order-update sink: pushes an "order" event
+    // carrying the updated order.
     void broadcast_order(exchange::AccountId account_id, const trader::oms::ClientOrder& order);
 
-    // ── REST handlers -- registered onto *server_ in the constructor,
-    // defined in ui_gateway.cpp. Each takes/returns httplib types by
-    // reference/value exactly as httplib::Server::Get/Post expect; kept as
-    // methods (not lambdas in the constructor) purely for readability.
+    // ── REST handlers, registered in the constructor and defined in the
+    // .cpp. Methods rather than lambdas purely for readability.
     void handle_health(const httplib::Request& req, httplib::Response& res);
     void handle_list_accounts(const httplib::Request& req, httplib::Response& res);
     void handle_get_account(const httplib::Request& req, httplib::Response& res);
@@ -238,17 +195,12 @@ private:
     void handle_replace_order(const httplib::Request& req, httplib::Response& res);
     void handle_stream(const httplib::Request& req, httplib::Response& res);
 
-    // Not otherwise read: kept as a member (rather than just a constructor
-    // parameter this class immediately forgets) purely to document, in the
-    // type system, that a UiGateway is permanently paired with one
-    // specific exchange gateway instance -- exactly the "must have already
-    // been pre-seeded, must not have start() called yet" precondition the
-    // constructor's own doc comment states. Nothing in this milestone's
-    // REST/SSE surface needs to read exchange-side state directly (every
-    // account/order/book view goes through a Session's own
-    // TraderRiskGatedOms or this class's own reconstructed BookManager,
-    // see class-level comment on why), so [[maybe_unused]] rather than
-    // manufacturing a call site that would exist only to silence a warning.
+    // Never actually read. Kept as a member, rather than a constructor
+    // parameter this class forgets, to record in the type system that a
+    // UiGateway is paired with one specific exchange gateway -- the
+    // "already seeded, not yet started" precondition above. Nothing in the
+    // REST or SSE surface reads exchange state directly: every view goes
+    // through a session's own OMS or this class's reconstructed book.
     [[maybe_unused]] exchange::gateway::OrderEntryGateway& exchange_gateway_;
     std::uint16_t exchange_tcp_port_;
     std::uint16_t market_data_udp_port_;
@@ -261,8 +213,7 @@ private:
     std::mutex books_mutex_;
     replay::ReplayOutcome market_data_outcome_; // .books is the live-reconstructed book::BookManager
 
-    // Type-erased so ui_gateway.hpp never has to include httplib.h (see
-    // this file's own top-of-file comment) or json.hpp.
+    // Type-erased so this header never has to include httplib.h or json.hpp.
     class SseHub;
     std::unique_ptr<SseHub> sse_hub_;
 

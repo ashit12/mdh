@@ -8,7 +8,7 @@
 
 namespace mdh::net {
 
-// RAII wrapper over a POSIX TCP stream socket (Milestone 7) -- the
+// RAII wrapper over a POSIX TCP stream socket -- the
 // order-entry gateway's transport primitive, the same role UdpSocket plays
 // for market data. Uses the same BSD sockets API as UdpSocket (shared by
 // Linux and macOS), for the same local-development reason.

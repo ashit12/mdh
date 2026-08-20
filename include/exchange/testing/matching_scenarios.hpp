@@ -9,8 +9,8 @@
 #include "exchange/core/event_sink.hpp"
 #include "exchange/matching/matching_engine.hpp"
 
-// Milestone 15: the small amount of scaffolding every matching-engine
-// benchmark and the stress harness both need -- command builders, a shared
+// The small amount of scaffolding every matching-engine benchmark and the
+// stress harness both need -- command builders, a shared
 // discard sink, and book-seeding helpers -- in one place instead of copied
 // into each benchmark file.
 //
@@ -28,7 +28,7 @@ namespace mdh::exchange::testing {
 // construction is cheap (a captureless lambda fits the small-object buffer,
 // so it does not allocate) but it is not free, and it is *harness* cost, not
 // matching-engine cost -- charging it to the engine would inflate every
-// number in this milestone's baseline. The indirect call *through* the
+// number in the baseline. The indirect call *through* the
 // std::function is left in place, because that one is genuinely part of how
 // the engine emits events today.
 [[nodiscard]] inline const EventSink& discard_events() {

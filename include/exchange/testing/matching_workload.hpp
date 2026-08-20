@@ -17,8 +17,8 @@
 #include "exchange/matching/matching_engine.hpp"
 #include "exchange/testing/matching_scenarios.hpp"
 
-// Milestone 15: a deterministic generator for a realistic mixed order
-// stream, shared by the mixed-workload benchmarks and the stress harness.
+// A deterministic generator for a realistic mixed order stream, shared by
+// the mixed-workload benchmarks and the stress harness.
 //
 // Header-only and test/benchmark-only. It drives MatchingEngine only through
 // the public process() entry point and changes nothing about how the engine

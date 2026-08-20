@@ -11,10 +11,9 @@
 #include "net/tcp_socket.hpp"
 #include "protocol/order_entry/messages.hpp"
 
-// The trader-side network transport for the order-entry protocol
-// (Milestone 8) -- the client-side counterpart to
-// exchange::gateway::OrderEntryGateway's per-connection reader/writer pair
-// (Milestone 7), reusing the exact same net::TcpSocket and
+// The trader-side network transport for the order-entry protocol -- the
+// counterpart to the exchange gateway's per-connection reader and writer
+// pair, reusing the exact same net::TcpSocket and
 // protocol::order_entry:: encoder/decoder the gateway itself uses (the wire
 // format is the only contract between the two sides). Deliberately kept
 // separate from OrderManagementSystem (order_management_system.hpp), which

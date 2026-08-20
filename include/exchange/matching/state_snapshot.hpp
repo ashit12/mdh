@@ -5,19 +5,16 @@
 #include "common/types.hpp"
 #include "exchange/matching/resting_order.hpp"
 
-// A canonical, deterministically-ordered view of a MatchingEngine's entire
-// resting-order state (Milestone 3), used to prove that replaying the same
-// command journal twice ends in the same authoritative state -- not just
-// that it emits the same events along the way. "Canonical" specifically
-// means: independent of std::unordered_map's iteration order (which is not
-// guaranteed to match between two separately-constructed MatchingEngine
-// instances even given identical inputs) -- instruments are sorted
-// ascending by id, and each side's orders are taken from MatchingBook's own
-// price-priority-then-FIFO order, which is already deterministic. An
-// instrument with no resting orders on either side (e.g. every order on it
-// was cancelled or fully filled) is omitted entirely, rather than reported
-// as an empty pair of vectors -- an empty book carries no state worth
-// comparing.
+// A canonical view of an engine's entire resting-order state, used to prove
+// that replaying the same command journal twice ends in the same state --
+// not just that it emitted the same events on the way there.
+//
+// "Canonical" means the order never depends on hash-table iteration, which
+// is not guaranteed to match between two separately-built engines even given
+// identical input. Instruments are sorted by ascending id, and each side's
+// orders come out in the book's own price-then-queue order, which is already
+// deterministic. An instrument with nothing resting is left out entirely
+// rather than reported as an empty pair of vectors.
 namespace mdh::exchange {
 
 struct InstrumentBookSnapshot {

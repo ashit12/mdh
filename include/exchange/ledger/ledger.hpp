@@ -9,60 +9,48 @@
 #include "exchange/core/events.hpp"
 #include "exchange/core/types.hpp"
 
-// Per-account cash and instrument-position balances (Milestone 5), updated
-// by watching the matching engine's own event stream -- the same "one
-// function/object is the single place state changes happen, fed by an
-// EventSink" pattern MatchingEngine itself uses for the book. There is no
-// DepositCommand in this project's command set (out of scope for the
-// current milestones; commands.hpp models trading, not funding), so
-// deposit_cash()/deposit_position() are the only way balances start out
-// non-zero -- test/admin seeding, not something the event stream drives.
+// Per-account cash and position balances, kept up to date by watching the
+// matching engine's event stream -- the same "one place changes state, fed
+// by an EventSink" arrangement the engine itself uses for the book.
 //
-// ── Reservation semantics (the actual design decision here) ───────────────
-// A resting GTC order can outlive many other commands, so the funds/
-// inventory behind it must be locked ("reserved") for as long as it rests --
-// otherwise two GTC orders from the same account could each independently
-// pass a balance check against the same unspent funds. IOC/FOK orders are
-// different: MatchingEngine resolves them completely within a single
-// process() call, with no other command interleaved (matching is single-
-// threaded and one command's whole event sequence is delivered before the
-// next command starts, see MatchingEngine's own class-level comment) -- so
-// there is no window in which a concurrent command could double-spend
-// against an IOC/FOK order's funds, and therefore *no reservation is needed
-// for them at all*. This ledger reserves only for GTC orders (created on
-// OrderAccepted/OrderReplaced when time_in_force == GTC) and settles IOC/FOK
-// fills by debiting/crediting `total` balances directly, with nothing to
-// release afterward. This is what avoids the alternative, genuinely hard
-// problem: IOC's "any unfilled remainder is silently discarded, no event
-// fires for it" behavior (see MatchingEngine::rest_remainder_if_applicable)
-// would otherwise leave a permanently unreleasable reservation with no
-// signal to ever clean it up. Because IOC/FOK never reserve in the first
-// place, that problem never arises.
+// There is no deposit command in this project (commands model trading, not
+// funding), so deposit_cash() and deposit_position() are the only way a
+// balance starts out non-zero. That is admin seeding, not something the
+// event stream drives.
 //
-// A GTC order's reservation is tracked per (account_id, client_order_id) --
-// the same key MatchingEngine itself uses for live_orders_ -- rather than
-// per exchange_order_id, specifically so a replace (which can assign a
-// brand new exchange_order_id via the cancel-plus-new path, see
-// MatchingEngine's replace-policy comment) can still be resolved: an
-// OrderReplaced event always carries both the *original* and *new*
-// client_order_id, letting the ledger release the old hold and open a new
-// one under the new key regardless of which replace path the engine took --
-// the two paths are handled by the exact same code here, uniformly (release
-// whatever remains of the old hold in full, open a fresh one at the new
-// price/quantity), which is arithmetically equivalent to a priority-
-// preserving quantity-only adjustment when the price is unchanged.
+// ── Reservations, which are the real design decision here ─────────────────
+// A resting GTC order can outlive many other commands, so the money behind
+// it has to be locked for as long as it rests. Otherwise two GTC orders from
+// the same account could each pass a balance check against the same unspent
+// funds.
 //
-// A resting order's limit price, not the eventual trade price, is what gets
-// reserved (the worst case the account could be on the hook for). A buy
-// that later trades at a *better* price than its own limit (always possible
-// for the aggressor side of a trade, since trades execute at the resting/
-// passive order's price -- see MatchingEngine::match_and_rest) releases the
-// full limit-price reservation for the filled slice but only actually
-// debits `total` at the true trade price, so the difference reappears in
-// `available` (= total - reserved) automatically, with no separate refund
-// bookkeeping needed. A resting order's own price *is* the trade price by
-// construction, so this refund case never applies to the passive side of a
-// trade, only the aggressor side.
+// IOC and FOK orders are different. The engine resolves them completely
+// inside one process() call, and matching is single-threaded, so no other
+// command can interleave and no double-spend window exists. They therefore
+// need no reservation at all: their fills settle straight against the total
+// balance, with nothing to release afterwards.
+//
+// That is not just a saving. IOC discards any unfilled remainder silently,
+// with no event to observe, so a reservation opened for one would have no
+// signal to ever release it. Never taking one avoids the problem entirely.
+//
+// ── Why holds are keyed on (account, client order id) ─────────────────────
+// Not on exchange order id, because a replace can mint a brand new one when
+// it takes the cancel-plus-new path. An OrderReplaced event always carries
+// both the original and the new client order id, so the ledger can release
+// the old hold and open a new one whichever path the engine took. Both paths
+// run the same code here -- release whatever is left of the old hold, open a
+// fresh one at the new price and quantity -- which comes to the same
+// arithmetic as adjusting the quantity in place when the price is unchanged.
+//
+// ── Why the limit price is reserved, not the trade price ──────────────────
+// The limit price is the worst case the account could owe. An aggressive buy
+// can trade at a better price than its own limit, since trades execute at
+// the resting order's price. When it does, the full limit-price reservation
+// is released for the filled slice but only the true trade price is debited,
+// so the difference reappears in `available` (total minus reserved) by
+// itself, with no refund bookkeeping. A resting order's own price *is* the
+// trade price, so this never applies to the passive side.
 namespace mdh::exchange::ledger {
 
 // Cash is kept on the same fixed-point tick scale as Price (common/

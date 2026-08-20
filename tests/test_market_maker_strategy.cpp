@@ -6,7 +6,7 @@
 #include "book/order_book.hpp"
 #include "trader/strategies/market_maker_strategy.hpp"
 
-// Composition-level unit tests for MarketMakerStrategy (Milestone 10) -- a
+// Composition-level unit tests for MarketMakerStrategy -- a
 // fake Sender stands in for the wire (same pattern
 // test_trader_risk_gated_oms.cpp uses), a book::OrderBook is built directly
 // (no BookManager/StrategyRuntime needed to exercise the strategy's own

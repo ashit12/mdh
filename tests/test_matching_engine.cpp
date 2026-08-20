@@ -457,7 +457,7 @@ TEST(MatchingEngine, SameAccountOrdersCrossNormally) {
     ASSERT_TRUE(holds<TradeExecuted>(out.events[1]));
     const auto& trade = out.at<TradeExecuted>(1);
     EXPECT_EQ(trade.buyer.account_id, 100u);
-    EXPECT_EQ(trade.seller.account_id, 100u); // no self-trade prevention in this milestone
+    EXPECT_EQ(trade.seller.account_id, 100u); // no self-trade prevention
 }
 
 TEST(MatchingEngine, EventSequenceNumbersAreStrictlyIncreasingAcrossCommands) {

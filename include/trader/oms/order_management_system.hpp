@@ -9,13 +9,11 @@
 #include "protocol/order_entry/messages.hpp"
 #include "trader/oms/client_order.hpp"
 
-// The trader-side order management system (Milestone 8): the piece that
-// turns a strategy's (a later milestone's) "buy/sell/cancel/replace" intent
-// into wire-level protocol::order_entry:: requests, and turns the gateway's
-// (Milestone 7) wire-level responses back into a queryable, per-order state
-// machine (see client_order.hpp) -- without itself knowing anything about
-// sockets. Networking is injected via two function-shaped seams instead of
-// this class owning an OrderEntryClient directly:
+// The trader-side order management system: it turns a strategy's
+// buy/sell/cancel/replace intent into wire requests, and turns the gateway's
+// responses back into a per-order state machine the strategy can query --
+// all without knowing anything about sockets. Networking is injected through
+// two function-shaped seams rather than owning a client directly:
 //
 //   - `Sender` (constructor parameter): how a wire Message gets sent.
 //   - `handle_message()` (public method): how a wire Message that arrived
@@ -59,8 +57,8 @@ namespace mdh::trader::oms {
 
 // One trade fill, addressed to a single tracked order -- OrderManagementSystem's
 // own output contract for anything downstream that needs to *settle* a
-// trade (Milestone 9's trader::positions::PositionTracker) rather than just
-// observe an order's lifecycle state. Deliberately a distinct type from
+// trade -- the position tracker -- rather than just observe an order's
+// lifecycle state. Deliberately a distinct type from
 // protocol::order_entry::TradeReport, which carries only what fit on the
 // wire: TradeReport has no `side` field (see messages.hpp's own comment),
 // because the gateway already knows which connection it's routing to and
@@ -100,11 +98,10 @@ public:
     using OrderUpdateSink = std::function<void(const ClientOrder&)>;
 
     // Invoked once per TradeReport, in addition to (and after) the
-    // corresponding OrderUpdateSink call for the same event -- the seam
-    // Milestone 9's PositionTracker hooks into via sink() below, mirroring
-    // exchange::ledger::Ledger::apply()/sink()'s own EventSink-subscriber
-    // pattern. Optional, like OrderUpdateSink: a caller with no need to
-    // settle fills (e.g. Milestone 8's own tests) simply never sets it.
+    // corresponding OrderUpdateSink call for the same event -- the seam the
+    // position tracker hooks into via sink() below, mirroring how the
+    // exchange's ledger subscribes to events. Optional, like OrderUpdateSink:
+    // a caller with no need to settle fills simply never sets it.
     using FillSink = std::function<void(const Fill&)>;
 
     // `fill_sink` is typically `positions::PositionTracker::sink()`

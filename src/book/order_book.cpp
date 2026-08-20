@@ -72,10 +72,9 @@ std::optional<BookError> OrderBook::modify_order(OrderId id, Price new_price, Qu
     const Side side = loc.side;
     erase_at(loc);
     order_index_.erase(it);
-    // Re-added at the back of the (possibly new) level: modify always
-    // loses time priority in this milestone, even for a quantity-only
-    // decrease where a real exchange would preserve it. Simpler to reason
-    // about and test; revisit if a later milestone needs the distinction.
+    // Re-added at the back of the (possibly new) level: a modify always
+    // loses time priority here, even for a quantity-only decrease where a
+    // real exchange would keep it. Simpler to reason about and to test.
     insert_at(side, id, new_price, new_qty);
     return std::nullopt;
 }

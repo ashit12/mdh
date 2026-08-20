@@ -29,7 +29,7 @@ namespace {
 // Side has no to_string()/parser anywhere else in this codebase (unlike
 // OrderType/TimeInForce/RejectReason, which exchange/core/types.hpp
 // already provides for logging purposes) -- these exist purely for this
-// milestone's JSON boundary, not because trading logic needs them.
+// file's JSON boundary, not because trading logic needs them.
 [[nodiscard]] std::string side_to_string(Side side) { return side == Side::Buy ? "Buy" : "Sell"; }
 
 [[nodiscard]] std::optional<Side> parse_side(const std::string& text) {

@@ -39,7 +39,7 @@ struct OrderView {
 // indexed by (price - base_price) would make the level lookup O(1) at the
 // cost of wasted space for sparse price ranges and a linear best-price
 // scan when the top level empties; std::map was chosen for simplicity and
-// because book depth in this milestone's synthetic feeds is small enough
+// because book depth in this project's synthetic feeds is small enough
 // that the log(P) factor is negligible next to memory-allocation costs
 // elsewhere in the pipeline.
 class OrderBook {

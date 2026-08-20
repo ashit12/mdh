@@ -13,10 +13,10 @@ namespace mdh::net {
 // so this works for local development even though the project is
 // Linux-oriented overall.
 //
-// Deliberately minimal for milestone 2: `send_to` takes an IPv4
-// dotted-decimal literal (e.g. "127.0.0.1"), not a hostname -- there is no
-// DNS resolution (no getaddrinfo) here, since every use case in this
-// milestone is a literal loopback or LAN address. IPv6 is out of scope.
+// Deliberately minimal. `send_to` takes an IPv4 dotted-decimal literal such
+// as "127.0.0.1", not a hostname: there is no DNS resolution here, since
+// every use in this project is a loopback or LAN address. IPv6 is out of
+// scope.
 //
 // Not copyable (owns a single fd); movable.
 class UdpSocket {

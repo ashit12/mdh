@@ -9,10 +9,10 @@
 
 // Composes TraderRiskEngine + positions::PositionTracker + a real
 // OrderManagementSystem behind (almost exactly) OMS's own submit_new_order()/
-// cancel_order()/replace_order() surface (Milestone 9) -- the trader-side
+// cancel_order()/replace_order() surface -- the trader-side
 // mirror of exchange::risk::RiskGatedEngine, which composes RiskEngine +
 // Ledger + MatchingEngine behind MatchingEngine::process()'s own signature
-// the same way. A future Milestone 10 strategy can hold either a bare
+// the same way. A strategy can hold either a bare
 // OrderManagementSystem or this and call the same three methods either way,
 // exactly the drop-in-substitution property RiskGatedEngine documents for
 // itself.

@@ -6,16 +6,10 @@
 #include "exchange/matching/matching_engine.hpp"
 #include "exchange/risk/risk_engine.hpp"
 
-// Composes RiskEngine + Ledger + MatchingEngine behind exactly
-// MatchingEngine::process()'s own signature (Milestone 5) -- a drop-in
-// replacement anywhere a bare MatchingEngine is used today, e.g. in place
-// of the `engine_.process(*command, sink_)` call inside
-// exchange::sequencing::MatchingPipeline's matching thread (Milestone 4),
-// though wiring that substitution in is left to whichever later milestone
-// actually needs risk-gating live (this milestone's own tests drive
-// RiskGatedEngine directly, single-threaded, which is sufficient to prove
-// the composition is correct without touching Milestone 4's already-tested
-// pipeline code).
+// Composes the risk engine, the ledger and the matching engine behind
+// exactly the matching engine's own process() signature, so it drops in
+// anywhere a bare engine is used -- notably as the pipeline's processor,
+// which is how the gateway wires risk in.
 //
 // ── Why risk-check and ledger-update must share one thread with matching ──
 // The architecture diagram (docs/end_to_end_architecture.md) places

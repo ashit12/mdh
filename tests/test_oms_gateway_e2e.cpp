@@ -7,9 +7,9 @@
 #include "trader/oms/order_entry_client.hpp"
 #include "trader/oms/order_management_system.hpp"
 
-// The Milestone 8 loop-closing test: proves the trader-side OMS + client
-// actually interoperate with a real, unmodified OrderEntryGateway
-// (Milestone 7) over a real TCP loopback connection -- the trader-side
+// The loop-closing test for the trader-side OMS: proves the OMS + client
+// actually interoperate with a real, unmodified OrderEntryGateway over a
+// real TCP loopback connection -- the trader-side
 // mirror of tests/test_order_entry_gateway_e2e.cpp, which proved the
 // gateway's own wire behavior using a bare hand-rolled test client. Here the
 // client is the real production one: OrderManagementSystem's state machine

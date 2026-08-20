@@ -79,7 +79,7 @@ struct ClearBook {
 using Event = std::variant<AddOrder, CancelOrder, ModifyOrder, Trade, ClearBook>;
 
 // Fixed on-wire payload size (bytes, not counting the header) for each
-// known message type. All milestone-1 message types are fixed-size; a
+// known message type. Every message type here is fixed-size; a
 // variable-length type would need HEADER_SIZE + payload_size validated
 // against a minimum instead of an exact match.
 [[nodiscard]] constexpr std::size_t payload_size_for(MessageType type) {

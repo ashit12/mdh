@@ -3,36 +3,24 @@
 #include "exchange/core/commands.hpp"
 #include "exchange/core/types.hpp"
 
-// Assigns the authoritative CommandSequence to an inbound ExchangeCommand
-// (Milestone 4). Every NewOrderCommand/CancelOrderCommand/ReplaceOrderCommand
-// struct already has a command_sequence field (Milestone 1), but nothing
-// upstream of this class has ever been the thing that *chooses* that value
-// -- Milestone 2's MatchingEngine and Milestone 3's replay driver both just
-// echo whatever command_sequence a command already carries (e.g. one a test
-// or a journal file supplied). CommandSequencer is that missing piece: the
-// one place that decides what "next" means, so a client (or, later, a
-// gateway) never gets to pick its own authoritative position in the
-// matching order -- only the sequencer does. This matters because the
-// matching engine's whole determinism guarantee rests on commands arriving
-// in one true, gapless order; letting an untrusted upstream assign that
-// order itself would undermine it.
+// Decides the authoritative position of each command in the matching order.
 //
-// Deliberately does NOT define a new "unsequenced command" type (e.g. a
-// NewOrderRequest without a command_sequence field) to represent "a command
-// that hasn't been sequenced yet" -- that would duplicate exchange/core/
-// commands.hpp's three structs into a second, near-identical hierarchy for
-// no benefit at this milestone. A wire-level inbound message genuinely has
-// no command_sequence field (Milestone 7, protocol/order_entry/), which is
-// exactly where that distinction belongs; until then, callers construct an
-// ordinary ExchangeCommand (the command_sequence field is set to whatever
-// placeholder value is convenient, e.g. 0) and sequence() overwrites it
-// unconditionally, discarding whatever was there.
+// Every command struct already has a command_sequence field, but the engine
+// and the replay driver only ever echo whatever value a command arrives
+// with. This class is the one place that chooses it, so a client -- or the
+// gateway acting for one -- never picks its own place in line. The engine's
+// determinism rests on commands arriving in one true, gapless order, and
+// letting an untrusted upstream assign that order would undermine it.
 //
-// Single-writer only: like SpscQueue's head_/tail_ split (common/
-// spsc_queue.hpp), this class is only safe to call from one thread. The
-// plain (non-atomic) counter below relies on that exact same invariant --
-// MatchingPipeline::submit() (matching_pipeline.hpp), the only intended
-// caller, is itself documented as producer-thread-only for this reason.
+// There is deliberately no separate "unsequenced command" type. That would
+// duplicate the three command structs into a near-identical second set for
+// no benefit. A wire-level message genuinely has no sequence field, which is
+// where the distinction properly lives; here, callers build an ordinary
+// command with any placeholder value and sequence() overwrites it.
+//
+// Single writer only, like the SPSC queue: the plain non-atomic counter
+// below depends on it, and the only intended caller is the pipeline's
+// submit(), which is producer-thread-only for the same reason.
 namespace mdh::exchange::sequencing {
 
 class CommandSequencer {

@@ -1,13 +1,9 @@
-# End-to-End Architecture — Trader Side (existing) and Exchange Side (planned)
+# End-to-End Architecture — Trader Side and Exchange Side
 
-**Status:** originally a Milestone 0 deliverable, describing a system where no
-exchange-side production code existed yet. As of Milestone 14, Milestones 1–14 below are
-implemented and tested (see `docs/exchange_flow.md` for the exchange-side walkthrough,
-`docs/benchmarks.md` for Milestone 13, and `docs/failure_injection.md`/`docs/live_demo.md`
-for Milestone 14) — every milestone this document originally scoped is now built. Sections
-below that predate that completion are kept largely as originally written, for history;
-where a section's own claim has since been superseded, a note says so explicitly rather
-than silently rewriting it.
+**Status:** everything described below is implemented and tested. See
+`docs/exchange_flow.md` for the exchange-side walkthrough, `docs/benchmarks.md` for
+performance, and `docs/failure_injection.md`/`docs/live_demo.md` for the hardening
+proof and the live run.
 
 ---
 
@@ -16,10 +12,10 @@ than silently rewriting it.
 **There will be two order-book implementations, and they must never be merged into one
 class just because both hold bids and asks:**
 
-- **`book::OrderBook` (existing, trader side)** reconstructs a view of exchange state
+- **`book::OrderBook` (trader side)** reconstructs a view of exchange state
   *from published market-data events*. It never decides whether two orders cross; it only
   records that an add/cancel/modify *already happened* upstream.
-- **The exchange matching book (new, Milestone 2)** is the *authoritative* book. It accepts
+- **`exchange::matching::MatchingBook`** is the *authoritative* book. It accepts
   inbound commands, decides whether they cross, mutates remaining quantity in place on a
   fill, and is the source of truth that market data is later derived *from*.
 
@@ -35,132 +31,119 @@ just in prose.
 ## 2. System diagram
 
 ```
-┌───────────────────────────── EXCHANGE SIDE (new, not yet built) ─────────────────────────────┐
+┌───────────────────────────────────── EXCHANGE SIDE ──────────────────────────────────────────┐
 │                                                                                                │
 │  Trading client                                                                               │
-│       │ TCP binary order-entry protocol                        (Milestone 7)                 │
+│       │ TCP binary order-entry protocol                                                       │
 │       ▼                                                                                       │
-│  Order-entry gateway ──────────────────────────────────────────  (Milestone 7)                │
+│  Order-entry gateway ──────────────────────────────────────────  exchange/gateway/            │
 │       │                                                                                       │
 │       ▼                                                                                       │
-│  Exchange validation + pre-trade risk ─────────────────────────  (Milestone 5)                │
+│  Exchange validation + pre-trade risk ─────────────────────────  exchange/risk/               │
 │       │                                                                                       │
 │       ▼                                                                                       │
-│  Command sequencer ─────────────────────────────────────────────  (Milestone 4)               │
+│  Command sequencer ─────────────────────────────────────────────  exchange/sequencing/        │
 │       │  strictly increasing CommandSequence                                                  │
 │       ▼                                                                                       │
-│  SPSC queue (reuse common::SpscQueue) ──────────────────────────  (Milestone 4)                │
+│  SPSC queue (common::SpscQueue) ────────────────────────────────  common/spsc_queue.hpp       │
 │       │                                                                                        │
 │       ▼                                                                                        │
 │  ┌─────────────────────────────────────────┐                                                   │
-│  │  MATCHING ENGINE  (Milestone 1 + 2)      │  single-threaded, deterministic                  │
+│  │  MATCHING ENGINE                         │  single-threaded, deterministic                  │
 │  │  ExchangeCommand -> process() -> events  │  owns the AUTHORITATIVE book                     │
 │  └─────────────────────────────────────────┘                                                   │
 │       │                                                                                        │
-│       ├──► Execution reports          (Milestone 7 return path)                                │
-│       ├──► Balance / ledger updates   (Milestone 5)                                             │
-│       ├──► Market-data events         (Milestone 6) ───────────────────────────┐                │
-│       └──► Command journal / replay   (Milestone 3)                            │                │
+│       ├──► Execution reports          (gateway return path)                                    │
+│       ├──► Balance / ledger updates   (exchange/ledger/)                                       │
+│       ├──► Market-data events         (exchange/market_data/) ─────────────────┐                │
+│       └──► Command journal / replay   (exchange/persistence/)                  │                │
 │                                                                                 │                │
 └─────────────────────────────────────────────────────────────────────────────────┼────────────────┘
                                                                                   │
                                                                      UDP market-data feed
-                                                                     (existing wire format,
-                                                                      reused by Milestone 6)
+                                                                   (the same wire format the
+                                                                    trader side already reads)
                                                                                   │
 ┌─────────────────────────────────────────────────────────────────────────────────┼────────────────┐
-│                          TRADER-FIRM SIDE (existing, verified in this milestone)│                │
+│                                    TRADER-FIRM SIDE                             │                │
 │                                                                                  ▼                │
-│  net::UdpReceiver / net::run_udp_listen() ──────────────────────────  EXISTING                    │
+│  net::UdpReceiver / net::run_udp_listen()                                                         │
 │       │  producer thread: receive_batch() → unpack_frames() → DroppingQueue.push()                │
 │       ▼                                                                                           │
-│  replay::apply_frame_result()  ─────────────────────────────────────  EXISTING                    │
+│  replay::apply_frame_result()                                                                     │
 │       │  consumer thread: SequenceValidator classifies; on Missing + configured                    │
 │       │  snapshot path, replay::read_snapshot() recovers instead of stopping                       │
 │       ▼                                                                                            │
-│  book::BookManager / book::OrderBook  ──────────────────────────────  EXISTING                     │
+│  book::BookManager / book::OrderBook                                                               │
 │       │  reconstructed, non-authoritative view — "what the exchange published so far"              │
 │       ▼                                                                                            │
-│  Strategy runtime ─────────────────────────────────────────────────  (Milestones 10-11)             │
+│  Strategy runtime ─────────────────────────────────────────────────  trader/strategies/            │
 │       ▼                                                                                            │
-│  Trader-side risk ─────────────────────────────────────────────────  (Milestone 9)                 │
+│  Trader-side risk ─────────────────────────────────────────────────  trader/risk/                  │
 │       ▼                                                                                            │
-│  OMS ──────────────────────────────────────────────────────────────  (Milestone 8)                 │
+│  OMS ──────────────────────────────────────────────────────────────  trader/oms/                   │
 │       ▼                                                                                            │
-│  TCP order-entry client ────────────────────────────────────────────  (Milestone 8) ───────────────┘
+│  TCP order-entry client ────────────────────────────────────────────  trader/oms/ ─────────────────┘
 │       (connects back up to the exchange gateway at the top of this diagram)
 │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-                     Outside the latency-sensitive path on both halves, but now wired
+                     Outside the latency-sensitive path on both halves, wired
                      into a real running process (apps/trading_server/main.cpp):
-                     UI gateway (REST + Server-Sent Events) + React dashboard  (Milestone 12)
+                     UI gateway (REST + Server-Sent Events) + React dashboard
                           │
                           ├──► listens to the same UDP market-data feed above, in its own
                           │    background thread, to reconstruct a live book::BookManager
                           └──► holds one TraderRiskGatedOms + OrderEntryClient per UI
                                account, connected back to the order-entry gateway over
-                               real loopback TCP -- exactly like Milestones 8-11's own
-                               traders/strategies, just driven by HTTP requests instead
+                               real loopback TCP -- exactly like any other trader or
+                               strategy, just driven by HTTP requests instead
 ```
 
-**Status of the milestone numbers in the diagram above, as of this writing:**
-Milestones 1–11 are built and tested (see `docs/exchange_flow.md` for 1–9's own
-walkthrough, and its "Milestones 10-11" section below the milestone-by-milestone
-list for the strategy layer) — this includes the "EXCHANGE SIDE" box in full (the
-order-entry gateway really does sit in front of a risk-gated matching engine
-today, over a real TCP socket) and, in the "TRADER-FIRM SIDE" box, the OMS + TCP
-order-entry client (Milestone 8) that closes the loop back up into that same
-gateway — proven by `tests/test_oms_gateway_e2e.cpp` — trader-side positions/P&L
-and a second, independent trader-side risk check (Milestone 9,
-`trader::risk::TraderRiskGatedOms`, wrapping that same OMS+client pair) —
-proven by `tests/test_trader_risk_gated_oms_e2e.cpp` — and now a strategy layer
-sitting on top of all of that (Milestones 10-11, `trader::strategies::
-StrategyRuntime`/`MarketMakerStrategy`/`CrossVenueArbStrategy`), proven by
-`tests/test_market_maker_strategy_e2e.cpp` (a real market maker quoting,
-getting filled, and requoting over a real gateway) and
-`tests/test_cross_venue_arbitrage_strategy_e2e.cpp` (two complete, independent
-exchange stacks running side by side, with one strategy trading both). The UDP
-market-data path in that same box predates this document (labeled "EXISTING"
-above) and is untouched — `StrategyRuntime` is unit-tested against synthetic
-market-data events the same way `replay::apply_frame_result()` itself is, but
-is not yet fed by a live UDP feed against a running gateway; strategies
-remain driven by their own e2e tests' simulated book updates, not a live feed.
+Every box in the diagram is built and tested; `docs/exchange_flow.md` walks
+through each in turn. The order-entry gateway really does sit in front of a
+risk-gated matching engine, over a real TCP socket, and the trader side's OMS +
+TCP order-entry client closes the loop back up into that same gateway (proven by
+`tests/test_oms_gateway_e2e.cpp`), with trader-side positions/P&L and a second,
+independent risk check on top (`trader::risk::TraderRiskGatedOms`, proven by
+`tests/test_trader_risk_gated_oms_e2e.cpp`) and a strategy layer above that
+(`trader::strategies::StrategyRuntime`/`MarketMakerStrategy`/
+`CrossVenueArbStrategy`, proven by `tests/test_market_maker_strategy_e2e.cpp`
+and `tests/test_cross_venue_arbitrage_strategy_e2e.cpp` — the latter running two
+complete, independent exchange stacks side by side with one strategy trading
+both).
 
-As of Milestone 12, `MarketDataPublisher` *is* now wired into a live,
-long-running process: `apps/trading_server/main.cpp` constructs an
-`OrderEntryGateway` with a new, purely additive
+`MarketDataPublisher` is wired into a live, long-running process:
+`apps/trading_server/main.cpp` constructs an
+`OrderEntryGateway` with a purely additive
 `OrderEntryGatewayOptions::extra_event_sink` hook that fans every matching-
 thread event out to `MarketDataPublisher` in addition to `RiskGatedEngine`'s
-own `Ledger` wiring, publishing real UDP frames on a configurable port. A new
+own `Ledger` wiring, publishing real UDP frames on a configurable port.
 `ui_gateway::UiGateway` (`include/ui_gateway/`, `src/ui_gateway/`) listens to
 that same UDP port in its own background thread to reconstruct a live
 `book::BookManager` (reusing the trader side's own
 `replay::apply_frame_result()` pipeline, exactly like `market_data_replay
 --listen` already does, just never stopping on idle), and exposes it — plus
 one `TraderRiskGatedOms` + `OrderEntryClient` session per pre-seeded demo
-account, connected back to the gateway over real loopback TCP just like a
-Milestone 8-11 trader would — as a REST + Server-Sent-Events API
+account, connected back to the gateway over real loopback TCP just like any
+other trader — as a REST + Server-Sent-Events API
 (`cpp-httplib`, a small vendored header-only library — see
 `ui_gateway.hpp`'s own comment on why a library was used here specifically,
 unlike every hand-rolled wire format elsewhere in this project) for a
 separate React + Vite + TypeScript dashboard (`ui/`) to render and trade
-against. `StrategyRuntime` is still not fed by this live feed — that remains
-open, see Milestone 12's own entry in section 4's table below — but the live
-feed itself now exists and is exercised end to end by
-`tests/test_ui_gateway.cpp`. As of Milestone 14, a real `MarketMakerStrategy`
-does trade live against a running `trading_server` (`apps/live_strategy_demo/`),
-by polling `UiGateway`'s own REST book endpoint rather than by
-`StrategyRuntime` reacting to the raw UDP feed directly -- a narrower,
-demo-appropriate substitution for that same open gap; see
-`docs/exchange_flow.md`'s Milestone 14 section and `docs/live_demo.md` for
-the full run. Milestone 13 (benchmarks, `docs/benchmarks.md`) and the rest of
-Milestone 14 (failure injection, `docs/failure_injection.md`) are likewise
-now complete.
+against.
+
+The one wiring gap that remains: `StrategyRuntime` itself is not fed by that
+live feed. A real `MarketMakerStrategy` does trade live against a running
+`trading_server` (`apps/live_strategy_demo/`), but by polling `UiGateway`'s own
+REST book endpoint rather than by `StrategyRuntime` reacting to the raw UDP feed
+directly — see `docs/live_demo.md` for the full run and
+`docs/exchange_flow.md`'s "Integration status" section for why that narrower
+substitution was the right scope for a demo binary.
 
 ---
 
-## 3. Existing market-data components (trader side — verified working this milestone)
+## 3. Trader-side market-data components
 
 | Component | Files | Role |
 |---|---|---|
@@ -175,135 +158,90 @@ now complete.
 | Local book (trader-side, non-authoritative) | `include/book/{order_book,price_level,book_manager,book_errors}.hpp` + `src/book/*.cpp` | **Reconstructs** state from received events; O(1) hash + O(log P) map + O(1) list-erase cancel/modify; **does not match crossing orders** |
 | Apps | `apps/{feed_generator,market_data_replay,udp_sender}/main.cpp` | CLI drivers exercising the above end to end |
 
-**None of the above changed in this milestone.** They are the foundation the exchange side
-will eventually feed into (Milestone 6) and otherwise remain untouched, per the working
-rules governing this migration.
+The exchange side feeds into these through `MarketDataPublisher`; nothing above had to
+change to accommodate it.
 
 ---
 
-## 4. Exchange-side components: built vs. still to come
+## 4. Component map
 
-| Component | Target milestone | Status | Lives under |
-|---|---|---|---|
-| `ExchangeCommand` / `ExchangeEvent` / `EventSink` types | 1 | Built | `exchange/core/` |
-| Matching engine (authoritative book, price-time priority, fills) | 2 | Built | `exchange/matching/` |
-| Exchange command journal + deterministic replay | 3 | Built | `exchange/persistence/` |
-| Command sequencer + matching-thread pipeline | 4 | Built | `exchange/sequencing/` |
-| Account balances + pre-trade risk | 5 | Built | `exchange/risk/`, `exchange/ledger/` |
-| Market-data publisher (matching events → existing wire format) | 6 | Built | `exchange/market_data/` |
-| TCP order-entry protocol + gateway | 7 | Built | `exchange/gateway/`, `protocol/order_entry/` |
-| Trader-side OMS + order-entry client | 8 | Built | `trader/oms/` |
-| Trader-side positions/P&L/risk | 9 | Built | `trader/positions/`, `trader/risk/` |
-| Strategy runtime + market maker | 10 | Built | `trader/strategies/` |
-| Additional strategies, two-venue simulation | 11 | Built | `trader/strategies/` |
-| UI gateway + React dashboard | 12 | Built | `ui_gateway/`, `ui/`, `apps/trading_server/` |
-| Benchmarks | 13 | Built | `benchmarks/` |
-| Failure injection + final demonstration | 14 | Built | `tests/test_failure_injection_*.cpp`, `apps/live_strategy_demo/` |
+| Component | Lives under |
+|---|---|
+| `ExchangeCommand` / `ExchangeEvent` / `EventSink` types | `exchange/core/` |
+| Matching engine (authoritative book, price-time priority, fills) | `exchange/matching/` |
+| Exchange command journal + deterministic replay | `exchange/persistence/` |
+| Command sequencer + matching-thread pipeline | `exchange/sequencing/` |
+| Account balances + pre-trade risk | `exchange/risk/`, `exchange/ledger/` |
+| Market-data publisher (matching events → the trader-side wire format) | `exchange/market_data/` |
+| TCP order-entry protocol + gateway | `exchange/gateway/`, `protocol/order_entry/` |
+| Trader-side OMS + order-entry client | `trader/oms/` |
+| Trader-side positions/P&L/risk | `trader/positions/`, `trader/risk/` |
+| Strategy runtime, market maker, cross-venue arbitrage | `trader/strategies/` |
+| UI gateway + React dashboard | `ui_gateway/`, `ui/`, `apps/trading_server/` |
+| Benchmarks | `benchmarks/` |
+| Failure injection + live demonstration | `tests/test_failure_injection_*.cpp`, `apps/live_strategy_demo/` |
 
-See `docs/exchange_flow.md` for a full walkthrough of Milestones 1–9's
-implementation (and its own "Milestones 10-11" section for the strategy
-layer); this table only tracks scope and status.
-
-Per the working rules, headers stay where they are today until the exchange-side
-architecture is actually working — the `exchange/...` paths above are the eventual
-destination, not something created now. Milestone 1 will add new files alongside the
-existing tree (e.g. `include/exchange/core/...`) without moving anything that already exists.
+See `docs/exchange_flow.md` for a full walkthrough of each; this table only
+says where things live.
 
 ---
 
 ## 5. Why the two books cannot share a class
 
-| | Trader-side `book::OrderBook` (existing) | Exchange matching book (new) |
+| | Trader-side `book::OrderBook` | Exchange `MatchingBook` |
 |---|---|---|
 | Input | Already-decided market-data facts (`AddOrder` etc., arriving as *events*) | Inbound *commands* requesting a decision (`NewOrderCommand` etc.) |
 | Core operation | Insert/erase a resting order at a known price | Decide whether an incoming order crosses the book *before* it rests |
 | Mutates on a fill | Never — no fill concept exists (`Trade` is informational-only, doesn't touch book depth, see `src/replay/replay_engine.cpp`) | Reduces a resting order's *remaining* quantity in place, or removes it entirely |
 | Crossed state | Tolerated — a reconstructed book can show a crossed spread and this is documented as expected, not a bug | Never valid — a crossed authoritative book is a correctness bug |
 | Source of truth | No — it is a *reconstruction*, allowed to be temporarily wrong/stale pending recovery | Yes — it is the one true record of what the exchange has done |
-| Recovery story | Snapshot + resume (already built, Milestone 4 of the market-data roadmap) | Command journal replay (Milestone 3 of *this* roadmap) — a different mechanism for a different failure mode |
+| Recovery story | Snapshot + resume | Command journal replay — a different mechanism for a different failure mode |
 
 Reusing `RestingOrder`/`OrderBook` unchanged for matching would conflate "record of a fact"
 with "adjudicator of a decision," and would make the crossed-spread tolerance of the
 reconstruction path (correct for its purpose) silently apply to the matching book (where it
-would be a bug). Milestone 2 will define a distinct exchange-side resting-order type and
-book, per the working rules.
+would be a bug). The exchange side therefore has its own resting-order type and its own
+book, deliberately not shared.
 
 ---
 
-## 6. Verified baseline (this milestone)
+## 6. Verified baseline
 
-See the accompanying report for exact commands and output. Summary: debug build,
-ASan+UBSan build, and TSan build all succeed with zero warnings; all 103 existing tests
-pass under all three configurations, with no source changes made. Breakdown by area
-relevant to this document's "existing components" claim above:
-
-- File replay (event-file I/O, replay determinism): 7 tests, all passing.
-- UDP replay (socket, batched receive, packet framing/sequencing, end-to-end UDP replay): 16 tests, all passing.
-- Snapshot / sequence-gap recovery: 9 tests, all passing.
-- Local (reconstructed) order book: 18 tests, all passing.
-- Remaining 53 tests (protocol codec, decode errors, sequence validation, SPSC/dropping queue, backpressure integration): all passing.
-
-No exchange-side code exists to test yet — that begins at Milestone 1.
-
----
-
-## 7. Verified baseline as of Milestone 9
-
-Superseding section 6 above (kept for history): debug, ASan+UBSan, and TSan builds all
-still succeed with zero warnings, and all **314** tests pass under all three
-configurations. `docs/exchange_flow.md` has the full exchange-side test breakdown by
-milestone; the highlights specific to Milestones 7–9's own concurrency are
-`test_order_entry_gateway_e2e.cpp`, `test_oms_gateway_e2e.cpp`, and
-`test_trader_risk_gated_oms_e2e.cpp`, all real multi-threaded TCP round trips (gateway
-accept/reader/writer/matching threads on one side, an `OrderEntryClient` reader thread on
-the other) that pass clean under TSan. The last of these is also the test proving
-Milestone 9's central design claim: the trader-side risk check
-(`TraderRiskEngine`/`PositionTracker`) and the exchange-side one (`RiskGatedEngine`/
-`Ledger`) are genuinely independent, each capable of rejecting an order the other would
-have allowed.
-
----
-
-## 8. Verified baseline as of Milestone 11
-
-Superseding section 7 above (kept for history): debug, ASan+UBSan, and TSan builds all
-still succeed with zero warnings, and all **337** tests pass under all three
-configurations. `docs/exchange_flow.md` has the full breakdown by milestone, including
-its own "Milestones 10-11" section; the highlights specific to Milestones 10-11 are
-`test_market_maker_strategy_e2e.cpp` (a real `MarketMakerStrategy`, trading through a
-real `TraderRiskGatedOms` + `OrderEntryClient`, quoting/getting filled/requoting over a
-real TCP connection to a real `OrderEntryGateway` — including a fix this test itself
-caught: replacing a widening bid before its own stale ask had moved could momentarily
-cross the strategy's own book, so `MarketMakerStrategy` now sequences which side it
-replaces first) and `test_cross_venue_arbitrage_strategy_e2e.cpp` (two complete,
-independent exchange stacks — two gateways, two matching engines, two ledgers — running
-side by side in one test process, with a single `CrossVenueArbStrategy` trading both and
-capturing a real, seeded price discrepancy between them via two independent IOC order
-round trips). TSan also caught a second real, if narrow, bug during this milestone's own
-development, in test infrastructure rather than production code: the `RiskGatedTrader`
-test helper (shared by the Milestone 9 and Milestone 10-11 e2e tests) declared its
-`OrderEntryClient` member before its `TraderRiskGatedOms` member, so the client's
-background reader thread — which calls into the risk-gated OMS asynchronously — could
-still be running while the OMS was being destroyed (C++ destroys members in reverse
-declaration order); all three `RiskGatedTrader` copies now declare `TraderRiskGatedOms`
-first so the client (and its thread) tears down before the OMS it calls into does.
-
----
-
-## 9. Verified baseline as of Milestone 12
-
-Superseding section 8 above (kept for history): debug, ASan+UBSan, and TSan builds all
-still succeed with zero warnings, and all **351** C++ tests pass under all three
-configurations, including the 13 new tests in `tests/test_ui_gateway.cpp`. This is also
-the first milestone with a separate, non-C++ build: `ui/` (React + Vite + TypeScript)
+Debug, ASan+UBSan, and TSan builds all succeed with zero warnings, and the whole C++
+test suite passes under all three configurations. `ui/` (React + Vite + TypeScript)
 type-checks (`tsc -b`) and builds (`npm run build`) cleanly, and its output was verified
 serving from a real, running `trading_server` process in an actual browser (a headless
 Chrome screenshot showing a live order book, positions, orders, and activity feed, all
 updating from real SSE events).
 
-Two real concurrency bugs surfaced and were fixed during this milestone's own manual
-end-to-end smoke testing (not caught by the unit-level tests written first, which is
-exactly why the manual smoke test — then turned into `tests/test_ui_gateway.cpp` — mattered):
+`docs/exchange_flow.md` has the full test breakdown by layer. The tests that matter most
+under TSan are the multi-threaded TCP round trips —
+`test_order_entry_gateway_e2e.cpp`, `test_oms_gateway_e2e.cpp`,
+`test_trader_risk_gated_oms_e2e.cpp`, `test_market_maker_strategy_e2e.cpp`,
+`test_cross_venue_arbitrage_strategy_e2e.cpp`, and `test_ui_gateway.cpp` — each of which
+runs gateway accept/reader/writer/matching threads on one side against client reader
+threads on the other, all concurrently.
+
+### Bugs these tests actually caught
+
+- **A self-crossing market maker.** Replacing a widening bid before its own stale ask had
+  moved could momentarily cross the strategy's own book, so `MarketMakerStrategy` now
+  sequences which side it replaces first. Caught by
+  `test_market_maker_strategy_e2e.cpp`.
+- **A use-after-free during teardown.** The `RiskGatedTrader` test helper declared its
+  `OrderEntryClient` member before its `TraderRiskGatedOms` member, so the client's
+  background reader thread — which calls into the risk-gated OMS asynchronously — could
+  still be running while the OMS was being destroyed (C++ destroys members in reverse
+  declaration order). All three `RiskGatedTrader` copies now declare `TraderRiskGatedOms`
+  first so the client, and its thread, tears down before the OMS it calls into does.
+  Caught by TSan.
+- **A `snapshot()` race.** Both gateway e2e tests called `OrderEntryGateway::snapshot()`
+  — only safe once the matching thread has been joined — while the gateway was still
+  running; both now call `stop()` first. Caught by TSan.
+
+Two further concurrency bugs surfaced during manual end-to-end smoke testing of the UI
+gateway, before `tests/test_ui_gateway.cpp` existed (which is exactly why that manual
+smoke test, later turned into the test file, mattered):
 - `UiGateway::start()` passed `http_port_` as cpp-httplib's `socket_flags` argument to
   `Server::bind_to_any_port(host, socket_flags)` — a method that, despite the call
   compiling and returning a seemingly valid port, *always* binds an ephemeral port and
@@ -328,7 +266,7 @@ exactly why the manual smoke test — then turned into `tests/test_ui_gateway.cp
     `Server::wait_until_ready()` (cpp-httplib's own documented fix for exactly this race)
     right after spawning `http_thread_`, before `start()` returns.
 
-`tests/test_ui_gateway.cpp` is this milestone's loop-closing test, same shape as every
+`tests/test_ui_gateway.cpp` is the UI gateway's loop-closing test, same shape as every
 other `*_e2e.cpp` in this codebase: a real `OrderEntryGateway` (with
 `extra_event_sink` wired to a real `MarketDataPublisher` over a real UDP socket) plus a
 real `UiGateway`, driven entirely through `httplib::Client` against the actual REST/SSE
@@ -340,23 +278,19 @@ because a real UDP frame really was published and received, a crossing order pro
 real fill visible on both accounts, and `/api/stream` actually delivering a live "order"
 SSE event to a subscribed client after an order is submitted.
 
----
+### Failure injection
 
-## 10. Verified baseline as of Milestone 14
+The 11 failure-injection tests (`tests/test_failure_injection_gateway.cpp`,
+`tests/test_failure_injection_market_data.cpp` — 6 and 5 respectively) all pass clean
+under TSan, which matters here because several of these faults (a slow non-reading
+client, a flood of random bytes, duplicated/gapped UDP packets) are only actually
+testing anything real if the reader/writer/matching/market-data threads they exercise
+are genuinely running concurrently, not accidentally serialized by test timing. See
+`docs/failure_injection.md` for the full fault matrix.
 
-Superseding section 9 above (kept for history): debug, ASan+UBSan, and TSan builds all
-still succeed with zero warnings, and all **362** C++ tests pass under all three
-configurations, including the 11 new failure-injection tests
-(`tests/test_failure_injection_gateway.cpp`, `tests/test_failure_injection_market_data.cpp`
--- 6 and 5 respectively) — see `docs/failure_injection.md` for the full fault matrix each
-one covers and confirmation all 11 pass clean under TSan specifically, which matters here
-because several of these faults (a slow non-reading client, a flood of random bytes,
-duplicated/gapped UDP packets) are only actually testing anything real if the
-reader/writer/matching/market-data threads they exercise are genuinely running
-concurrently, not accidentally serialized by test timing.
+### Benchmarks
 
-This milestone also added a Release-build-only artifact class this document's own
-"Verified baseline" sections hadn't needed before: **benchmarks**, not correctness tests.
+Benchmarks are a Release-only artifact, not correctness tests.
 `benchmarks/` (five Google-Benchmark executables plus one hand-rolled latency harness,
 gated behind `-DMDH_BUILD_BENCHMARKS=ON`, the default) were built and actually run in
 Release on this machine; every number is recorded, with methodology and interpretation, in
@@ -374,13 +308,14 @@ investigation turned up). Re-measured after both fixes, p50 dropped to ~73 μs �
 a 17x reduction, verified with two independent 20,000-sample runs, documented in
 `docs/benchmarks.md` §7.2.
 
-Finally, this milestone ran the one demonstration every earlier milestone's own
-end-to-end test proved the *pieces* for but never assembled into a single live scenario:
-a real `MarketMakerStrategy` (`apps/live_strategy_demo/`, new) trading against a real,
-running `trading_server`, a real second account crossing both sides of its quotes over
-the same REST API a browser dashboard uses, both processes' independently-computed fill
-accounting agreeing exactly, and a real headless-Chrome screenshot of the resulting live
-dashboard state. `docs/live_demo.md` has the full run, every JSON response and log line
-involved, and an explicit list of this demo's own deliberate scope limits (REST-polling
-the book instead of a second UDP subscriber; a pre-existing, documented IOC/FOK
-no-fill-remainder behavior from Milestones 3/4 that is not new to this milestone).
+### The live demonstration
+
+The one scenario every e2e test proved the *pieces* for but none assembled into a single
+live run: a real `MarketMakerStrategy` (`apps/live_strategy_demo/`) trading against a
+real, running `trading_server`, a real second account crossing both sides of its quotes
+over the same REST API a browser dashboard uses, both processes' independently-computed
+fill accounting agreeing exactly, and a real headless-Chrome screenshot of the resulting
+live dashboard state. `docs/live_demo.md` has the full run, every JSON response and log
+line involved, and an explicit list of the demo's deliberate scope limits (REST-polling
+the book instead of a second UDP subscriber; the pre-existing, documented IOC/FOK
+no-fill-remainder behavior of the matching engine).

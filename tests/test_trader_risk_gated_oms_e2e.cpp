@@ -7,17 +7,17 @@
 #include "trader/oms/order_entry_client.hpp"
 #include "trader/risk/trader_risk_gated_oms.hpp"
 
-// The Milestone 9 loop-closing test: proves TraderRiskGatedOms interoperates
+// The loop-closing test for trader-side risk: proves TraderRiskGatedOms interoperates
 // with a real, unmodified OrderEntryGateway exactly like a bare
 // OrderManagementSystem does (see test_oms_gateway_e2e.cpp), while also
-// demonstrating the specific thing Milestone 9 adds -- two genuinely
+// demonstrating the specific thing the gated OMS adds -- two genuinely
 // independent risk layers, exactly as docs/end_to_end_architecture.md's
 // system diagram draws them as two separate boxes:
 //
 //   - The trader's OWN risk check (TraderRiskEngine, checked against this
 //     process's own PositionTracker) can reject an order before it is ever
 //     sent -- the gateway/exchange never even sees it.
-//   - The EXCHANGE's OWN risk check (Milestone 5's RiskGatedEngine, checked
+//   - The EXCHANGE's OWN risk check (RiskGatedEngine, checked
 //     against the gateway's own, entirely separate Ledger) can still
 //     independently reject an order that passed the trader-side check --
 //     proving neither layer is a stand-in for the other.

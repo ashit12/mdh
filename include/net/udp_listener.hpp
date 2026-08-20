@@ -43,7 +43,7 @@ struct UdpListenResult {
 //
 // Both still funnel through apply_frame_result(), so decode-error/
 // sequence-validation/book-application behavior is identical to file
-// replay and to milestone 2's single-threaded listener -- only "how frames
+// replay and to a single-threaded listener -- only "how frames
 // get from the socket to apply_frame_result()" changed. Packet-level
 // bookkeeping (PacketSequenceTracker, packet_errors) stays entirely on the
 // producer thread, since it's tied to receiving a datagram, not to

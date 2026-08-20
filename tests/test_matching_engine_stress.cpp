@@ -1,12 +1,12 @@
-// Milestone 15: a long-running deterministic stress/correctness harness for
-// the matching engine.
+// A long-running deterministic stress/correctness harness for the matching
+// engine.
 //
 // Deliberately not a Google Benchmark case and not an ordinary unit test
 // either. tests/test_matching_engine.cpp asserts specific outcomes for
 // specific hand-written scenarios; this harness instead runs a large,
 // randomly-mixed-but-reproducible command stream and continuously checks the
 // properties that must hold no matter what the stream contains. It is what
-// gives the Milestone 15 baseline numbers their credibility: measuring an
+// gives the benchmark baseline numbers their credibility: measuring an
 // engine that quietly corrupts its own indexes under load would be measuring
 // nothing worth knowing.
 //

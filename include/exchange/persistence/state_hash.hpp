@@ -4,7 +4,7 @@
 
 #include "exchange/matching/state_snapshot.hpp"
 
-// A single u64 fingerprint of an EngineStateSnapshot (Milestone 3) --
+// A single 64-bit fingerprint of an engine state snapshot --
 // convenient for a one-line "did final state match" assertion or a log
 // line, on top of (not instead of) directly comparing two
 // EngineStateSnapshot values with ==. Deterministic for the same reason the

@@ -5,20 +5,18 @@
 #include "common/types.hpp"
 #include "exchange/core/types.hpp"
 
-// Transport-independent exchange commands -- the exchange's inbound
-// vocabulary. Deliberately carry only what deterministic processing needs:
-// no socket handles, no file offsets, no JSON, and no timestamp captured
-// inside the matcher (a command's effect must depend only on its own fields
-// and book state at the time it's processed, never on wall-clock time
-// observed during matching). Whatever eventually produces these -- a TCP
-// gateway (a later milestone) or a test constructing them directly -- is
-// entirely decoupled from this type's definition; nothing here has been
-// decoded from wire bytes.
+// The exchange's inbound vocabulary, with no knowledge of any transport.
+// These carry only what deterministic processing needs: no socket handles,
+// no file offsets, no JSON, and no timestamp read inside the matcher. A
+// command's effect must depend only on its own fields and the book state
+// when it is processed, never on the clock.
 //
-// Every struct below also defines a defaulted operator== (Milestone 3): the
-// command journal's roundtrip tests need to assert a decoded command equals
-// the original one that was encoded. Purely additive -- does not affect
-// aggregate-ness or existing designated-initializer construction.
+// Whatever produces them -- the TCP gateway, or a test building them
+// directly -- is entirely decoupled from this definition. Nothing here has
+// been decoded from wire bytes.
+//
+// Every struct defines a defaulted operator== so the journal's round-trip
+// tests can assert that a decoded command equals the one encoded.
 namespace mdh::exchange {
 
 struct NewOrderCommand {

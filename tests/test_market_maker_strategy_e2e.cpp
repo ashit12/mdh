@@ -9,13 +9,13 @@
 #include "trader/risk/trader_risk_gated_oms.hpp"
 #include "trader/strategies/market_maker_strategy.hpp"
 
-// The Milestone 10 loop-closing test: a real MarketMakerStrategy, trading
-// through a real TraderRiskGatedOms + OrderEntryClient, over a real TCP
-// connection to a real, unmodified OrderEntryGateway -- proving the
-// strategy layer composes correctly with every layer built in Milestones
-// 7-9 (gateway, OMS/client, trader-side risk/positions), the same
-// loop-closing role test_trader_risk_gated_oms_e2e.cpp played for
-// Milestone 9 against Milestone 8's OMS/client.
+// The loop-closing test for the strategy layer: a real MarketMakerStrategy,
+// trading through a real TraderRiskGatedOms + OrderEntryClient, over a real
+// TCP connection to a real, unmodified OrderEntryGateway -- proving the
+// strategy layer composes correctly with every layer beneath it (gateway,
+// OMS/client, trader-side risk/positions), the same loop-closing role
+// test_trader_risk_gated_oms_e2e.cpp plays for trader-side risk against the
+// bare OMS/client.
 //
 // ── Why the book is built by the test, not received over a live feed ─────
 // Per docs/exchange_flow.md's "Integration status" section,

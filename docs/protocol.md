@@ -1,4 +1,4 @@
-# Wire Protocol Specification (through Milestone 4)
+# Wire Protocol Specification
 
 This is a simulated, ITCH/OUCH-inspired binary market-data protocol built
 for a portfolio project. It is not a real exchange spec, and no claim is
@@ -11,18 +11,14 @@ replay format and UDP transport. There is exactly one wire format: a
 replay file is a raw capture of the same bytes a UDP receiver would see,
 not a separate on-disk encoding.
 
-This was little-endian in milestone 1, when the protocol was file-only
-with no wire transport and there was no interoperability requirement to
-justify network byte order. Milestone 2 added UDP, which is exactly the
-situation network byte order exists for -- it's the same reason `htons`/
-`htonl` exist in the sockets API: intermediate routers and receivers on
-different architectures can't assume anything about the sender's
-endianness. Switching was a one-file change confined entirely to
-`include/common/byte_io.hpp` -- `encoder.cpp`/`decoder.cpp` only ever call
-`io::put_u16()`/`io::get_u16()` etc. and never depended on which byte
-order those functions used internally, so nothing outside that one file
-needed to change. All 44 tests from milestone 1 passed unmodified after
-the switch, which is exactly the point of that abstraction boundary.
+Network byte order is the right default the moment bytes cross a wire --
+it's the same reason `htons`/`htonl` exist in the sockets API: intermediate
+routers and receivers on different architectures can't assume anything about
+the sender's endianness. The choice is confined entirely to
+`include/common/byte_io.hpp`; `encoder.cpp`/`decoder.cpp` only ever call
+`io::put_u16()`/`io::get_u16()` and never depend on which byte order those
+functions use internally, so the endianness of the whole protocol can be
+changed in one file without touching anything else.
 
 Every multi-byte field is encoded/decoded via explicit bit shifts (see
 `include/common/byte_io.hpp`), never via `memcpy`-ing a struct onto the
@@ -48,8 +44,8 @@ header/footer -- an event file is simply frames concatenated back to back.
 | 4 | `sequence_number` | `u64` | feed-wide, monotonically increasing |
 | 12 | `timestamp_ns` | `u64` | nanoseconds, arbitrary epoch |
 
-`payload_size` is redundant with `type` today (every milestone-1 type has a
-fixed payload size) -- it exists as an independent corruption cross-check:
+`payload_size` is redundant with `type` today (every type has a fixed
+payload size) -- it exists as an independent corruption cross-check:
 the decoder rejects a frame whose declared `payload_size` doesn't match the
 fixed size for its `type`, which catches a class of bit-flip corruption
 that a `type`-only check would miss. It also means adding a variable-length
@@ -79,9 +75,9 @@ value is rejected by the decoder as `DecodeError::InvalidSide`.
 
 ## Price scale
 
-`Price` is `int64_t`, scaled integer ticks -- never floating point. This
-milestone fixes the scale at **1 tick = 0.0001 currency unit** (4 implied
-decimal places). That scale is a convention, not something carried on the
+`Price` is `int64_t`, scaled integer ticks -- never floating point. The
+scale is fixed at **1 tick = 0.0001 currency unit** (4 implied decimal
+places). That scale is a convention, not something carried on the
 wire; the encoder and every consumer must agree on it out of band, the same
 way real fixed-point feeds do. Floating point was ruled out because
 `0.1 + 0.2 != 0.3` in IEEE 754 -- unreliable for price-level equality and
@@ -104,7 +100,7 @@ routing in a book.
 Decode errors are returned as `std::variant<T, DecodeError>` rather than
 thrown as exceptions or terminating the process -- decoding untrusted bytes
 is exactly the situation where a caller needs to inspect *what* went wrong
-and decide what to do next (in milestone 1: stop replay), not unwind a
+and decide what to do next (for replay: stop), not unwind a
 call stack. `std::expected<T, E>` was the more obviously-named alternative
 but is a C++23 feature; this project targets C++20.
 
@@ -113,8 +109,8 @@ but is a C++23 feature; this project targets C++20.
 Sequencing is validated feed-wide (one counter across all instruments), not
 per instrument -- matching how ITCH-style feeds sequence a single physical
 channel that happens to carry multiple instruments. `SequenceValidator`
-(see `include/common/sequence_validator.hpp` -- moved there in milestone 2
-since it is now reused for packet-level tracking too, see below)
+(see `include/common/sequence_validator.hpp` -- it lives in `common/`
+because it is reused for packet-level tracking too, see below)
 classifies every sequence number relative to the last one it accepted:
 
 - **InOrder** -- exactly `last + 1`.
@@ -130,19 +126,18 @@ only the last one. That means it cannot distinguish "a duplicate of
 sequence 40" from "an out-of-order arrival of sequence 40" once the feed
 has already moved on to sequence 90; both are reported as `OutOfOrder`.
 Tracking full history would fix that at the cost of unbounded memory for
-an unbounded replay -- a trade-off not worth making for milestone 1's
-requirement to just detect and stop.
+an unbounded replay -- a trade-off not worth making when all the caller
+needs is to detect the problem and stop.
 
 Replay always stops on the first non-`InOrder` classification
 (`ReplayOptions::stop_on_sequence_error`, defaulted `true`), for both
 transports -- file replay (`run_replay`) and UDP (`net::run_udp_listen`)
 both funnel through the shared `replay::apply_frame_result()`, which is
 where this policy is applied. The validator itself has no opinion on this
--- it only classifies -- so a later milestone can add a skip-and-continue
-or buffer-and-reorder policy at that one call site without touching
-`SequenceValidator`.
+-- it only classifies -- so a skip-and-continue or buffer-and-reorder policy
+could be added at that one call site without touching `SequenceValidator`.
 
-## Packet framing (UDP, milestone 2)
+## Packet framing (UDP)
 
 UDP is a datagram protocol: each `sendto()`/`recvfrom()` pair transfers one
 packet, either whole or not at all (no partial-packet delivery the way a
@@ -215,9 +210,9 @@ redundant feeds); the actual correctness gate remains the event-level
 `SequenceValidator` used inside `apply_frame_result()`, which validates
 each event's own `sequence_number` regardless of which packet carried it.
 
-## A dropped queue item looks identical to a dropped packet (milestone 3)
+## A dropped queue item looks identical to a dropped packet
 
-`net::run_udp_listen()` (milestone 3) decodes on a producer thread and
+`net::run_udp_listen()` decodes on a producer thread and
 applies on a consumer thread, connected by a bounded queue
 (`common/spsc_queue.hpp`) with a drop-newest policy under backpressure
 (`common/dropping_queue.hpp`). Nothing about that queue is part of the
@@ -227,8 +222,8 @@ being explicit about its effect on sequencing: from
 an event lost because the underlying UDP packet never arrived are
 *exactly the same thing*. Both simply never reach the validator, so both
 show up identically as a gap in `sequence_number` once a later event
-arrives. This is deliberate, not incidental -- see the README's Milestone
-3 design notes for why drop-newest was chosen specifically because it
+arrives. This is deliberate, not incidental: drop-newest was chosen
+specifically because it
 degrades into the same, already-handled failure mode as ordinary packet
 loss, rather than introducing a second kind of gap the validator would
 need to reason about differently.
@@ -242,7 +237,7 @@ the validator; it has no way to know how many messages *should* have
 followed. It does mean "sequence_failures == 0" is not, on its own, proof
 that nothing was ever dropped.
 
-## Snapshot format (milestone 4)
+## Snapshot format
 
 A snapshot (`replay/snapshot.hpp`) is a separate file format from both the
 event-file and packet formats above, but deliberately reuses as much of
@@ -298,8 +293,8 @@ named, deliberate simplification, not an oversight.
 `replay::apply_frame_result()` loads a snapshot only on a
 `SequenceOutcome::Missing` classification (a genuine gap) when
 `ReplayOptions::recovery_snapshot_path` is set -- not on `Duplicate` or
-`OutOfOrder`, which keep their pre-milestone-4 `stop_on_sequence_error`-
-governed behavior. On a Missing classification with a snapshot path
+`OutOfOrder`, which stay governed by `stop_on_sequence_error` as before.
+On a Missing classification with a snapshot path
 configured: `outcome.books` is replaced wholesale by the snapshot's
 state (not merged with whatever was applied before the gap), and the
 event that revealed the gap becomes the new `SequenceValidator` baseline

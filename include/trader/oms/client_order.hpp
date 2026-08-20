@@ -7,7 +7,7 @@
 #include "common/types.hpp"
 #include "exchange/core/types.hpp"
 
-// The trader-side order-entry OMS's own view of one order (Milestone 8) --
+// The trader-side OMS's own view of one order --
 // deliberately a distinct type from every exchange-side or wire-level order
 // representation (exchange::matching's resting orders, protocol::order_entry::
 // NewOrder/Accepted/etc.), for exactly the same reason exchange-side and

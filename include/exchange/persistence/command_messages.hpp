@@ -6,7 +6,7 @@
 #include "common/types.hpp"
 #include "exchange/core/types.hpp"
 
-// Wire format for journaling ExchangeCommand (Milestone 3). This is a
+// Wire format for journaling exchange commands. This is a
 // SEPARATE format from protocol/messages.hpp -- that one is the trader-side
 // market-data wire format (AddOrder/CancelOrder/ModifyOrder/Trade/ClearBook,
 // unrelated events, unrelated namespace) and is not modified or reused here.

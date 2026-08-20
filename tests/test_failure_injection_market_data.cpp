@@ -22,8 +22,8 @@
 #include "protocol/messages.hpp"
 #include "ui_gateway/ui_gateway.hpp"
 
-// Milestone 14: failure injection against UiGateway's live market-data UDP
-// listener (market_data_loop(), Milestone 12) -- corrupt bytes, dropped
+// Failure injection against UiGateway's live market-data UDP
+// listener (market_data_loop()) -- corrupt bytes, dropped
 // (gapped) sequence numbers, and duplicated events sent as raw, hand-built
 // UDP datagrams directly to its market-data port, bypassing
 // MarketDataPublisher entirely so this test has full, deliberate control

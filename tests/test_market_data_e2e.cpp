@@ -8,7 +8,7 @@
 #include "replay/event_file_writer.hpp"
 #include "replay/replay_engine.hpp"
 
-// The Milestone 6 loop-closing test: proves the exchange side and the
+// The loop-closing test for market data: proves the exchange side and the
 // trader side actually agree, not just that MarketDataPublisher's
 // translation is correct in isolation (see test_market_data_publisher.cpp
 // for that). Commands are processed by a real MatchingEngine, its events
@@ -21,8 +21,8 @@
 // that both sides believe is now completely empty after a cancel.
 //
 // Nothing about EventFileWriter, replay::run_replay(), or book::BookManager
-// changed to make this pass -- only MarketDataPublisher (this milestone)
-// is new. That is exactly the point: it's a drop-in producer of the same
+// changed to make this pass -- MarketDataPublisher slots straight in.
+// That is exactly the point: it's a drop-in producer of the same
 // wire format feed_generator has always produced synthetically.
 using namespace mdh;
 using namespace mdh::protocol;

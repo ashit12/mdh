@@ -32,10 +32,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS OFF)
 FetchContent_MakeAvailable(googletest)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ── cpp-httplib + nlohmann/json (Milestone 12: UI gateway only) ────────────
+# ── cpp-httplib + nlohmann/json (UI gateway only) ──────────────────────────
 # Both are single-header, MIT-licensed, and used nowhere except
-# include/ui_gateway/ + apps/trading_server/ -- every earlier milestone's
-# hand-rolled TCP/UDP wire protocols are completely untouched by this;
+# include/ui_gateway/ + apps/trading_server/ -- the hand-rolled TCP/UDP wire
+# protocols everywhere else are completely untouched by this;
 # see include/ui_gateway/ui_gateway.hpp's own class comment for why a
 # library was chosen here instead of hand-rolling HTTP/WebSocket framing
 # the way this project hand-rolled everything else.
@@ -55,12 +55,12 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nlohmann_json)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ── Google Benchmark (Milestone 13: benchmarks/ only) ──────────────────────
+# ── Google Benchmark (benchmarks/ only) ────────────────────────────────────
 # Same FetchContent pattern as googletest/httplib/json above, and same
 # rationale as httplib: microbenchmark harness/statistics (warm-up,
-# repetition counts, mean/median/stddev) is not this milestone's teaching
-# point -- measuring the matching core, codecs, book, and SPSC queue that
-# milestones 1-12 already hand-rolled is -- so a small, standard,
+# repetition counts, mean/median/stddev) is not the point here -- measuring
+# the hand-rolled matching core, codecs, book, and SPSC queue is -- so a
+# small, standard,
 # well-regarded library is used instead of hand-rolling percentile/timing
 # machinery a second time (bench_end_to_end_latency.cpp below hand-rolls
 # only the one thing Google Benchmark's fixed-iteration model can't express
@@ -156,7 +156,7 @@ if(MDH_ENABLE_TSAN)
     target_link_options(mdh_core PUBLIC -fsanitize=thread)
 endif()
 
-# ── UI gateway library (Milestone 12) ───────────────────────────────────────
+# ── UI gateway library ─────────────────────────────────────────────────────
 # Kept as its own target, separate from mdh_core, so that httplib/json are
 # only ever compiled into the two things that actually need them
 # (trading_server, mdh_tests) -- every other app (feed_generator,
@@ -198,7 +198,7 @@ add_executable(trading_server apps/trading_server/main.cpp)
 target_link_libraries(trading_server PRIVATE mdh_ui_gateway)
 target_compile_options(trading_server PRIVATE ${MDH_WARNING_FLAGS})
 
-# Milestone 14's final demonstration -- links httplib/json directly (like
+# The end-to-end live demo -- links httplib/json directly (like
 # mdh_ui_gateway does) rather than through that target, since this app
 # only needs an httplib::Client to poll trading_server's REST API, never
 # the UI gateway's own server-side code -- see apps/live_strategy_demo/
@@ -269,7 +269,7 @@ target_compile_options(mdh_tests PRIVATE ${MDH_WARNING_FLAGS})
 include(GoogleTest)
 gtest_discover_tests(mdh_tests)
 
-# ── Benchmarks (Milestone 13) ───────────────────────────────────────────────
+# ── Benchmarks ─────────────────────────────────────────────────────────────
 # Every number these produce is meaningless in a Debug build (see
 # docs/benchmarks.md's own note on this) -- they link exactly like mdh_tests
 # (mdh_core/mdh_ui_gateway, unmodified) but are meant to be *run* from a
@@ -306,8 +306,8 @@ if(MDH_BUILD_BENCHMARKS)
     target_link_libraries(bench_end_to_end_latency PRIVATE mdh_core)
     target_compile_options(bench_end_to_end_latency PRIVATE ${MDH_WARNING_FLAGS})
 
-    # Milestone 15. Also standalone rather than Google Benchmark cases, and
-    # for two different reasons.
+    # The two matching-engine benchmarks below are also standalone rather
+    # than Google Benchmark cases, for two different reasons.
     #
     # bench_matching_workload needs the individual per-operation samples to
     # report a p99.9, and one figure per configuration to draw a scaling

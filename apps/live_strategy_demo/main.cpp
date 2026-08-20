@@ -1,56 +1,34 @@
-// live_strategy_demo: Milestone 14's final demonstration -- a real
-// MarketMakerStrategy (Milestone 10) trading through a real
-// TraderRiskGatedOms + OrderEntryClient (Milestones 8-9) over a real TCP
-// connection to a running apps/trading_server (Milestone 12), closing the
-// exact gap trader/strategies/strategy_runtime.hpp's own class comment
-// documented as "future, out-of-scope integration work" back when it was
-// written: "no live UDP feed is wired up to a running gateway yet."
-// Milestone 12 built that gateway; this app is what actually plugs a real
-// strategy into it end to end.
+// live_strategy_demo: a real market-making strategy trading through the real
+// trader-side risk layer and order-entry client, over a real TCP connection
+// to a running trading_server. This is the app that plugs a strategy into
+// the live stack end to end.
 //
-// ── Why this polls GET /api/book/:id instead of subscribing to the UDP
-//    market-data feed directly ───────────────────────────────────────────
-// trading_server's MarketDataPublisher currently sends every packet to
-// exactly one destination port (--market-data-port) -- see
-// apps/trading_server/main.cpp's own extra_event_sink lambda. Teaching it
-// to fan out to N subscriber ports so a second, independent UDP listener
-// (this app reconstructing its own book::BookManager from scratch, the way
-// UiGateway::market_data_loop() already does) could exist alongside
-// UiGateway's own listener is real production networking work, out of
-// scope for a demo binary whose actual point is exercising the strategy/
-// risk/OMS/gateway stack, not re-deriving book reconstruction a third time
-// (replay::apply_frame_result() and UiGateway::market_data_loop() already
-// cover that). Instead, this app reuses the exact already-tested,
-// already-running reconstruction UiGateway itself performs, via the same
-// GET /api/book/:id REST endpoint ui/'s own dashboard polls/streams from --
-// so "where does the book come from" is answered identically for a human
-// watching the dashboard and for this strategy trading against it.
-// MarketMakerStrategy::on_book_update() only ever reads best_bid()/
-// best_ask() from whatever book::OrderBook it is handed (see
-// market_maker_strategy.cpp), so a freshly-rebuilt-every-poll mirror built
-// from that JSON response is a faithful, sufficient input -- it never
-// needs per-order identity or history, only current top-of-book prices.
+// ── Why it polls the REST book instead of the UDP feed ────────────────────
+// trading_server sends market data to exactly one destination port.
+// Teaching it to fan out to many subscriber ports, so this app could run its
+// own independent UDP listener alongside the UI gateway's, is real
+// production networking work and beside the point of a demo whose job is
+// exercising the strategy, risk, OMS and gateway stack.
 //
-// ── Why this trades as its own, separate account id, never one of
-//    UiGatewayOptions::demo_account_ids ───────────────────────────────────
-// UiGateway::find_or_create_session() lazily opens its own real TCP
-// OrderEntryClient connection for account_id the first time any HTTP
-// request names it (see that method's own doc comment). Sharing an account
-// with it is no longer *unsafe* -- OrderEntryGateway supports many
-// sessions per account and routes each execution report back to the
-// session that placed the order (see its own session doc comment), where
-// it once mapped an account to exactly one connection and let a second one
-// silently take over the first's reports. What sharing would still be is
-// confusing: this app and a dashboard viewer would be two independent
-// traders spending the same balance and appearing in each other's
-// position, with neither one's view of "my account" telling the whole
-// story. Trading as a dedicated account (default 9001, see
-// kDefaultAccountId below) keeps the demonstration legible: this app's
-// resting quotes are still fully visible to every dashboard viewer (the
-// book is public, not scoped per account -- see
-// UiGateway::handle_get_book()), and a human trader using the dashboard's
-// own demo accounts can trade against them for real, which is exactly what
-// docs/live_demo.md's walkthrough does.
+// So this app reuses the reconstruction the UI gateway already performs, via
+// the same GET /api/book/:id endpoint the dashboard reads -- meaning a human
+// watching the dashboard and this strategy trading against it see the book
+// from the same place. The strategy only ever reads best bid and best ask,
+// so a mirror rebuilt on each poll is a faithful input; it needs no
+// per-order identity or history.
+//
+// ── Why it trades as its own account ──────────────────────────────────────
+// Sharing an account with a dashboard viewer is not unsafe: the exchange
+// gateway supports many sessions per account and routes each report back to
+// the session that placed the order. It would just be confusing -- two
+// independent traders spending one balance and showing up in each other's
+// position, with neither view telling the whole story.
+//
+// A dedicated account (9001 by default) keeps the demonstration legible. Its
+// resting quotes are still fully visible to every dashboard viewer, since
+// the book is public rather than scoped per account, and a human can trade
+// against them for real. That is exactly what docs/live_demo.md walks
+// through.
 //
 // Usage:
 //   live_strategy_demo [--host 127.0.0.1] [--tcp-port 7000] [--http-port 8080]

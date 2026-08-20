@@ -13,7 +13,7 @@ using InstrumentId = std::uint32_t;
 // Scaled-integer price: ticks, not a floating-point unit. Floating-point
 // comparison is unreliable for price-level routing and equality checks
 // (0.1 + 0.2 != 0.3 in IEEE 754), so all prices are integers throughout.
-// This milestone fixes the scale at 1 tick = 0.0001 currency unit
+// The scale is fixed at 1 tick = 0.0001 currency unit
 // (4 implied decimal places); feed_generator and any future consumer must
 // agree on that scale out of band, same as real fixed-point feeds do.
 using Price = std::int64_t;

@@ -12,7 +12,7 @@ struct ReplayStats {
     std::uint64_t messages_processed = 0;
     std::uint64_t decode_failures = 0;
     std::uint64_t sequence_failures = 0;
-    std::uint64_t recoveries = 0; // how many times a sequence gap triggered snapshot-based recovery (milestone 4)
+    std::uint64_t recoveries = 0; // how many times a gap triggered snapshot recovery
 
     std::uint64_t adds = 0;
     std::uint64_t cancels = 0;

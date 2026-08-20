@@ -5,9 +5,9 @@
 // Usage:
 //   udp_sender --input events.bin --host 127.0.0.1 --port 9000 [--batch-size 20]
 //
-// No pacing/rate limiting -- sends as fast as it can. No deliberate
-// packet loss/reordering/corruption -- that is fault injection, milestone
-// 6 scope, not this one.
+// No pacing or rate limiting -- it sends as fast as it can -- and no
+// deliberate loss, reordering or corruption. That is fault injection, which
+// lives in the tests rather than here.
 #include <cstdlib>
 #include <iostream>
 #include <optional>

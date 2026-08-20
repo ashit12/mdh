@@ -8,7 +8,7 @@
 #include "trader/risk/trader_risk_gated_oms.hpp"
 #include "trader/strategies/strategy_runtime.hpp"
 
-// A textbook cross-venue arbitrage strategy (Milestone 11): watches the
+// A textbook cross-venue arbitrage strategy: watches the
 // SAME instrument's book on two independent venues -- two entirely separate
 // exchange gateway + matching engine + ledger stacks, each with its own
 // trader::risk::TraderRiskGatedOms on this trader's own side -- and,
@@ -16,7 +16,7 @@
 // venue's best bid, buys on the cheap venue and sells on the expensive one,
 // `trade_size` at a time. Proves two things at once: (a) a second, distinct
 // strategy composes on top of the exact same StrategyRuntime/
-// TraderRiskGatedOms plumbing MarketMakerStrategy (Milestone 10) uses, with
+// TraderRiskGatedOms plumbing MarketMakerStrategy uses, with
 // no changes to that plumbing, and (b) that plumbing genuinely supports
 // trading on more than one venue from a single process at once -- see
 // test_cross_venue_arbitrage_strategy_e2e.cpp's "two-venue simulation,"
@@ -39,7 +39,7 @@
 // updates from one venue, before the other venue's confirming update or
 // this trade's own fill arrives, could therefore re-fire on an edge that a
 // prior, still-in-flight order already started consuming. TraderRiskEngine
-// (Milestone 9) and each venue's own exchange-side risk still bound the
+// and each venue's own exchange-side risk still bound the
 // damage (insufficient funds/position simply locally- or exchange-reject
 // the excess), so this is a documented inefficiency, not a safety hole --
 // mirroring the same "small but credible, not exhaustive" scoping already

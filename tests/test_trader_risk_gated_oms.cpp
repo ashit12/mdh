@@ -4,7 +4,7 @@
 
 #include "trader/risk/trader_risk_gated_oms.hpp"
 
-// Composition-level unit tests for TraderRiskGatedOms (Milestone 9) -- a
+// Composition-level unit tests for TraderRiskGatedOms -- a
 // fake Sender stands in for the wire (same FakeSender pattern
 // test_order_management_system.cpp uses), and handle_message() is called
 // directly to simulate gateway responses. Confirms the three things this

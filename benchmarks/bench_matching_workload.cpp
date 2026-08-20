@@ -1,5 +1,5 @@
-// Milestone 15: matching-engine latency distribution, sustained throughput,
-// and scaling behaviour under a deterministic mixed order stream.
+// Matching-engine latency distribution, sustained throughput, and scaling
+// behaviour under a deterministic mixed order stream.
 //
 // Not a Google Benchmark binary, for the same reason
 // bench_end_to_end_latency.cpp is not one: Google Benchmark times a loop and

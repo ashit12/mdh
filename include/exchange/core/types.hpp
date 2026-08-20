@@ -46,8 +46,8 @@ enum class TimeInForce : std::uint8_t {
     return "UnknownTimeInForce";
 }
 
-// Only the reasons the next few milestones actually need -- not an
-// encyclopaedia of every rejection a real exchange might issue.
+// Only the reasons this project actually needs -- not an encyclopaedia of
+// every rejection a real exchange might issue.
 enum class RejectReason {
     None, // not a rejection; paired with an accepted/successful outcome
     InvalidPrice,
@@ -58,7 +58,7 @@ enum class RejectReason {
     InsufficientLiquidity, // FOK: could not be fully filled immediately
     InvalidReplacement,
     InternalError,
-    // Milestone 5 (exchange/risk/): pre-trade checks performed before a
+    // From exchange/risk/: pre-trade checks performed before a
     // command is allowed to reach the matching engine at all -- distinct
     // from InsufficientLiquidity above, which is a book-depth concept
     // (not enough resting quantity to fill against), not an account-balance
@@ -67,7 +67,7 @@ enum class RejectReason {
     InsufficientFunds,    // buy: account's available (unreserved) cash can't cover price * quantity
     InsufficientPosition, // sell: account's available (unreserved) instrument holdings are short
     OrderTooLarge,        // exceeds RiskLimits::max_order_quantity
-    // Milestone 7 (exchange/gateway/): the message's account_id is not the
+    // From exchange/gateway/: the message's account_id is not the
     // one this connection bound to on its first message. Unlike every
     // reason above, this one is produced by the gateway itself and the
     // command never reaches the matching engine at all -- see

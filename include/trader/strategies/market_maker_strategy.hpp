@@ -8,7 +8,7 @@
 #include "trader/risk/trader_risk_gated_oms.hpp"
 #include "trader/strategies/strategy_runtime.hpp"
 
-// A minimal, textbook two-sided market maker (Milestone 10): on every book
+// A minimal, textbook two-sided market maker: on every book
 // update for its own instrument, quotes a bid and an ask centered on the
 // book's current midpoint, `half_spread` ticks apart from it on either
 // side, `quote_size` deep, replacing a resting quote only once the desired
@@ -17,14 +17,14 @@
 // modeling, no dynamic spread widening on volatility, no order-book-
 // imbalance skew) -- proving the strategy runtime / trader-side risk / OMS
 // / gateway plumbing all compose correctly end to end (test_market_maker_
-// strategy_e2e.cpp) is this milestone's actual goal, matching the same
+// strategy_e2e.cpp) is the actual goal here, matching the same
 // "small but credible, not a real venue's/strategy's full stack" scoping
 // exchange::risk::RiskLimits and trader::risk::TraderRiskLimits already
-// document for themselves. CrossVenueArbStrategy (Milestone 11) is the
-// next, still-deliberately-simple strategy built on this same plumbing.
+// document for themselves. CrossVenueArbStrategy is a second,
+// still-deliberately-simple strategy built on this same plumbing.
 //
 // ── Inventory management: why this checks position itself, not just relying on risk ──
-// TraderRiskEngine (Milestone 9) already refuses a sell that exceeds held
+// TraderRiskEngine already refuses a sell that exceeds held
 // position, so the ask side is naturally self-limiting once inventory runs
 // out -- an ask this class cannot currently afford to quote (zero
 // inventory) is simply locally risk-rejected by TraderRiskGatedOms
@@ -35,9 +35,9 @@
 // `max_position` (withdrawing the resting bid entirely, not just declining
 // to requote it, once reached) is this strategy's own P&L/inventory-risk
 // decision, independent of and in addition to what TraderRiskEngine checks
-// for -- exactly the "two independent layers" relationship Milestone 9's
-// own class comments describe between trader-side and exchange-side risk,
-// one level up.
+// for -- exactly the "two independent layers" relationship the trader-side
+// risk headers describe between trader-side and exchange-side risk, one
+// level up.
 namespace mdh::trader::strategies {
 
 struct MarketMakerConfig {
@@ -54,8 +54,8 @@ public:
 
     // Ignores updates for any instrument other than config.instrument_id --
     // safe to subscribe this same instance to a StrategyRuntime for
-    // multiple instruments if ever needed, though this milestone only ever
-    // wires it to its own one.
+    // multiple instruments if ever needed, though in practice it is only
+    // ever wired to its own one.
     void on_book_update(InstrumentId instrument_id, const book::OrderBook& book);
 
     [[nodiscard]] BookUpdateSink book_update_sink() {

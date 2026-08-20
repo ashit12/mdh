@@ -13,7 +13,7 @@
 #include "protocol/order_entry/decoder.hpp"
 #include "protocol/order_entry/encoder.hpp"
 
-// Milestone 14: failure injection against the live, networked
+// Failure injection against the live, networked
 // OrderEntryGateway -- deliberately malformed/adversarial/abrupt client
 // behavior sent over real TCP sockets, checking the two properties every
 // fault class below must satisfy: (1) the gateway itself never crashes or

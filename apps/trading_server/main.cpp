@@ -1,33 +1,25 @@
-// trading_server: the first long-running process in this codebase that
-// wires together everything built across Milestones 1-11 into something a
-// browser can actually talk to (Milestone 12) --
+// trading_server: the whole stack in one long-running process, reachable
+// from a browser.
 //
-//   OrderEntryGateway (Milestone 7)  -- real TCP order entry, on --tcp-port
+//   OrderEntryGateway -- real TCP order entry, on --tcp-port
 //        |
-//        +--> extra_event_sink (new, additive hook -- see
-//        |     OrderEntryGatewayOptions::extra_event_sink's own doc
-//        |     comment) --> MarketDataPublisher (Milestone 6) --> UDP, on
-//        |     --market-data-port -- this is the wiring
-//        |     docs/exchange_flow.md's "Integration status" section
-//        |     previously listed as not yet done.
+//        +--> extra_event_sink --> MarketDataPublisher --> UDP, on
+//        |    --market-data-port
 //        |
-//   UiGateway (Milestone 12, include/ui_gateway/) -- listens to that same
-//        UDP port to reconstruct a live book, and holds one
-//        TraderRiskGatedOms + OrderEntryClient per pre-seeded demo account,
-//        connected back to --tcp-port exactly like a strategy would --
-//        exposing it all as REST + Server-Sent Events on --http-port for
-//        ui/ (a separate React project) to render.
+//   UiGateway -- listens on that same UDP port to reconstruct a live book,
+//        and holds one trader-side OMS and client per demo account,
+//        connected back to --tcp-port exactly as a strategy would be. Serves
+//        the lot as REST and Server-Sent Events on --http-port, for the
+//        React app in ui/ to render.
 //
 // Usage:
 //   trading_server [--tcp-port 7000] [--market-data-port 7001]
 //                   [--http-port 8080] [--static-dir <path>]
 //
-// No real shutdown story beyond SIGINT (matches apps/market_data_replay's
-// own documented scope decision to skip graceful-shutdown engineering for
-// a demo app) -- Ctrl+C requests a stop; every owned piece is torn down in
-// dependency order (UiGateway first, since its Sessions depend on the
-// exchange gateway being reachable; then the gateway itself) before this
-// process exits.
+// Shutdown is Ctrl+C and nothing more, the same scope decision the other
+// demo apps make. Everything is then torn down in dependency order: the UI
+// gateway first, since its sessions need the exchange gateway to still be
+// reachable, then the gateway itself.
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -108,15 +100,12 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    // ── Market-data publishing: ExchangeEvent -> protocol::Event -> UDP ────
-    // Owned here (not inside OrderEntryGateway) so the gateway itself stays
-    // completely unaware market data even exists -- exactly the same
-    // separation-of-concerns argument event_sink.hpp makes for every other
-    // EventSink consumer. Captured by reference into extra_event_sink
-    // below; both outlive the gateway, which is what that lambda's
-    // lifetime actually depends on, not on gateway/publisher/socket being
-    // declared in any particular order relative to each other (none of
-    // them reference one another directly).
+    // ── Market-data publishing: exchange event -> wire event -> UDP ───────
+    // Owned here rather than inside the gateway, so the gateway stays
+    // unaware market data exists at all. Captured by reference into
+    // extra_event_sink below; both outlive the gateway, which is all that
+    // lambda's lifetime depends on -- none of these three reference each
+    // other, so their declaration order does not matter.
     market_data::MarketDataPublisher publisher;
     net::UdpSocket market_data_socket;
     if (!market_data_socket.is_open()) {
@@ -125,10 +114,10 @@ int main(int argc, char** argv) {
     }
     std::uint64_t next_packet_sequence = 1;
 
-    // Declared here rather than beside the pre-seeding loop below because
-    // the exchange now needs the instrument list before it is constructed,
-    // not just when accounts are seeded: this is the whole tradeable
-    // universe of this process, and an order on anything else is rejected.
+    // Declared up here because the exchange needs the instrument list before
+    // it is constructed, not just when accounts are seeded: this is the
+    // whole tradeable universe of the process, and an order on anything else
+    // is rejected.
     ui_gateway::UiGatewayOptions ui_options;
 
     OrderEntryGatewayOptions gateway_options;
@@ -143,10 +132,9 @@ int main(int argc, char** argv) {
 
     OrderEntryGateway gateway(args->tcp_port, gateway_options);
 
-    // ── Pre-seed every demo account BEFORE start() -- see
-    // ui_gateway.hpp's own class comment on why this ordering, not lazy
-    // per-request seeding, is what keeps Ledger's single-writer contract
-    // intact once the matching thread is live.
+    // Seed every demo account before start(). See ui_gateway.hpp on why this
+    // ordering, rather than seeding lazily per request, is what keeps the
+    // ledger's single-writer contract intact once the matching thread runs.
     for (AccountId account_id : ui_options.demo_account_ids) {
         gateway.deposit_cash(account_id, ui_options.demo_starting_cash);
         for (InstrumentId instrument_id : ui_options.demo_instrument_ids) {
@@ -154,15 +142,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Milestone 14: also pre-seed apps/live_strategy_demo's own dedicated
-    // trading account (never one of ui_options.demo_account_ids -- see
-    // that app's own top comment on why it trades as an account no
-    // dashboard viewer can also be trading as). Same amounts, same
-    // pre-start() timing, same reasoning as
-    // the demo accounts immediately above; kept as its own loop (of one)
-    // rather than folded into demo_account_ids itself specifically so
-    // this account is never accidentally exposed through
-    // UiGateway::find_or_create_session()'s demo-account allowlist.
+    // live_strategy_demo's own account, deliberately not one of the demo
+    // accounts: it trades as an account no dashboard viewer can also be
+    // trading as. Same amounts and same timing as above, but kept as its own
+    // loop of one so it is never exposed through the dashboard's allowlist.
     constexpr AccountId kLiveStrategyDemoAccountId = 9001;
     gateway.deposit_cash(kLiveStrategyDemoAccountId, ui_options.demo_starting_cash);
     for (InstrumentId instrument_id : ui_options.demo_instrument_ids) {

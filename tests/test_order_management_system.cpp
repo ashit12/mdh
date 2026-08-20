@@ -6,8 +6,8 @@
 
 #include "trader/oms/order_management_system.hpp"
 
-// Pure-logic unit tests for OrderManagementSystem's state machine (Milestone
-// 8) -- no real socket or gateway involved. `Sender` is faked here with a
+// Pure-logic unit tests for OrderManagementSystem's state machine -- no
+// real socket or gateway involved. `Sender` is faked here with a
 // plain vector-capturing lambda (same "std::function fake stands in for the
 // real transport" pattern MatchingEngine's own unit tests use for
 // EventSink), and gateway responses are simulated by calling

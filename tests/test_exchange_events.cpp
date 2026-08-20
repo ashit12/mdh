@@ -166,8 +166,8 @@ TEST(EventSink, CollectsMultipleEventsEmittedForOneCommand) {
     std::vector<ExchangeEvent> collected;
     EventSink sink = [&](const ExchangeEvent& ev) { collected.push_back(ev); };
 
-    // No MatchingEngine exists yet (that's Milestone 2). This simulates what
-    // it will eventually do for one crossing NewOrderCommand -- emit an
+    // Deliberately does not involve a MatchingEngine. This simulates what
+    // the engine does for one crossing NewOrderCommand -- emit an
     // acceptance, a trade, and a book reduction, in order -- to prove the
     // EventSink shape itself (a plain callable) is sufficient for a test to
     // collect an ordered sequence of heterogeneous events from one logical

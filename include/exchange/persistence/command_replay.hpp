@@ -8,7 +8,7 @@
 #include "exchange/core/events.hpp"
 #include "exchange/matching/matching_engine.hpp"
 
-// Deterministic exchange-command replay (Milestone 3): reads a command
+// Deterministic exchange-command replay: reads a command
 // journal end to end and feeds each decoded command into a fresh
 // MatchingEngine, collecting every emitted event in order. This is a
 // SEPARATE replay concept from replay::run_replay() (replay_engine.hpp) --
@@ -20,9 +20,9 @@
 namespace mdh::exchange::persistence {
 
 struct CommandReplayOptions {
-    // Only "stop on first decode error" is implemented, mirroring
-    // replay::ReplayOptions's milestone-1 scope -- a skip-and-continue
-    // policy can be added at this call site later without changing
+    // Only "stop on the first decode error" is implemented, mirroring
+    // replay::ReplayOptions -- a skip-and-continue policy can be added at
+    // this call site later without changing
     // run_command_replay()'s signature.
     bool stop_on_decode_error = true;
 };

@@ -15,99 +15,75 @@
 #include "exchange/matching/state_snapshot.hpp"
 #include "exchange/sequencing/command_sequencer.hpp"
 
-// The command-sequencer + matching-thread pipeline (Milestone 4): the piece
-// of the architecture between "however commands arrive" (a future
-// gateway/validation/risk layer, Milestones 5 and 7) and the deterministic,
-// single-threaded MatchingEngine (Milestone 2). Reuses SpscQueue exactly as
-// it already exists (common/spsc_queue.hpp), per the architecture doc's own
-// callout that it's "directly reusable for ... sequencer -> matching ...
-// boundaries as-is" -- no changes needed to that class for this milestone.
+// The sequencer and matching thread: everything between "commands arrive
+// somehow" and the deterministic, single-threaded matching engine. It uses
+// SpscQueue unchanged.
 //
-// ── Why this is NOT a DroppingQueue ──────────────────────────────────────
-// Market data can tolerate dropping a frame -- a dropped AddOrder just
-// shows up downstream as a detected, recoverable sequence gap (see
-// DroppingQueue's own doc comment, common/dropping_queue.hpp). An exchange
-// inbound command cannot be treated the same way: it represents a live
-// client request, and silently discarding it would leave a client
-// believing they submitted an order the exchange never actually saw, with
-// no way to tell the difference from an acknowledged rejection. So
-// MatchingPipeline::submit() surfaces a full queue as an explicit `false`
-// return instead of swallowing it -- turning that into an actual
-// client-facing response (e.g. a "system busy, retry" reply) is a
-// gateway/risk-layer concern for a later milestone; this milestone's job
-// stops at "did this command get sequenced and queued, yes or no."
+// ── Why this is not a DroppingQueue ───────────────────────────────────────
+// Market data can afford to drop a frame -- downstream it shows up as a
+// sequence gap the receiver can detect and repair. An inbound command
+// cannot. It is a live client request, and discarding it silently would
+// leave the client believing it had an order working that the exchange
+// never saw, indistinguishable from an acknowledged rejection.
 //
-// ── Threading model ───────────────────────────────────────────────────────
-// Single producer, single consumer, exactly like SpscQueue's own contract:
-// submit() must only ever be called from one thread (the same constraint
-// SpscQueue::try_push() already documents) -- CommandSequencer's internal
-// counter is a plain, non-atomic counter relying on that same single-writer
-// invariant, the same way SpscQueue's head_ does. The matching thread,
-// started in the constructor and joined in the destructor/stop(), is the
-// sole consumer and the only thread that ever calls
-// MatchingEngine::process() -- preserving the matching engine's documented
-// single-threaded-determinism requirement even though commands now arrive
-// asynchronously from a different thread than the one that processes them.
+// So submit() reports a full queue as an explicit `false` instead of
+// swallowing it. Turning that into a client-facing "busy, retry" reply is
+// the gateway's business; this class stops at "was this command sequenced
+// and queued, yes or no."
 //
-// The EventSink supplied at construction is invoked synchronously on the
-// matching thread, exactly like every other EventSink call site in this
-// codebase (see event_sink.hpp) -- MatchingPipeline adds no thread-hopping
-// or buffering on the output side; a caller that needs events observed
-// from a different thread must arrange that itself (e.g. by having its
-// sink push onto its own queue), the same way EventSink has always left
-// delivery-thread concerns to the caller.
+// ── Threads ───────────────────────────────────────────────────────────────
+// One producer, one consumer, exactly as SpscQueue requires. submit() must
+// be called from a single thread: the sequencer's counter is a plain
+// non-atomic relying on that, the same way the queue's own head index does.
+//
+// The matching thread is started in the constructor and joined in stop() or
+// the destructor. It is the only consumer and the only thread that ever
+// calls into the matching engine, which is what preserves the engine's
+// single-threaded determinism even though commands now arrive from
+// elsewhere.
+//
+// The EventSink runs synchronously on the matching thread. This class adds
+// no buffering or thread-hopping on the way out -- a caller that needs
+// events on another thread must arrange that itself, for instance by having
+// its sink push onto a queue of its own.
 namespace mdh::exchange::sequencing {
 
 struct MatchingPipelineOptions {
     std::size_t queue_capacity = 1024;
 
-    // Every instrument the MatchingEngine this pipeline owns will trade.
-    // Commands naming anything else are rejected -- see MatchingEngine's
-    // constructor. Empty means an engine that rejects everything, which is
-    // the right default for a type whose whole job is transport: a caller
-    // that does not say what it trades has not finished configuring it.
+    // Every instrument this pipeline's engine will trade; anything else is
+    // rejected. Empty means an engine that rejects everything, which is the
+    // right default for a class whose job is transport: a caller that has
+    // not said what it trades has not finished configuring it.
     std::vector<InstrumentId> instruments;
 
-    // Passed straight to the MatchingEngine this pipeline owns -- see
-    // MatchingEngine::kDefaultExpectedRestingOrders for what it buys and
-    // what guessing low costs.
+    // Passed to the engine -- see kDefaultExpectedRestingOrders for what it
+    // buys and what guessing low costs.
     std::size_t expected_resting_orders = MatchingEngine::kDefaultExpectedRestingOrders;
 
-    // Artificial delay applied by the matching thread after processing
-    // each command -- a deterministic way to simulate a slow matching
-    // core (e.g. a heavier instrument mix) without depending on incidental
-    // machine/OS-scheduling timing to ever exercise submit()'s backpressure
-    // path in a test. Mirrors net::UdpListenOptions::consumer_delay
-    // exactly, same rationale. Zero (the default) means no artificial delay.
+    // An artificial pause after each command, so a test can exercise
+    // submit()'s backpressure path deterministically instead of hoping the
+    // OS scheduler produces a slow enough consumer. Zero by default.
     std::chrono::microseconds matching_delay{0};
 };
 
 class MatchingPipeline {
 public:
-    // A pluggable substitute for calling engine_.process() directly on the
-    // matching thread (Milestone 7) -- lets a caller wrap the bare
-    // MatchingEngine with additional behavior (e.g.
-    // exchange::risk::RiskGatedEngine, Milestone 5, composing risk-checking
-    // and ledger updates around it) while keeping every threading/queueing
-    // guarantee this class already provides completely unchanged. Same
-    // signature as MatchingEngine::process() and RiskGatedEngine::process()
-    // themselves, so either one can be adapted into this type with nothing
-    // more than a lambda that forwards the call -- see the constructor's
-    // own doc comment for how the default (no processor supplied) case
-    // preserves exactly today's behavior.
+    // A stand-in for calling the engine directly on the matching thread, so
+    // a caller can wrap it with extra behaviour -- RiskGatedEngine, which
+    // adds risk checks and ledger updates -- without changing any of the
+    // threading or queueing guarantees here. It has the same signature as
+    // both engines' own process(), so either adapts with a forwarding
+    // lambda.
     using Processor = std::function<void(const ExchangeCommand&, const EventSink&)>;
 
-    // `processor`, if supplied, is invoked on the matching thread in place
-    // of engine_.process() for every command dequeued -- see the Processor
-    // alias comment above. Defaults to nullptr, meaning "call
-    // engine_.process() directly," so every existing caller that never
-    // passes one (i.e. every caller before this parameter existed) sees
-    // exactly the same behavior as before.
+    // If `processor` is supplied it runs on the matching thread for every
+    // command dequeued, in place of the engine. Null means call the engine
+    // directly.
     explicit MatchingPipeline(EventSink sink, const MatchingPipelineOptions& options = {},
                                Processor processor = nullptr);
 
-    // Requests the matching thread stop (after draining, see stop()) and
-    // joins it.
+    // Asks the matching thread to drain and stop, then joins it.
     ~MatchingPipeline();
 
     MatchingPipeline(const MatchingPipeline&) = delete;
@@ -115,33 +91,26 @@ public:
     MatchingPipeline(MatchingPipeline&&) = delete;
     MatchingPipeline& operator=(MatchingPipeline&&) = delete;
 
-    // Producer side only (see class-level threading-model comment).
-    // Assigns `command` its authoritative CommandSequence, then enqueues it
-    // for the matching thread. Returns false, without sequencing or
-    // processing anything, if the queue is currently full -- see the
-    // class-level comment on why this is a rejection, not a silent drop.
+    // Producer side only. Gives `command` its authoritative sequence number
+    // and queues it for the matching thread. Returns false, having sequenced
+    // and processed nothing, if the queue is full -- see the class comment
+    // on why that is a rejection rather than a silent drop.
     [[nodiscard]] bool submit(ExchangeCommand command);
 
-    // Requests the matching thread stop once it has processed every
-    // command already sitting in the queue (never mid-drain), then joins
-    // it. Safe to call more than once (including implicitly via the
-    // destructor); a no-op if the thread has already been joined. Exposed
-    // separately from the destructor so a caller can request shutdown and
-    // still call snapshot() afterwards on a still-alive object.
+    // Asks the matching thread to stop once it has processed everything
+    // already queued -- never mid-drain -- then joins it. Safe to call more
+    // than once, including from the destructor. Separate from the destructor
+    // so a caller can shut down and still call snapshot() afterwards.
     void stop();
 
-    // Only safe to call after stop() has returned (i.e. the matching
-    // thread has been joined) -- std::jthread::join()'s happens-before
-    // guarantee is what makes reading engine_ from another thread safe at
-    // that point, exactly the same reasoning net::run_udp_listen() relies
-    // on to return `outcome.books` only after both its threads are joined.
-    // Calling this while the matching thread is still running is a data
-    // race and not guarded against at runtime, the same way SpscQueue does
-    // not runtime-check its own producer/consumer-only contract either.
+    // Only safe after stop() has returned. Joining the matching thread is
+    // what makes reading the engine from another thread safe; calling this
+    // while it still runs is a data race, unguarded at runtime, just as
+    // SpscQueue does not check its own single-producer contract.
     [[nodiscard]] EngineStateSnapshot snapshot() const { return engine_.snapshot(); }
 
-    // Introspection, safe to call from any thread as a best-effort
-    // snapshot (same caveat as SpscQueue::size()/high_water_mark()).
+    // Best-effort introspection, safe from any thread, with the same caveat
+    // as the queue's own size() and high_water_mark().
     [[nodiscard]] std::size_t queue_size() const { return queue_.size(); }
     [[nodiscard]] std::size_t queue_high_water_mark() const { return queue_.high_water_mark(); }
     [[nodiscard]] std::size_t commands_processed() const {
@@ -151,17 +120,17 @@ public:
 
 private:
     EventSink sink_;
-    CommandSequencer sequencer_; // producer-thread-only, see class-level comment
+    CommandSequencer sequencer_; // producer thread only
     SpscQueue<ExchangeCommand> queue_;
-    MatchingEngine engine_; // matching-thread-only while running; see snapshot()'s precondition
-    Processor processor_;   // see the Processor alias comment above; matching-thread-only, like engine_
+    MatchingEngine engine_; // matching thread only while running; see snapshot()
+    Processor processor_;   // matching thread only, like engine_
 
-    std::atomic<std::size_t> commands_processed_{0}; // written by the matching thread only
-    std::atomic<std::size_t> commands_rejected_{0};  // written by the producer thread only (submit())
+    std::atomic<std::size_t> commands_processed_{0}; // matching thread writes
+    std::atomic<std::size_t> commands_rejected_{0};  // producer thread writes
 
     MatchingPipelineOptions options_;
     std::stop_source stop_source_;
-    std::jthread matching_thread_; // started last: must see a fully-initialized *this
+    std::jthread matching_thread_; // last: it must see a fully built *this
 };
 
 } // namespace mdh::exchange::sequencing

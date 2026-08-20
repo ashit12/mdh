@@ -8,10 +8,9 @@
 #include "exchange/core/types.hpp"
 #include "trader/oms/order_management_system.hpp"
 
-// Per-account cash and instrument-position bookkeeping, kept purely by
-// watching OrderManagementSystem::Fill events (Milestone 9) -- the
-// trader-side mirror of exchange::ledger::Ledger, which keeps the
-// authoritative equivalent by watching ExchangeEvent (Milestone 5). Same
+// Per-account cash and position bookkeeping, kept purely by watching the
+// OMS's fill events -- the trader-side mirror of the exchange's ledger,
+// which keeps the authoritative equivalent by watching exchange events. Same
 // "one object is the single place this state changes, fed by a sink"
 // pattern; see PositionTracker::sink().
 //
@@ -26,17 +25,17 @@
 // has no such guarantee to lean on: it is a *second*, independent,
 // best-effort screen sitting in front of the OMS (see trader::risk::
 // TraderRiskGatedOms) -- the exchange's own risk-gated engine remains the
-// authoritative check no matter what this milestone does. Reservation
+// authoritative check no matter what this class does. Reservation
 // bookkeeping this class cannot make authoritative would only add
-// complexity without adding safety, so this milestone deliberately tracks
+// complexity without adding safety, so it deliberately tracks
 // *settled* (post-fill) balances only, exactly like Ledger's own `total`
 // fields, with nothing corresponding to `reserved`.
 namespace mdh::trader::positions {
 
 // Cash is kept on the same fixed-point tick scale as Price (common/
 // types.hpp) and signed for the same reason exchange::ledger::Balance is:
-// well-defined arithmetic regardless, even though this milestone does not
-// expect it to go negative in practice. Deliberately a distinct type from
+// well-defined arithmetic regardless, even though it is not expected to go
+// negative in practice. Deliberately a distinct type from
 // exchange::ledger::Balance -- see docs/end_to_end_architecture.md section
 // 5's general rule that the trader side and exchange side never share a
 // class just because the shape happens to match.

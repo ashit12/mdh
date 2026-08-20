@@ -1,5 +1,4 @@
-// Milestone 15: heap allocation behaviour and memory footprint of the
-// matching hot path.
+// Heap allocation behaviour and memory footprint of the matching hot path.
 //
 // The question this answers is not "is the engine fast" but "what does it
 // ask the allocator for". It began as the measurement that justified the

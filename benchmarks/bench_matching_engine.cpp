@@ -1,8 +1,8 @@
-// Milestone 15: matching-engine operation latency, measured without
-// per-iteration timer manipulation.
+// Matching-engine operation latency, measured without per-iteration timer
+// manipulation.
 //
-// ── What changed from Milestone 13, and why ────────────────────────────────
-// The original version of this file bracketed its per-iteration setup in
+// ── Why there is no PauseTiming()/ResumeTiming() here ──────────────────────
+// An earlier version of this file bracketed its per-iteration setup in
 // state.PauseTiming()/state.ResumeTiming(). Google Benchmark's own
 // documentation warns those calls are relatively heavyweight, and the
 // numbers recorded in docs/benchmarks.md §4 showed exactly that: every case

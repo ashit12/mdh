@@ -8,12 +8,10 @@
 namespace mdh::exchange {
 namespace {
 
-// orders_ allocates a single node per resting order, now the wider of the
-// two it used to allocate because it carries the location the book's own
-// index used to hold. The bound is set well above that node's size for the
-// reason spelled out in matching_book.cpp: libc++ only pools blocks up to a
-// quarter of this value, and a node that misses the pool lands in an adhoc
-// list with a linear-scan deallocate.
+// orders_ allocates one node per resting order. The bound is set well above
+// that node's actual size for the reason given in matching_book.cpp: libc++
+// only pools blocks up to a quarter of this value, and a node that misses
+// the pool lands in an adhoc list whose deallocate is a linear scan.
 constexpr std::size_t kLargestPooledBlock = 1024;
 constexpr std::size_t kMaxBlocksPerChunk = 4096;
 
@@ -36,14 +34,13 @@ MatchingEngine::MatchingEngine(std::span<const InstrumentId> universe, std::size
     }
     if (!universe.empty()) {
         slot_of_id_.assign(static_cast<std::size_t>(widest) + 1, kNoSlot);
-        // expected_resting_orders counts every instrument's orders, so each
-        // book gets an equal share of it. Split evenly rather than cleverly:
-        // the engine has no way to know which instruments will be busy, and
-        // being wrong per book costs only the relocations a wrong figure was
-        // always going to cost. An engine constructed with no universe at
-        // all -- replay, which learns its instruments from the journal --
-        // reserves nothing, since the share would be a division by the
-        // number of instruments it does not yet have.
+        // expected_resting_orders counts orders across every instrument, so
+        // each book gets an equal share. Split evenly rather than cleverly:
+        // the engine cannot know which instruments will be busy, and being
+        // wrong per book only costs relocations a wrong total was going to
+        // cost anyway. An engine built with no universe -- replay, which
+        // learns its instruments from the journal -- reserves nothing, since
+        // there is nothing yet to divide by.
         expected_orders_per_book_ = expected_resting_orders / universe.size();
         // Sized from the whole universe before the first book is built, so
         // that every book in it gets the same band -- registering them one

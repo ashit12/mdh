@@ -76,8 +76,8 @@ TEST(UdpReplayE2E, SingleFrameOverLoopbackReconstructsBookState) {
     EXPECT_EQ(result.packet_errors, 0u);
     EXPECT_EQ(result.packet_seq_stats.in_order, 1u);
     EXPECT_EQ(result.outcome.stats.messages_processed, 1u);
-    // The producer/consumer queue introduced in milestone 3: on this
-    // uncontended happy path the consumer easily keeps up, so nothing
+    // The producer/consumer queue: on this uncontended happy path the
+    // consumer easily keeps up, so nothing
     // should ever have been dropped, and the peak occupancy should be
     // small (at most the one frame sent).
     EXPECT_EQ(result.queue_dropped_count, 0u);
@@ -248,13 +248,13 @@ TEST(UdpReplayE2E, SlowConsumerForcesDrops) {
 }
 
 TEST(UdpReplayE2E, QueueBuffersLiveTrafficWhileConsumerRecoversFromSnapshot) {
-    // This is milestone 3's queue doing new work for free: while the
+    // This is the queue doing extra work for free: while the
     // consumer thread is busy (simulated via consumer_delay, standing in
     // for "recovery involves book reconstruction, which takes real time"),
     // the producer thread keeps receiving and pushing normally -- nothing
-    // special has to be built for the queue to act as the "buffered
-    // incremental messages" milestone 4's plan calls for; it already does,
-    // just by continuing to do what it always does.
+    // special has to be built for the queue to act as the buffer of
+    // incremental messages snapshot recovery needs; it already does, just
+    // by continuing to do what it always does.
     TempFile snapshot_file("mdh_test_udp_recovery_snapshot.bin");
     {
         book::BookManager snapshot_books;

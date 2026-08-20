@@ -1,13 +1,12 @@
-# Live demonstration (Milestone 14's capstone)
+# Live demonstration
 
 **Status:** actually run, once, end to end, on this machine, on 2026-08-09 -- every
 number, log line, and the screenshot below are real output from that run, not
 illustrative/hypothetical -- same documentation discipline `docs/benchmarks.md` and
 `docs/failure_injection.md` apply to their own claims.
 
-This is the final piece of the milestone list `docs/current_system_assessment.md`
-originally scoped: "run a live strategy with UI activity." It ties together
-everything built across Milestones 1-14 into one running system: a real exchange, a
+This is the capstone: a live strategy trading with real UI activity. It ties together
+everything in the repository into one running system: a real exchange, a
 real browser dashboard, a real market-making strategy, and a real human-shaped trader
 (driven here by `curl`, exercising exactly the same REST surface a person clicking
 the dashboard would) all interacting over real sockets at the same time.
@@ -17,7 +16,7 @@ the dashboard would) all interacting over real sockets at the same time.
 ## 1. What's actually running, and how it's wired
 
 ```
-apps/trading_server (Milestone 12)
+apps/trading_server
     OrderEntryGateway  --tcp:7100-------------------+
          |                                          |
          +--extra_event_sink--> MarketDataPublisher |
@@ -30,17 +29,16 @@ apps/trading_server (Milestone 12)
                                       |
               +---------------------+----------------------+
               |                                             |
-   a browser (headless Chrome, this demo)          apps/live_strategy_demo (Milestone 14, new)
+   a browser (headless Chrome, this demo)          apps/live_strategy_demo
    GET/POST /api/*, GET /api/stream                  tcp:7100 (real order flow, account 9001)
    -- exactly what a human at the                     http:8180 GET /api/book/1 (polls the
    dashboard would do                                 UI gateway's own live-reconstructed book)
 ```
 
-`apps/live_strategy_demo` (new in this milestone) is the piece that finally closes the
-gap `trader/strategies/strategy_runtime.hpp`'s own class comment documented as future
-work back at Milestone 10: *"no live UDP feed is wired up to a running gateway yet
-... wiring that end-to-end live path remains future, out-of-scope integration work."*
-It wires a real `MarketMakerStrategy` to a real, running `trading_server` -- trading
+`apps/live_strategy_demo` is the piece that closes the gap between the strategy
+runtime and a live, running exchange process: for a long time the strategy layer was
+only ever exercised in-process, against synthetic events or a book the test built by
+hand. It wires a real `MarketMakerStrategy` to a real, running `trading_server` -- trading
 through a real `TraderRiskGatedOms`/`OrderEntryClient` pair over TCP, quoting off the
 book it gets by polling `UiGateway`'s own `GET /api/book/:id` (see that app's own
 top-of-file comment for why polling the already-tested REST endpoint was chosen over
@@ -154,8 +152,8 @@ curl -s -X POST http://127.0.0.1:8180/api/orders -H "Content-Type: application/j
 
 ## 4. What this demonstrates, concretely
 
-- **A real strategy, unmodified from what Milestone 10 built and tested
-  in-process, trades correctly against a real, running exchange process** -- the
+- **A real strategy, unmodified from the version tested in-process, trades
+  correctly against a real, running exchange process** -- the
   same `MarketMakerStrategy` class, the same quoting math (mid ± `half_spread`,
   requote only past `requote_threshold`), now proven against a live book fetched
   over a real network call instead of a hand-fed local mirror.
@@ -186,8 +184,8 @@ curl -s -X POST http://127.0.0.1:8180/api/orders -H "Content-Type: application/j
   to more than one destination port, real production work out of scope here.
 - **The IOC orders in step 3/4 above are logged by the UI's Activity feed as
   transitioning straight to a state that never shows an explicit "Cancelled" for any
-  unfilled remainder** -- this is pre-existing, documented Milestone 3/4 behavior, not
-  a bug introduced by this milestone: `MatchingEngine::rest_remainder_if_applicable()`
+  unfilled remainder** -- this is pre-existing, documented matching-engine behavior,
+  not a bug introduced by the demo: `MatchingEngine::rest_remainder_if_applicable()`
   and `Ledger::on_order_accepted()` both explicitly skip any bookkeeping for an
   IOC/FOK order's unfilled remainder ("any remainder is discarded silently -- never
   accepted as resting, so there is nothing to announce" -- `matching_engine.cpp`'s own

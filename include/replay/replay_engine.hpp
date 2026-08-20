@@ -13,21 +13,20 @@
 namespace mdh::replay {
 
 struct ReplayOptions {
-    // Milestone 1 only implements "stop on first error" (per spec); these
-    // flags exist so a later milestone can add a skip-and-continue policy
-    // at this call site without changing run_replay()'s signature.
+    // Only "stop on the first error" is implemented. These flags exist so a
+    // skip-and-continue policy can be added at this call site later without
+    // changing run_replay()'s signature.
     bool stop_on_sequence_error = true;
     bool stop_on_decode_error = true;
 
-    // Milestone 4: if set, a detected sequence GAP (SequenceOutcome::Missing
-    // specifically -- not a Duplicate or OutOfOrder, see apply_frame_result's
-    // doc comment for why) loads this snapshot and resumes instead of
-    // stopping. Reloaded from disk fresh every time recovery triggers -- if
-    // multiple gaps occur in one run, each one reloads the SAME snapshot
-    // file, which is only as fresh as whenever it was written. A real
-    // system would fetch a current snapshot per recovery event, which needs
-    // a live snapshot-serving/retransmission infrastructure this project
-    // doesn't model; this is a deliberate, documented simplification.
+    // If set, a detected gap -- a genuine Missing, not a duplicate or a
+    // reorder -- loads this snapshot and resumes instead of stopping.
+    //
+    // Reloaded from disk every time recovery triggers, so several gaps in
+    // one run all reload the same file, which is only as fresh as whenever
+    // it was written. A real system would fetch a current snapshot per
+    // recovery; that needs snapshot-serving infrastructure this project does
+    // not model.
     std::optional<std::string> recovery_snapshot_path;
 };
 
@@ -63,25 +62,21 @@ struct ReplayOutcome {
 // function from a UDP receive loop instead of a file-read loop. Only the
 // "where do frames come from" part differs between the two call sites.
 //
-// Sequence-gap recovery (milestone 4): only a SequenceOutcome::Missing
-// classification -- a genuine gap -- triggers snapshot-based recovery, if
-// `options.recovery_snapshot_path` is set. Duplicate and OutOfOrder keep
-// their existing stop_on_sequence_error-governed behavior unchanged: a
-// duplicate isn't evidence anything was lost (reprocessing it would be
-// wrong, and a full book reset would be pure regression), and a
-// genuinely-reordered-but-not-missing message calls for buffer-and-reorder
-// in a real system, not a snapshot reset -- neither is what recovery is
-// for. On a Missing classification with a snapshot configured: the
-// snapshot is loaded, `outcome.books` is replaced with its state, and the
-// event that revealed the gap becomes the new validator baseline (there is
-// no way to fill in exactly what happened between the snapshot's sequence
-// and this event without a real gap-fill/retransmission service, which is
-// out of scope -- see ReplayOptions::recovery_snapshot_path). That event is
-// then applied normally; if it references an order that only existed
-// during the unrecoverable window, that surfaces as an ordinary
-// BookError/book_errors count, not a crash -- the same machinery that
-// already handles any "operating on an order the book doesn't know about"
-// case.
+// Only a genuine gap triggers snapshot recovery, and only when
+// `options.recovery_snapshot_path` is set. Duplicates and reorders keep
+// their ordinary stop_on_sequence_error behaviour: a duplicate is no
+// evidence anything was lost, so reprocessing it would be wrong and a full
+// book reset would be a pure regression, while a reordered-but-not-missing
+// message calls for buffer-and-reorder in a real system rather than a reset.
+//
+// On a genuine gap with a snapshot configured, the snapshot is loaded,
+// `outcome.books` is replaced with its state, and the event that revealed
+// the gap becomes the new validator baseline -- there is no way to fill in
+// what happened between the snapshot's sequence and that event without a
+// retransmission service, which is out of scope. The event is then applied
+// normally. If it references an order that only existed during the
+// unrecoverable window, that shows up as an ordinary book error rather than
+// a crash, through the same path as any operation on an unknown order.
 [[nodiscard]] bool apply_frame_result(std::variant<protocol::Event, protocol::DecodeError> frame,
                                        SequenceValidator& validator,
                                        const ReplayOptions& options,

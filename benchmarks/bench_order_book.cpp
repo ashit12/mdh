@@ -1,12 +1,9 @@
-// Milestone 13: throughput of the trader-side reconstructed book
+// Throughput of the trader-side reconstructed book
 // (book::OrderBook) -- add/cancel/modify, plus top_bids()/top_asks() query
-// cost at varying depth. This is the closest available analog to
-// docs/current_system_assessment.md's named-but-never-built "comparison of
-// alternative book representations" benchmark: rather than building a
-// second book representation from scratch (a large, separate design
-// exercise unto itself -- see that doc's §10 on why OrderBook itself
-// cannot just be repurposed for matching), this measures how the one
-// representation that actually exists (std::map-per-side + std::list-per-
+// cost at varying depth. A comparison of alternative book representations
+// would mean building a second representation from scratch, a large design
+// exercise unto itself; instead this measures how the one representation
+// that exists (std::map-per-side + std::list-per-
 // level + unordered_map index, order_book.hpp's own documented complexity
 // analysis) behaves as book depth grows, which is the input any future
 // alternative-representation comparison would need as its baseline.
@@ -100,7 +97,7 @@ BENCHMARK(BM_OrderBook_ModifyOrderRepriceLosesPriority);
 
 // Query cost (best_bid()/top_bids()) as a function of requested depth `n`
 // against a book with 1024 distinct bid levels -- the read path a UI
-// gateway's GET /api/book/:id (Milestone 12) and every SSE "book" event
+// gateway's GET /api/book/:id and every SSE "book" event
 // actually exercise live.
 static void BM_OrderBook_TopBids(benchmark::State& state) {
     const auto n = static_cast<std::size_t>(state.range(0));

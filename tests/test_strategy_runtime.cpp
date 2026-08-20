@@ -4,7 +4,7 @@
 
 #include "trader/strategies/strategy_runtime.hpp"
 
-// Pure-logic unit tests for StrategyRuntime (Milestone 10) -- fed synthetic
+// Pure-logic unit tests for StrategyRuntime -- fed synthetic
 // protocol::Event values directly and a fresh book::BookManager, exactly
 // the same style replay's own tests use synthetic Events (see
 // tests/test_sequence_recovery.cpp), with no file/socket/OMS involved.

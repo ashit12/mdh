@@ -10,16 +10,16 @@
 #include "trader/risk/trader_risk_gated_oms.hpp"
 #include "trader/strategies/cross_venue_arbitrage_strategy.hpp"
 
-// The Milestone 11 "two-venue simulation": TWO complete, independent
-// exchange stacks (each its own OrderEntryGateway, in front of its own
-// matching engine and ledger, per Milestone 7's own composition), running
+// The "two-venue simulation": TWO complete, independent exchange stacks
+// (each its own OrderEntryGateway, in front of its own matching engine and
+// ledger, composed exactly as the gateway normally is), running
 // side by side in the same test process on two different ports, each with
 // its own liquidity-provider account creating a genuine price discrepancy
 // between them. A single CrossVenueArbStrategy, trading through two
 // separate real TraderRiskGatedOms + OrderEntryClient pairs (one per
 // venue), observes both venues' books and captures the edge with two real,
 // independent IOC order round trips -- proving both that a second strategy
-// composes on the Milestone 10 plumbing untouched, and that the plumbing
+// composes on the market maker's plumbing untouched, and that the plumbing
 // itself has no hidden single-venue assumption anywhere in it.
 //
 // See test_market_maker_strategy_e2e.cpp's own doc comment for why each

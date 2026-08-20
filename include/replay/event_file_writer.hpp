@@ -9,8 +9,8 @@
 namespace mdh::replay {
 
 // Writes encoded events to a binary file, sequentially, with no framing
-// beyond each event's own header (there is no outer file header/footer in
-// milestone 1 -- the file is just a concatenation of frames).
+// beyond each event's own header -- there is no outer file header or
+// footer, so the file is just a concatenation of frames.
 class EventFileWriter {
 public:
     explicit EventFileWriter(const std::string& path);

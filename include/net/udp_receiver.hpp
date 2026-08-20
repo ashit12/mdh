@@ -10,8 +10,7 @@ namespace mdh::net {
 
 // One received datagram, tagged with a local receive timestamp -- when
 // *this* process saw it via recvfrom(), not any timestamp the sender
-// claims. Useful for later end-to-end latency measurement (milestone 5);
-// not otherwise acted on in milestone 2.
+// claims. Useful for end-to-end latency measurement; not otherwise acted on.
 struct ReceivedDatagram {
     std::vector<std::byte> bytes;
     std::uint64_t receive_timestamp_ns;

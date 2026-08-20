@@ -1,9 +1,9 @@
-# mdh trading dashboard (Milestone 12)
+# mdh trading dashboard
 
 A React + Vite + TypeScript single-page app for `ui_gateway::UiGateway`'s
 REST + Server-Sent-Events API (see `../include/ui_gateway/ui_gateway.hpp`
-and `../docs/exchange_flow.md`'s "Milestone 12" section for the backend side
-of this). Order book, order entry, positions/cash, open orders
+and `../docs/exchange_flow.md`'s UI gateway section for the backend side of
+this). Order book, order entry, positions/cash, open orders
 (cancel/replace), and a live activity feed -- all kept in sync by one shared
 `EventSource` connection to `/api/stream` plus the REST calls a newly
 selected account/instrument needs to hydrate.

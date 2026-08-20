@@ -14,7 +14,7 @@
 #include "protocol/order_entry/decoder.hpp"
 #include "protocol/order_entry/encoder.hpp"
 
-// The Milestone 7 loop-closing test: proves the gateway is actually reachable
+// The loop-closing test for the gateway: proves it is actually reachable
 // and correct end to end over a real TCP loopback connection -- not just that
 // its pieces (codec, TcpSocket, MatchingPipeline's Processor seam) are
 // individually correct in isolation, the way their own unit tests already

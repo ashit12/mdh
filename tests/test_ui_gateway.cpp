@@ -19,16 +19,16 @@
 #include "net/udp_socket.hpp"
 #include "ui_gateway/ui_gateway.hpp"
 
-// The Milestone 12 loop-closing test: a real OrderEntryGateway, publishing
-// real market data over a real UDP socket (via the new
-// OrderEntryGatewayOptions::extra_event_sink hook), observed by a real
+// The loop-closing test for the UI gateway: a real OrderEntryGateway,
+// publishing real market data over a real UDP socket (via
+// OrderEntryGatewayOptions::extra_event_sink), observed by a real
 // UiGateway reconstructing a live book and holding real
 // TraderRiskGatedOms + OrderEntryClient sessions over a real TCP
 // connection -- exercised entirely through UiGateway's actual REST/SSE
 // surface (httplib::Client), never by reaching into its internals. Proves
 // the same thing every other *_e2e.cpp in this codebase proves for its own
-// milestone: the pieces built here compose correctly with everything
-// beneath them, over real transports, not just in isolation.
+// layer: the pieces compose correctly with everything beneath them, over
+// real transports, not just in isolation.
 using namespace mdh;
 using namespace mdh::exchange;
 using namespace std::chrono_literals;
@@ -369,7 +369,7 @@ TEST(UiGatewayTest, StreamDeliversAnOrderEventAfterSubmission) {
 }
 
 TEST(UiGatewayTest, GatewayHttpAndMarketDataPortsAreAllIndependentlyEphemeral) {
-    // Two full stacks, back to back -- proves nothing in this milestone
+    // Two full stacks, back to back -- proves nothing in the UI gateway
     // hardcodes a port anywhere (see apps/trading_server for the CLI-args
     // equivalent of this same property in the actual binary).
     RunningStack first;

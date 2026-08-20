@@ -39,7 +39,7 @@ struct SequenceCheck {
 //
 // The validator only classifies; it does not decide what to do about a
 // non-InOrder outcome. That policy decision belongs to the caller, which
-// keeps this class reusable if a later milestone wants a configurable
+// keeps this class reusable if something later wants a configurable
 // recovery policy (skip-and-continue, buffer-and-reorder, etc.) without
 // changing this interface.
 class SequenceValidator {

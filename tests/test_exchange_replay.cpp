@@ -102,7 +102,7 @@ TEST(ExchangeReplay, SameJournalProducesIdenticalFinalStateAcrossTwoRuns) {
     // Direct structural equality of the canonical state dump...
     EXPECT_EQ(snapshot1, snapshot2);
     // ...and the single-value hash derived from it, both proving the same
-    // thing two different ways (the milestone allows either).
+    // thing two different ways.
     EXPECT_EQ(hash_state_snapshot(snapshot1), hash_state_snapshot(snapshot2));
 
     // Sanity: the final state isn't trivially empty (i.e. this is actually

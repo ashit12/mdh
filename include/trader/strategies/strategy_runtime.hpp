@@ -7,7 +7,7 @@
 #include "common/types.hpp"
 #include "protocol/messages.hpp"
 
-// The trader-side strategy runtime (Milestone 10) -- the piece named
+// The trader-side strategy runtime -- the piece named
 // "Strategy runtime" in docs/end_to_end_architecture.md's system diagram,
 // sitting between the existing, untouched market-data reconstruction
 // pipeline (book::BookManager/OrderBook, protocol/messages.hpp) and however
@@ -27,19 +27,15 @@
 // and trader::positions::PositionTracker::sink() wrap apply()/apply().
 //
 // ── Why this is NOT wired into replay::apply_frame_result() itself ───────
-// That function (Milestone 1) is heavily tested and reused by both file
-// replay and UDP replay; it has no reason to know strategies exist.
-// StrategyRuntime::on_event() is meant to be called by whatever already
-// drives BookManager (a live UDP listener loop, or a test), immediately
-// after apply_frame_result() returns -- one extra call at an existing call
-// site, not a change to Milestone 1-4's own code. Per docs/exchange_flow.md's
-// own "Integration status" section, no live UDP feed is wired up to a
-// running gateway yet (MarketDataPublisher isn't bound into the gateway's
-// matching thread), so this class's own tests exercise it against
-// synthetic protocol::Event values the same way replay's own tests do,
-// not against a live socket -- wiring that end-to-end live path remains
-// future, out-of-scope integration work, not something this milestone
-// silently expands into.
+// That function is heavily tested and reused by both file replay and UDP
+// replay; it has no reason to know strategies exist. StrategyRuntime::
+// on_event() is meant to be called by whatever already drives BookManager
+// (a live UDP listener loop, or a test), immediately after
+// apply_frame_result() returns -- one extra call at an existing call site,
+// rather than a change to the replay code itself. This class's own tests
+// therefore drive it with synthetic protocol::Event values the same way
+// replay's tests do; the live socket path is covered separately by the
+// end-to-end strategy tests and the live demo app.
 namespace mdh::trader::strategies {
 
 using BookUpdateSink = std::function<void(InstrumentId, const book::OrderBook&)>;

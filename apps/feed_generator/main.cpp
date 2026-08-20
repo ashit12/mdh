@@ -3,10 +3,9 @@
 // Usage:
 //   feed_generator --output events.bin --orders 100000 --seed 42 [--instruments 10]
 //
-// Every AddOrder/CancelOrder/ModifyOrder/Trade/ClearBook this milestone's
-// generator produces is valid (well-formed and sequence-correct) -- fault
-// injection (corrupt bytes, dropped/duplicated packets) is out of scope
-// until milestone 6, per the project plan. --seed fully determines the
+// Every message this generator produces is valid: well-formed and
+// sequence-correct. Fault injection -- corrupt bytes, dropped or duplicated
+// packets -- lives in the tests, not here. --seed fully determines the
 // output: the same seed and --orders value always produce a byte-identical
 // file, since the only sources of "randomness" are seeded std::mt19937_64
 // draws.

@@ -6,33 +6,29 @@
 #include "common/types.hpp"
 #include "exchange/core/types.hpp"
 
-// Wire format for the order-entry protocol (Milestone 7): a bidirectional
-// TCP stream between one client and the gateway, carrying both client
-// requests (NewOrder/CancelOrder/ReplaceOrder) and gateway responses
-// (Accepted/Rejected/Cancelled/Replaced/TradeReport) -- unlike
-// protocol/messages.hpp (Milestone 1), which is one-way, UDP, market-data
-// only. The two protocols intentionally do not share an Event/Message type
-// or a header: they exist for different transports with different
-// guarantees, and forcing a single shared representation between them would
-// couple a lossy, unordered, one-way feed to a reliable, ordered, two-way
-// session for no real benefit.
+// The order-entry wire format: a two-way TCP stream between one client and
+// the gateway, carrying client requests (NewOrder, CancelOrder,
+// ReplaceOrder) and gateway responses (Accepted, Rejected, Cancelled,
+// Replaced, TradeReport). It resembles what the industry calls OUCH.
 //
-// ── Why there's no sequence_number here (unlike protocol/messages.hpp) ───
-// The UDP header carries a sequence_number because UDP can drop or reorder
-// datagrams -- a receiver needs it to detect gaps and request/perform
-// recovery (see common/sequence_validator.hpp). TCP already guarantees
-// ordered, lossless, exactly-once delivery of the byte stream itself, so
-// there is nothing left for an application-level sequence number to detect;
-// carrying one here would be redundant with what the transport already
-// provides.
+// protocol/messages.hpp is the other half: one-way, UDP, market data only,
+// resembling ITCH. The two share no header and no message type on purpose.
+// They run over different transports with different guarantees, and forcing
+// one representation would tie a lossy, unordered, public broadcast to a
+// reliable, ordered, private session for no benefit.
 //
-// ── Why the header is smaller (3 bytes vs. 20) ────────────────────────────
-// A UDP receiver gets one whole datagram per recvfrom() call, so
-// message-boundary detection is free (the OS already delivered exactly one
-// message). A TCP receiver gets an arbitrary, possibly-partial slice of the
-// byte stream per read() call, so the header's only remaining job is
-// framing -- telling the reader how many payload bytes to wait for before a
-// complete message is available -- hence just `type` + `payload_size`.
+// ── Why there is no sequence number here ──────────────────────────────────
+// The market-data header carries one because UDP can drop and reorder
+// datagrams, so a receiver needs it to spot gaps and recover. TCP already
+// guarantees ordered, lossless, exactly-once delivery of the byte stream, so
+// an application-level sequence number would have nothing left to detect.
+//
+// ── Why the header is 3 bytes rather than 20 ──────────────────────────────
+// A UDP receiver gets exactly one whole datagram per recvfrom(), so message
+// boundaries come free from the OS. A TCP receiver gets an arbitrary,
+// possibly partial slice of the stream per read(), so the header's only
+// remaining job is framing: saying how many payload bytes to wait for. Hence
+// just a type and a size.
 namespace mdh::protocol::order_entry {
 
 inline constexpr std::size_t HEADER_SIZE = 3; // type (u8) + payload_size (u16)

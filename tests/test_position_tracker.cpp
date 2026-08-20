@@ -2,7 +2,7 @@
 
 #include "trader/positions/position_tracker.hpp"
 
-// Pure-logic unit tests for PositionTracker (Milestone 9) -- fed synthetic
+// Pure-logic unit tests for PositionTracker -- fed synthetic
 // oms::Fill values directly, no OrderManagementSystem or socket involved,
 // mirroring exactly how test_ledger.cpp exercises exchange::ledger::Ledger
 // with synthetic ExchangeEvents.

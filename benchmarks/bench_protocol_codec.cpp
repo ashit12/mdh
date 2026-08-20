@@ -1,8 +1,6 @@
-// Milestone 13: decode/encode throughput for both wire codecs this project
-// hand-rolled (protocol/ for market data, protocol/order_entry/ for order
-// entry) -- the "decode throughput benchmarks" this project's own roadmap
-// named as its deferred milestone 5 (see docs/current_system_assessment.md),
-// now finally measured instead of only asserted correct by
+// Decode/encode throughput for both wire codecs this project hand-rolled
+// (protocol/ for market data, protocol/order_entry/ for order entry) --
+// measured here rather than only asserted correct by
 // tests/test_protocol_roundtrip.cpp / tests/test_order_entry_codec.cpp.
 //
 // Each case pre-encodes its input once in a Setup-like step outside the
