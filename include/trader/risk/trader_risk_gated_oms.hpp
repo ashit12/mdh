@@ -30,6 +30,21 @@
 // explicit instead of forcing it through the same channel as "attempted and
 // failed."
 //
+// ── Why an owner needs `extra_fill_sink` to see fills at all ──────────────
+// This class wires the underlying OMS's one FillSink to its own
+// positions_ at construction, which is what keeps position/cash
+// bookkeeping automatic and invisible to the caller -- but it also means an
+// owner that wants to *also* watch fills (to compute realized/unrealized
+// P&L, say -- positions::PnlTracker) has nowhere to hook in, since
+// OrderManagementSystem has exactly one FillSink and this class has already
+// claimed it. `extra_fill_sink` is fanned out alongside positions_'s own,
+// never instead of it, so this class's internal bookkeeping is unaffected
+// by whether one is set -- the same purely-additive second-observer shape
+// exchange::gateway::OrderEntryGatewayOptions::extra_event_sink already
+// uses for the matching thread's event stream, and for the same reason:
+// the built-in consumer must not become optional just because a second one
+// appeared.
+//
 // ── Why cancel_order()/replace_order() are NOT risk-gated ─────────────────
 // Exactly exchange::risk::RiskEngine's own documented policy, restated for
 // the trader side: a cancel never increases exposure, and a replace either
@@ -51,9 +66,14 @@ struct SubmitOutcome {
 
 class TraderRiskGatedOms {
 public:
+    // `extra_fill_sink`, if set, observes every fill in addition to this
+    // class's own position bookkeeping -- see the class-level comment. It is
+    // invoked on whichever thread called handle_message(), synchronously,
+    // under the same convention as every other sink in this codebase.
     explicit TraderRiskGatedOms(exchange::AccountId account_id, oms::OrderManagementSystem::Sender sender,
                                  oms::OrderManagementSystem::OrderUpdateSink update_sink = nullptr,
-                                 TraderRiskLimits limits = {});
+                                 TraderRiskLimits limits = {},
+                                 oms::OrderManagementSystem::FillSink extra_fill_sink = nullptr);
 
     // Checks `risk_` against `positions_`'s current settled exposure first;
     // on failure, sends nothing and returns a SubmitOutcome with

@@ -62,11 +62,24 @@ struct BookOrder {
     AccountId account_id;
     Price price;
     Quantity remaining_quantity;
-    // Both enums are redundant in principle -- side repeats which of the
-    // book's two sides this order is filed under -- but they are free: the
-    // five eight-byte fields above pad out to 48 with or without them.
-    // Carrying them saves every caller from being told out of band what the
-    // order can say for itself.
+    // Both enums look redundant, and neither is worth removing.
+    //
+    // side repeats which of the book's two sides this order is filed under,
+    // but remove_at() reads it back to find that side's own index -- which
+    // is precisely what lets a Handle be a bare slot number rather than
+    // something carrying a side and a price around.
+    //
+    // time_in_force is always GTC on anything resting here:
+    // rest_remainder_if_applicable() is the only caller of add(), and it
+    // turns IOC and FOK away before reaching it. It is kept anyway because
+    // dropping it would buy nothing -- the five eight-byte fields above are
+    // 40 bytes and this struct aligns to 8, so one trailing byte rounds up
+    // to 48 exactly as two do, leaving a slab entry at 56 either way.
+    // Against that zero saving, compose() and process_replace() both read it
+    // back (the latter carries it onto the replacement order) and
+    // state_hash.cpp hashes it, so removing the field would trade a stored
+    // fact for an assumption that replay determinism rests on -- one that
+    // stops holding the day a resting time in force other than GTC exists.
     Side side;
     TimeInForce time_in_force;
 

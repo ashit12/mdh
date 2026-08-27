@@ -48,6 +48,26 @@ enum class ClientOrderState {
     return "UnknownClientOrderState";
 }
 
+// True for a state nothing further will ever be observed for -- see
+// ClientOrderState's own transition diagram above. Lives here, next to the
+// enum, rather than in each strategy that needs it: "which of these states
+// are final" is a property of the state machine itself, not of any one
+// caller's policy.
+[[nodiscard]] constexpr bool is_terminal(ClientOrderState s) {
+    switch (s) {
+        case ClientOrderState::Filled:
+        case ClientOrderState::Rejected:
+        case ClientOrderState::Cancelled:
+        case ClientOrderState::Replaced:
+            return true;
+        case ClientOrderState::PendingNew:
+        case ClientOrderState::Live:
+        case ClientOrderState::PartiallyFilled:
+            return false;
+    }
+    return false;
+}
+
 // Tracks a Cancel/Replace request already sent for this order, still
 // awaiting a definitive response. Needed because the wire protocol's
 // Rejected message (protocol/order_entry/messages.hpp) carries no

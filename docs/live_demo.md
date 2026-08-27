@@ -180,8 +180,16 @@ curl -s -X POST http://127.0.0.1:8180/api/orders -H "Content-Type: application/j
 - **`live_strategy_demo` polls the book over REST rather than subscribing to the raw
   UDP feed directly** -- a deliberate, documented simplification for a demo binary
   (see that app's own top comment); a "real" HFT-style strategy would want the raw
-  feed's lower latency, which would require teaching `MarketDataPublisher` to fan out
-  to more than one destination port, real production work out of scope here.
+  feed's lower latency, which at the time of this run would have required teaching
+  `MarketDataPublisher` to fan out to more than one destination port, real production
+  work out of scope here.
+
+  *This limitation has since been lifted.* `trading_server --market-data-port` may now
+  be repeated, publishing every event to all of the given ports, and
+  `trader::market_data::FeedSubscriber` subscribes to the raw feed directly and drives
+  `StrategyRuntime` from it. `apps/market_simulator` uses both -- see
+  `docs/market_simulation.md`. `live_strategy_demo` itself is left as it was, since its
+  REST-polling path is what this run documents.
 - **The IOC orders in step 3/4 above are logged by the UI's Activity feed as
   transitioning straight to a state that never shows an explicit "Cancelled" for any
   unfilled remainder** -- this is pre-existing, documented matching-engine behavior,

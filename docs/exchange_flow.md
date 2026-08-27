@@ -967,20 +967,31 @@ What's still **not** assembled into one live call path or app:
   `RiskGatedEngine`) *and* `MarketDataPublisher::sink()` (via the
   `extra_event_sink` hook) but not to a `CommandJournalWriter` -- a live
   gateway process keeps no durable command journal of its own traffic.
-- `strategies::StrategyRuntime` -- the dispatch class, literally -- is
-  proven correct only in isolation, against synthetic `protocol::Event`
-  values feeding a `book::BookManager`; nothing calls
-  `StrategyRuntime::on_event()` from a live UDP feed. `apps/live_strategy_demo`
-  closes the narrower, more concretely useful gap: a real
-  `MarketMakerStrategy` (the strategy `StrategyRuntime` would otherwise
-  dispatch to) does trade, live, against a real running `trading_server`,
-  driven by book snapshots it polls from `UiGateway`'s own REST API rather
-  than by `StrategyRuntime` reacting to raw UDP frames — see that app's own
-  top comment for why that substitution was the right scope for a demo
-  binary. Binding `StrategyRuntime` itself directly to the raw UDP feed (so
-  a strategy could react to a book update within microseconds of the packet
-  arriving, not within one REST-poll interval) remains open, real, future
-  work.
+Two items that used to be on this list have since been closed, and are
+recorded here because the shape of the fix is the interesting part:
+
+- **`StrategyRuntime` is now driven by a live UDP feed.** It used to be proven
+  correct only in isolation, against synthetic `protocol::Event` values feeding
+  a `book::BookManager`, with nothing calling `StrategyRuntime::on_event()`
+  from a real feed; `apps/live_strategy_demo` closed the narrower gap by
+  polling `UiGateway`'s REST book instead. `trader::market_data::FeedSubscriber`
+  is now the missing live driver, and it reuses the existing receive path
+  wholesale — `UdpReceiver::receive_batch()` → `net::unpack_frames()` →
+  `replay::apply_frame_result()` → `StrategyRuntime::on_event()` — so decode
+  errors, gap classification and book application behave identically to file
+  replay. `apps/market_simulator` uses it to drive a real strategy from raw
+  UDP frames; `live_strategy_demo` is left on its REST path, since that is
+  what `docs/live_demo.md`'s recorded run documents.
+- **Market data fans out to more than one destination.** `MarketDataPublisher`
+  always could — it publishes to a sink, and the sink decides — but
+  `trading_server` gave it exactly one UDP port, so the dashboard's subscriber
+  and any other subscriber were mutually exclusive. `--market-data-port` may
+  now be repeated, and each event is sent to every configured port. This is
+  the limitation `docs/live_demo.md` §5 recorded as the reason a live strategy
+  had to poll REST.
+
+Both are exercised end to end by `tests/test_market_simulator_e2e.cpp` and
+demonstrated in a real run in `docs/market_simulation.md`.
 
 This is deliberate scoping, not an oversight — each piece is built and
 proven correct on its own, then in combination with the trader side's replay
@@ -988,9 +999,11 @@ pipeline, then end to end over real TCP connections between real gateways
 and real clients (including two independent gateways at once), then over a
 real long-running process with real UDP market data and a real browser
 dashboard, then against a documented matrix of network-level faults on both
-live components, and finally demonstrated once, for real, with a real
-strategy, a real counterparty, and a real browser screenshot. See
-`docs/end_to_end_architecture.md` for the system-wide view,
-`docs/benchmarks.md` for performance, `docs/failure_injection.md` for the
-fault matrix, and `docs/live_demo.md` for the live run. This document
-should be updated as any further wiring happens.
+live components, then demonstrated once, for real, with a real strategy, a
+real counterparty, and a real browser screenshot, and finally with two
+simulated participants trading each other continuously through the whole
+pipeline over both sockets at once. See `docs/end_to_end_architecture.md` for
+the system-wide view, `docs/benchmarks.md` for performance,
+`docs/failure_injection.md` for the fault matrix, `docs/live_demo.md` for the
+live run, and `docs/market_simulation.md` for the simulated participants. This
+document should be updated as any further wiring happens.

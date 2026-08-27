@@ -6,18 +6,7 @@ namespace mdh::trader::strategies {
 
 namespace {
 
-[[nodiscard]] bool is_terminal(oms::ClientOrderState state) {
-    using oms::ClientOrderState;
-    switch (state) {
-        case ClientOrderState::Filled:
-        case ClientOrderState::Rejected:
-        case ClientOrderState::Cancelled:
-        case ClientOrderState::Replaced:
-            return true;
-        default:
-            return false;
-    }
-}
+using oms::is_terminal;
 
 [[nodiscard]] Price abs_diff(Price a, Price b) { return a > b ? a - b : b - a; }
 

@@ -4,13 +4,35 @@
 
 namespace mdh::trader::risk {
 
+namespace {
+
+// positions_'s own sink, plus an optional second observer. Built as one
+// FillSink so OrderManagementSystem still sees exactly one, and so the
+// fan-out order ("positions first, then the observer") is stated in one
+// place: an observer reacting to a fill can then already read the updated
+// position, exactly as it would if it were reading it a moment later.
+[[nodiscard]] oms::OrderManagementSystem::FillSink fan_out(oms::OrderManagementSystem::FillSink primary,
+                                                            oms::OrderManagementSystem::FillSink extra) {
+    if (!extra) {
+        return primary;
+    }
+    return [primary = std::move(primary), extra = std::move(extra)](const oms::Fill& fill) {
+        primary(fill);
+        extra(fill);
+    };
+}
+
+} // namespace
+
 TraderRiskGatedOms::TraderRiskGatedOms(exchange::AccountId account_id, oms::OrderManagementSystem::Sender sender,
                                         oms::OrderManagementSystem::OrderUpdateSink update_sink,
-                                        TraderRiskLimits limits)
+                                        TraderRiskLimits limits,
+                                        oms::OrderManagementSystem::FillSink extra_fill_sink)
     : account_id_(account_id),
       risk_(limits),
       positions_(),
-      oms_(account_id, std::move(sender), std::move(update_sink), positions_.sink()) {}
+      oms_(account_id, std::move(sender), std::move(update_sink),
+            fan_out(positions_.sink(), std::move(extra_fill_sink))) {}
 
 SubmitOutcome TraderRiskGatedOms::submit_new_order(InstrumentId instrument_id, Side side, Price price,
                                                     Quantity quantity, exchange::OrderType order_type,

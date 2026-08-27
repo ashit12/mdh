@@ -133,13 +133,31 @@ unlike every hand-rolled wire format elsewhere in this project) for a
 separate React + Vite + TypeScript dashboard (`ui/`) to render and trade
 against.
 
-The one wiring gap that remains: `StrategyRuntime` itself is not fed by that
-live feed. A real `MarketMakerStrategy` does trade live against a running
-`trading_server` (`apps/live_strategy_demo/`), but by polling `UiGateway`'s own
-REST book endpoint rather than by `StrategyRuntime` reacting to the raw UDP feed
-directly — see `docs/live_demo.md` for the full run and
-`docs/exchange_flow.md`'s "Integration status" section for why that narrower
-substitution was the right scope for a demo binary.
+`StrategyRuntime` is fed by that live feed too, via
+`trader::market_data::FeedSubscriber` (`include/trader/market_data/`), which
+owns a receive thread running the same `UdpReceiver::receive_batch()` →
+`net::unpack_frames()` → `replay::apply_frame_result()` pipeline `UiGateway` and
+`market_data_replay --listen` already use, and then calls
+`StrategyRuntime::on_event()` with the book as it stands after each event. It
+was the one piece that had never existed: `StrategyRuntime`'s own header
+documented that something had to drive it from a live feed, and until now the
+only live UDP listener was `UiGateway`, which has no strategies to dispatch to.
+
+`apps/market_simulator/` is what uses it, and is the fullest exercise of this
+whole diagram: two simulated participants — a `LadderMarketMaker` quoting
+around a seeded random walk and a `MomentumStrategy` reacting to the
+reconstructed midpoint — each with its own account, TCP session,
+`TraderRiskGatedOms`, `PositionTracker` and `PnlTracker`, trading each other
+through the real gateway, pipeline, risk, ledger and matching engine, and
+learning what happened from real execution reports over TCP and real market
+data over UDP. Because market data now fans out to several ports, the dashboard
+can watch it happen live. See `docs/market_simulation.md` for the design and a
+real run.
+
+`apps/live_strategy_demo/` predates `FeedSubscriber` and is deliberately left on
+its original path: it polls `UiGateway`'s REST book endpoint instead of
+subscribing to the feed. That is what `docs/live_demo.md`'s recorded run
+documents, and rewriting it would invalidate the run rather than improve it.
 
 ---
 
@@ -156,6 +174,7 @@ substitution was the right scope for a demo binary.
 | Concurrency primitives | `include/common/spsc_queue.hpp`, `include/common/dropping_queue.hpp` | Lock-free bounded SPSC ring buffer; drop-newest + counted backpressure wrapper |
 | Snapshot / recovery | `include/replay/snapshot.hpp`, `src/replay/snapshot.cpp` | Book-state snapshot format reusing the `AddOrder` wire frame; `apply_frame_result()` loads a snapshot on a `Missing` classification when configured |
 | Local book (trader-side, non-authoritative) | `include/book/{order_book,price_level,book_manager,book_errors}.hpp` + `src/book/*.cpp` | **Reconstructs** state from received events; O(1) hash + O(log P) map + O(1) list-erase cancel/modify; **does not match crossing orders** |
+| Live feed subscription | `include/trader/market_data/feed_subscriber.hpp`, `src/trader/market_data/feed_subscriber.cpp` | Owns a receive thread running the `receive_batch` → `unpack_frames` → `apply_frame_result` pipeline above, then dispatches each applied event to a `StrategyRuntime`; the live driver `StrategyRuntime` previously lacked |
 | Apps | `apps/{feed_generator,market_data_replay,udp_sender}/main.cpp` | CLI drivers exercising the above end to end |
 
 The exchange side feeds into these through `MarketDataPublisher`; nothing above had to
@@ -176,10 +195,12 @@ change to accommodate it.
 | TCP order-entry protocol + gateway | `exchange/gateway/`, `protocol/order_entry/` |
 | Trader-side OMS + order-entry client | `trader/oms/` |
 | Trader-side positions/P&L/risk | `trader/positions/`, `trader/risk/` |
-| Strategy runtime, market maker, cross-venue arbitrage | `trader/strategies/` |
+| Strategy runtime, market maker, cross-venue arbitrage, ladder maker, momentum | `trader/strategies/` |
+| Live market-data subscription (feed → book → strategies) | `trader/market_data/` |
 | UI gateway + React dashboard | `ui_gateway/`, `ui/`, `apps/trading_server/` |
 | Benchmarks | `benchmarks/` |
 | Failure injection + live demonstration | `tests/test_failure_injection_*.cpp`, `apps/live_strategy_demo/` |
+| Simulated market participants | `apps/market_simulator/` |
 
 See `docs/exchange_flow.md` for a full walkthrough of each; this table only
 says where things live.
@@ -218,9 +239,13 @@ updating from real SSE events).
 under TSan are the multi-threaded TCP round trips —
 `test_order_entry_gateway_e2e.cpp`, `test_oms_gateway_e2e.cpp`,
 `test_trader_risk_gated_oms_e2e.cpp`, `test_market_maker_strategy_e2e.cpp`,
-`test_cross_venue_arbitrage_strategy_e2e.cpp`, and `test_ui_gateway.cpp` — each of which
-runs gateway accept/reader/writer/matching threads on one side against client reader
-threads on the other, all concurrently.
+`test_cross_venue_arbitrage_strategy_e2e.cpp`, `test_ui_gateway.cpp`, and
+`test_market_simulator_e2e.cpp` — each of which runs gateway
+accept/reader/writer/matching threads on one side against client reader threads on the
+other, all concurrently. The last of those adds a `FeedSubscriber` receive thread and
+two independent participant sessions to that mix, so a single test has the exchange's
+threads, two clients' reader threads, and a UDP receive thread dispatching into a
+strategy that sends orders, all live at once.
 
 ### Bugs these tests actually caught
 
@@ -238,6 +263,24 @@ threads on the other, all concurrently.
 - **A `snapshot()` race.** Both gateway e2e tests called `OrderEntryGateway::snapshot()`
   — only safe once the matching thread has been joined — while the gateway was still
   running; both now call `stop()` first. Caught by TSan.
+- **A bind failure that reported success.** `FeedSubscriber::start()` checked
+  `UdpReceiver::is_open()` to decide whether it had the port, but that reports only that
+  the *socket* was created — `UdpReceiver`'s constructor creates the socket before
+  attempting the bind and keeps it either way — so a subscriber that lost a port race
+  started a thread and received nothing, silently, forever. It now also requires a
+  non-zero bound port, which is the observable difference (`getsockname()` reports 0 for
+  an unbound socket, and a successful bind never yields 0 even when 0 was requested).
+  Caught by `test_feed_subscriber.cpp`. `UiGateway::start()` makes the same check and has
+  the same latent gap; it is left alone here rather than changed as a side effect of
+  unrelated work.
+- **A book that would freeze at the first dropped datagram.** `FeedSubscriber` initially
+  took `replay::ReplayOptions`' defaults, which stop at the first sequence gap or decode
+  error. That is right for file replay, where an anomaly means the file is corrupt, and
+  wrong for a live feed, where a gap means a lost packet: `apply_frame_result()` does not
+  apply the event that revealed the gap, so the subscriber would have gone on handing
+  strategies a book frozen at the moment of the loss while continuing to receive. It now
+  defaults to counting the anomaly and carrying on. Caught by
+  `test_feed_subscriber.cpp`.
 
 Two further concurrency bugs surfaced during manual end-to-end smoke testing of the UI
 gateway, before `tests/test_ui_gateway.cpp` existed (which is exactly why that manual

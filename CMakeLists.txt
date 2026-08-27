@@ -117,11 +117,15 @@ add_library(mdh_core
     src/trader/oms/order_entry_client.cpp
     src/trader/oms/order_management_system.cpp
     src/trader/positions/position_tracker.cpp
+    src/trader/positions/pnl_tracker.cpp
     src/trader/risk/trader_risk_engine.cpp
     src/trader/risk/trader_risk_gated_oms.cpp
+    src/trader/market_data/feed_subscriber.cpp
     src/trader/strategies/strategy_runtime.cpp
     src/trader/strategies/market_maker_strategy.cpp
     src/trader/strategies/cross_venue_arbitrage_strategy.cpp
+    src/trader/strategies/ladder_market_maker.cpp
+    src/trader/strategies/momentum_strategy.cpp
 )
 target_include_directories(mdh_core PUBLIC include)
 target_compile_options(mdh_core PRIVATE ${MDH_WARNING_FLAGS})
@@ -207,6 +211,15 @@ add_executable(live_strategy_demo apps/live_strategy_demo/main.cpp)
 target_link_libraries(live_strategy_demo PRIVATE mdh_core httplib nlohmann_json::nlohmann_json)
 target_compile_options(live_strategy_demo PRIVATE ${MDH_WARNING_FLAGS})
 
+# The simulated-participant driver. Links mdh_core alone -- no httplib/json,
+# unlike live_strategy_demo, because it reaches the exchange only through the
+# two real wire protocols (TCP order entry and the UDP market-data feed) and
+# never through the UI gateway's REST surface. See apps/market_simulator/
+# main.cpp's own top comment.
+add_executable(market_simulator apps/market_simulator/main.cpp)
+target_link_libraries(market_simulator PRIVATE mdh_core)
+target_compile_options(market_simulator PRIVATE ${MDH_WARNING_FLAGS})
+
 # ── Tests ──────────────────────────────────────────────────────────────────
 enable_testing()
 
@@ -250,6 +263,7 @@ add_executable(mdh_tests
     tests/test_order_entry_client.cpp
     tests/test_oms_gateway_e2e.cpp
     tests/test_position_tracker.cpp
+    tests/test_pnl_tracker.cpp
     tests/test_trader_risk_engine.cpp
     tests/test_trader_risk_gated_oms.cpp
     tests/test_trader_risk_gated_oms_e2e.cpp
@@ -258,6 +272,11 @@ add_executable(mdh_tests
     tests/test_market_maker_strategy_e2e.cpp
     tests/test_cross_venue_arbitrage_strategy.cpp
     tests/test_cross_venue_arbitrage_strategy_e2e.cpp
+    tests/test_reference_price_walk.cpp
+    tests/test_ladder_market_maker.cpp
+    tests/test_momentum_strategy.cpp
+    tests/test_feed_subscriber.cpp
+    tests/test_market_simulator_e2e.cpp
     tests/test_ui_gateway.cpp
     tests/test_failure_injection_gateway.cpp
     tests/test_failure_injection_market_data.cpp

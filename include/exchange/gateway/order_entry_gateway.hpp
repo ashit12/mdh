@@ -128,7 +128,13 @@ struct OrderEntryGatewayOptions {
     // a real policy decision -- see Connection::outbound below.
     std::size_t outbound_queue_capacity = 1024;
 
-    // Passed through to TcpSocket::listen()'s backlog.
+    // How many established-but-not-yet-accepted connections the kernel will
+    // hold for the accept thread to collect, passed through to POSIX
+    // listen() via TcpSocket::listen(). It is a queue depth, not a session
+    // limit: it bounds only how many clients may sit waiting to be accepted
+    // at one instant, never how many connections this gateway can serve at
+    // once, and a connection stops occupying a slot the moment accept_loop()
+    // picks it up.
     int accept_backlog = 16;
 
     // How many reports to keep for an account while it has no live session

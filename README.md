@@ -34,6 +34,7 @@ finance background is assumed anywhere in this README.
   - [8. Getting the reply back to the right client](#8-getting-the-reply-back-to-the-right-client)
 - [Market data: the public broadcast](#market-data-the-public-broadcast)
 - [The trader side](#the-trader-side)
+- [Simulated participants](#simulated-participants)
 - [The dashboard](#the-dashboard)
 - [Determinism, journaling, and replay](#determinism-journaling-and-replay)
 - [Why these networking and queueing choices](#why-these-networking-and-queueing-choices)
@@ -562,10 +563,19 @@ here is counted and visible.
   limits before anything is sent. This is separate from the exchange's risk
   check and exists for a different reason: the exchange protects itself, the
   trader protects itself from its own strategy.
-- **`PositionTracker`** maintains what the trader believes it owns.
+- **`PositionTracker`** maintains what the trader believes it owns, and
+  **`PnlTracker`** — a second, independent consumer of the same fill stream —
+  maintains how its trading has *done*. Two classes rather than one because
+  they answer different questions and cannot share a representation: holdings
+  are an unsigned quantity that seeded inventory contributes to, whereas a
+  trading position is signed, starts at zero, and ignores seeding.
+- **`FeedSubscriber`** subscribes to the live UDP feed and drives a
+  `StrategyRuntime` from it, reusing the same sequence-validation and
+  book-application code file replay uses.
 - **Strategies**: `MarketMakerStrategy` quotes both sides of the book and
   earns the spread; `CrossVenueArbitrageStrategy` watches two books for a
-  price discrepancy.
+  price discrepancy; `LadderMarketMaker` and `MomentumStrategy` are the two
+  simulated participants below.
 
 The trader keeps its own copy of the order book (`book/`), built from the UDP
 feed. It is a genuinely different class from the exchange's book and cannot
@@ -575,6 +585,40 @@ while the trader's book is a reconstruction from a public feed that shows
 anonymous depth and may be stale or gapped. They have different invariants,
 different keys, and different failure modes. `docs/end_to_end_architecture.md`
 covers this in more detail.
+
+---
+
+## Simulated participants
+
+`apps/market_simulator` makes the exchange visibly trade by itself. Two
+participants connect to a running `trading_server` as ordinary external
+traders and trade against each other:
+
+- a **market maker** quoting a two-sided ladder around a seeded random walk,
+  so the book is continuously tradeable and keeps moving;
+- a **momentum strategy** that buys when the midpoint it reconstructs from the
+  UDP feed has risen over a short window, and sells when it has fallen.
+
+Both are deliberately simple. The objective is plausible liquidity and a
+visible, working system, not alpha.
+
+What makes this worth having is what it *refuses* to do. The simulator holds no
+`MatchingEngine`, no `MatchingBook`, no `RiskEngine` and no `Ledger` — it
+cannot, since it links only the trader-side components and its entire contact
+with the exchange is two sockets. So every order genuinely travels the whole
+path: trader-side risk, OMS, encode, TCP, gateway, sequencer, exchange risk and
+ledger, matching engine, and then back out both as a private execution report
+over TCP and as public market data over UDP, which is the momentum strategy's
+only input. That exercises the entire exchange rather than calling the matcher
+in a loop.
+
+Each participant is its own account on its own session with its own OMS,
+positions, risk limits and P&L. A run prints a periodic status block and a
+shutdown summary; `--seed` determines the reference-price path exactly, so runs
+are reproducible even though which quotes fill is not.
+
+See **[docs/market_simulation.md](docs/market_simulation.md)** for the design,
+the P&L accounting, and a real run with its numbers explained.
 
 ---
 
@@ -718,9 +762,11 @@ apps/
   udp_sender/          streams a feed file over UDP
   market_data_replay/  replays a file or listens on UDP
   live_strategy_demo/  a real strategy against a running trading_server
+  market_simulator/    two simulated participants trading a running
+                       trading_server over TCP + UDP
 ui/               React + Vite + TypeScript dashboard
 benchmarks/       Google Benchmark suites + a real TCP latency harness
-tests/            GoogleTest suite (407 tests)
+tests/            GoogleTest suite (464 tests)
 bench-results/    raw benchmark output, committed
 docs/             see below
 ```
@@ -752,11 +798,20 @@ and the build is warning-clean.
 **Run the whole stack:**
 
 ```bash
-./build/trading_server --tcp-port 7000 --market-data-port 7001 --http-port 8080
-# then, in another terminal:
-./build/live_strategy_demo          # a real market-making strategy trading against it
+# --market-data-port may be repeated: the first is the UI gateway's, and every
+# event is published to all of them.
+./build/trading_server --tcp-port 7000 \
+    --market-data-port 7001 --market-data-port 7002 --http-port 8080
+# then, in another terminal, watch the exchange trade with itself:
+./build/market_simulator --tcp-port 7000 --market-data-port 7002 --seed 42
 # and open http://localhost:8080 for the dashboard
 ```
+
+`market_simulator` runs a simulated market maker and a momentum strategy as two
+ordinary external traders, over the same TCP and UDP interfaces any client uses --
+see [docs/market_simulation.md](docs/market_simulation.md). For a single
+market-making strategy driven off the dashboard's REST book instead,
+`./build/live_strategy_demo`.
 
 **Run the market-data half on its own:**
 
@@ -794,7 +849,12 @@ benchmark number.
 **Simulated or out of scope**, deliberately:
 
 - One process, one machine, loopback only. No multicast, no NIC tuning, no
-  kernel bypass, no CPU pinning.
+  kernel bypass, no CPU pinning. Market data is fanned out by sending a copy
+  of each datagram to every configured port, which is what lets the dashboard
+  and `market_simulator` both subscribe; a real venue would use multicast.
+- The simulated participants in `market_simulator` trade only with each other,
+  so their P&L is zero-sum by construction, and both run in one process
+  (properly separated, but not adversarially).
 - No authentication, no TLS, no credentials. Session-to-account binding is
   by assertion.
 - No clearing, settlement, margin, or corporate actions. The ledger is cash
@@ -825,4 +885,5 @@ benchmark number.
 | [`docs/benchmarks.md`](docs/benchmarks.md) | benchmark methodology and interpretation |
 | [`docs/failure_injection.md`](docs/failure_injection.md) | the fault matrix against the live TCP gateway and UDP listener |
 | [`docs/live_demo.md`](docs/live_demo.md) | one real end-to-end run, with a dashboard screenshot |
+| [`docs/market_simulation.md`](docs/market_simulation.md) | the simulated market maker and momentum strategy, and a real run of them |
 | [`ui/README.md`](ui/README.md) | the React dashboard |
