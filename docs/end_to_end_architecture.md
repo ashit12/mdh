@@ -37,17 +37,16 @@ just in prose.
 │       │ TCP binary order-entry protocol                                                       │
 │       ▼                                                                                       │
 │  Order-entry gateway ──────────────────────────────────────────  exchange/gateway/            │
-│       │                                                                                       │
+│       │  per-connection readers call MatchingPipeline::submit() concurrently                  │
 │       ▼                                                                                       │
-│  Exchange validation + pre-trade risk ─────────────────────────  exchange/risk/               │
-│       │                                                                                       │
+│  MPSC command queue (common::MpscQueue) ────────────────────────  common/mpsc_queue.hpp       │
+│       │  admission FIFO; per-session FIFO; no submit mutex                                    │
 │       ▼                                                                                       │
-│  Command sequencer ─────────────────────────────────────────────  exchange/sequencing/        │
-│       │  strictly increasing CommandSequence                                                  │
+│  Command sequencer (matching thread) ───────────────────────────  exchange/sequencing/        │
+│       │  strictly increasing CommandSequence = processing order                               │
 │       ▼                                                                                       │
-│  SPSC queue (common::SpscQueue) ────────────────────────────────  common/spsc_queue.hpp       │
-│       │                                                                                        │
-│       ▼                                                                                        │
+│  Pre-trade risk + ledger (matching thread) ────────────────────  exchange/risk/, ledger/      │
+│       ▼                                                                                       │
 │  ┌─────────────────────────────────────────┐                                                   │
 │  │  MATCHING ENGINE                         │  single-threaded, deterministic                  │
 │  │  ExchangeCommand -> process() -> events  │  owns the AUTHORITATIVE book                     │
@@ -334,13 +333,14 @@ are genuinely running concurrently, not accidentally serialized by test timing. 
 ### Benchmarks
 
 Benchmarks are a Release-only artifact, not correctness tests.
-`benchmarks/` (five Google-Benchmark executables plus one hand-rolled latency harness,
-gated behind `-DMDH_BUILD_BENCHMARKS=ON`, the default) were built and actually run in
-Release on this machine; every number is recorded, with methodology and interpretation, in
-`docs/benchmarks.md` — summarized: every hot-path component measured (protocol codec,
-matching engine, trader-side book, SPSC queue) costs tens to low thousands of nanoseconds
-per operation. The one live, real-TCP measurement (`bench_end_to_end_latency`, a real
-round trip against a real `OrderEntryGateway`) initially measured ~0.7-1.3 ms at
+`benchmarks/` (four Google-Benchmark and four hand-rolled executables, gated
+behind `-DMDH_BUILD_BENCHMARKS=ON`, the default) were built and actually run
+in Release on this machine. Component and transport-floor results are in
+`docs/benchmarks.md`; staged order-path latency, load, and syscall results
+are in `docs/latency_benchmark.md`. Every hot-path
+component measured (protocol codec, matching engine, trader-side book, SPSC
+queue) costs tens to low thousands of nanoseconds per operation.
+`bench_end_to_end_latency` initially measured a real gateway round trip at ~0.7-1.3 ms at
 p50/mean — three orders of magnitude larger, traced (by reading the code, not guessed)
 to a specific, deliberate design choice: `connection_writer_loop()`'s 1 ms sleep-based
 poll, not anything slow in matching/risk/ledger. That finding was then actually acted
@@ -349,7 +349,9 @@ directly by `route_event()` instead of polling on a timer, plus `TCP_NODELAY` wa
 to every connected `TcpSocket` (a second, previously-unexamined latency source the same
 investigation turned up). Re-measured after both fixes, p50 dropped to ~73 μs — roughly
 a 17x reduction, verified with two independent 20,000-sample runs, documented in
-`docs/benchmarks.md` §7.2.
+`docs/benchmarks.md` §7.2. `bench_order_path_latency` is now the primary live
+TCP harness; `bench_end_to_end_latency` remains for its unique canned
+transport-floor comparison.
 
 ### The live demonstration
 

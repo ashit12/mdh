@@ -18,9 +18,10 @@
 // where the distinction properly lives; here, callers build an ordinary
 // command with any placeholder value and sequence() overwrites it.
 //
-// Single writer only, like the SPSC queue: the plain non-atomic counter
-// below depends on it, and the only intended caller is the pipeline's
-// submit(), which is producer-thread-only for the same reason.
+// Single writer only: the plain non-atomic counter below depends on it.
+// MatchingPipeline calls this on the matching thread, after dequeue, so the
+// sequence stream *is* the processing order. Tests may call it on one
+// thread of their own.
 namespace mdh::exchange::sequencing {
 
 class CommandSequencer {

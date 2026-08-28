@@ -57,10 +57,12 @@ streams and equal final states.
 (`exchange/sequencing/`). `CommandSequencer` assigns the authoritative,
 monotonically increasing `CommandSequence` to an inbound command — the one
 place that decides matching order, so no upstream caller can pick its own
-position in it. `MatchingPipeline` wraps a lock-free SPSC queue and a
-dedicated matching thread around a `MatchingEngine`, so a producer thread
-can call `submit()` without itself becoming the thread that runs matching
-logic. A full queue is an explicit rejection (`submit()` returns `false`),
+position in it. `MatchingPipeline` wraps a lock-free MPSC queue and a
+dedicated matching thread around a `MatchingEngine`, so any number of
+producer threads can call `submit()` without themselves becoming the thread
+that runs matching logic. Sequence numbers are stamped after dequeue, on
+the matching thread, so a rejected (full-queue) command never occupies a
+slot in the sequence stream. A full queue is an explicit rejection (`submit()` returns `false`),
 never a silent drop — unlike market-data's `DroppingQueue`, a dropped
 *inbound order* is unacceptable: the client would believe their order was
 seen when it never reached the matcher.
@@ -105,11 +107,12 @@ ordered, lossless delivery (see that header's own comment for the full
 reasoning) — carrying `NewOrder`/`CancelOrder`/`ReplaceOrder` one way and
 `Accepted`/`Rejected`/`Cancelled`/`Replaced`/`TradeReport` the other. Each
 accepted connection gets its own reader thread (decodes inbound frames,
-translates them to `ExchangeCommand`s, and calls a mutex-serialized
-`submit()`) and writer thread (drains a per-connection outbound `SpscQueue`
-fed by `route_event()`, which runs *on the matching thread* as the
+translates them to `ExchangeCommand`s, and concurrently submits to the MPSC
+pipeline). Each connection also has a writer thread that drains that
+connection's outbound `SpscQueue`, sleeping on a condition variable until
+there is work. `route_event()` runs *on the matching thread* as the
 `Processor`'s `EventSink` and therefore must never block — a slow client's
-socket cannot be allowed to stall matching for every other client).
+socket cannot be allowed to stall matching for every other client.
 Session-to-account binding is opportunistic: a connection is unbound until
 its first valid request arrives, since every client message type already
 carries `account_id`. That binding is then immutable — a later message
@@ -322,18 +325,19 @@ deadlock with two independent causes).
 ## Benchmarks (`benchmarks/`)
 
 Allocation profiling, decode throughput, end-to-end latency (p50/p99/p99.9),
-and a look at how the book representation scales with depth. Five
-Google-Benchmark-based (plus one hand-rolled)
-executables, added via an `MDH_BUILD_BENCHMARKS` CMake option
+and a look at how the book representation scales with depth. Four
+Google-Benchmark-based plus four hand-rolled executables, added via an
+`MDH_BUILD_BENCHMARKS` CMake option
 (`FetchContent`, same pattern as `googletest`/`cpp-httplib`/`nlohmann-json`):
 `bench_protocol_codec` (market-data and order-entry encode/decode
 throughput), `bench_matching_engine` (`MatchingEngine::process()` for
 resting/crossing/cancel/replace), `bench_order_book` (the trader-side
 reconstructed `book::OrderBook`'s add/cancel/modify/query cost at varying
-depth), `bench_spsc_queue` (single- and two-thread `SpscQueue` throughput),
-and `bench_end_to_end_latency` (a real, hand-rolled loopback-TCP round trip
-against a real `OrderEntryGateway`, since Google Benchmark's fixed-iteration
-model can't express a latency *distribution* the way this one needed to).
+depth), and `bench_spsc_queue` (single- and two-thread `SpscQueue`
+throughput). The hand-rolled executables are `bench_end_to_end_latency`
+(loopback TCP against a transport floor), `bench_order_path_latency`
+(primary staged TCP latency/load/syscall harness), `bench_matching_workload`,
+and `bench_matching_memory`.
 
 The single most useful finding, identified from a real measurement plus a
 source read rather than assumed: every hot-path component measured here
@@ -419,20 +423,19 @@ builds an ExchangeCommand
 (NewOrder / Cancel / Replace)
         │
         ▼
-CommandSequencer::sequence()
-  overwrites command_sequence with the
-  next value from a producer-owned,
-  monotonic (non-atomic) counter
+MpscQueue<ExchangeCommand>::try_push()  ── full? ──► submit() returns false
+  (MatchingPipeline::submit(); any reader)           (reject, never silently drop)
         │
+        │   lock-free MPSC ring; FIFO = admission (CAS) order
+        │   per-session FIFO because one reader is one producer
         ▼
-SpscQueue<ExchangeCommand>::try_push()  ── full? ──► submit() returns false
-  (MatchingPipeline::submit())                        (reject, never silently drop)
-        │
-        │   lock-free ring buffer, cache-line-padded
-        │   head_/tail_ (common/spsc_queue.hpp)
-        ▼
-                                              SpscQueue::try_pop()      <- MatchingPipeline's
+                                              MpscQueue::try_pop()      <- MatchingPipeline's
                                                     │                     std::jthread, sole consumer
+                                                    ▼
+                                              CommandSequencer::sequence()
+                                                matching-thread-only; gapless
+                                                processing order, not a client field
+                                                    │
                                                     ▼
                                               MatchingEngine::process(cmd, sink)
                                                     │
@@ -539,11 +542,12 @@ Account `42` submits a GTC buy: 10 shares of instrument `1` at price `101`.
 The book already has two resting sell orders on that instrument: 5 @ `100`
 (account `7`) and 8 @ `101` (account `9`).
 
-1. **`CommandSequencer::sequence()`** stamps `command_sequence = 57` onto
-   the `NewOrderCommand`, discarding whatever placeholder value it arrived
-   with.
-2. **`MatchingPipeline::submit()`** pushes it onto the SPSC queue; the
-   matching thread's `try_pop()` picks it up.
+1. **`MatchingPipeline::submit()`** admits the unsequenced command to the
+   MPSC queue (or returns `false` if the queue is full).
+2. **Matching thread `try_pop()`** then **`CommandSequencer::sequence()`**
+   stamps `command_sequence = 57` onto the `NewOrderCommand`, discarding
+   whatever placeholder value it arrived with. That stamp is the matching
+   order.
 3. *(If risk-gated)* **`RiskEngine::check()`** confirms account `42` has at
    least `101 * 10 = 1010` in *available* (unreserved) cash and that `10` is
    under `RiskLimits::max_order_quantity`. Returns `RejectReason::None`.
@@ -739,20 +743,21 @@ same event stream with no extra coordination between `MatchingEngine` and
 - **`command_sequencer.hpp`/`.cpp`** — `CommandSequencer::sequence(command)`:
   overwrites whichever `ExchangeCommand` alternative's `command_sequence`
   field with the next value from a monotonic, non-atomic counter, and
-  returns it. Producer-thread-only, by the same single-writer contract
-  `SpscQueue`'s own `head_`/`tail_` split relies on.
-- **`matching_pipeline.hpp`/`.cpp`** — `MatchingPipeline`: owns a
-  `SpscQueue<ExchangeCommand>`, a `CommandSequencer`, a `MatchingEngine`, and
-  a `std::jthread` that loops `try_pop()` → `engine_.process()` until told to
-  stop (and drained). `submit()` (producer-only) checks queue occupancy
-  *before* sequencing — a command that never enters the queue must not
-  consume an authoritative `CommandSequence` value, or the sequence stream
-  would show a permanent gap for a command the matcher never saw. `stop()`
+  returns it. Matching-thread-only in production (`MatchingPipeline` stamps
+  after dequeue so the sequence stream is the processing order).
+- **`matching_pipeline.hpp`/`.cpp`** — `MatchingPipeline`: owns an
+  `MpscQueue<ExchangeCommand>`, a `CommandSequencer`, a `MatchingEngine`, and
+  a `std::jthread` that loops `try_pop()` → `sequence()` → `process()` until
+  told to stop (and drained). `submit()` is safe from any number of producer
+  threads. A command that never enters the queue is not sequenced. `stop()`
   requests a stop and joins only after the queue has fully drained (never
   mid-drain); `snapshot()` is only safe to call after that join has
   happened. `MatchingPipelineOptions::matching_delay` lets a test
   deterministically simulate a slow matcher to exercise the backpressure
   path on demand, rather than depending on incidental scheduling.
+
+  Sequencing rules: per-producer FIFO; cross-producer order is the lock-free
+  admission race; matching stays single-threaded.
 
 ### `exchange/ledger/` — account balances
 - **`ledger.hpp`/`.cpp`** — `Ledger`: per-account `cash_total`/`cash_reserved`
@@ -840,7 +845,7 @@ same event stream with no extra coordination between `MatchingEngine` and
   for every "this didn't work" outcome, matching this codebase's existing
   convention on the trader side (`protocol::DecodeError`, `book::BookError`).
 - **Reject, never silently drop, at the command-submission boundary.**
-  `DroppingQueue` (market data) and `MatchingPipeline`'s SPSC queue (inbound
+  `DroppingQueue` (market data) and `MatchingPipeline`'s MPSC queue (inbound
   commands) make opposite backpressure choices on purpose: a dropped
   market-data frame is a detectable, recoverable sequence gap downstream; a
   silently dropped *order* leaves a client with no way to know their request

@@ -134,7 +134,7 @@ Here is the whole system in one picture. Each box is code in this repo.
    trader risk              │   accept thread              │
       │                     │   reader thread (per client) │
       v                     │        │                     │
-   OMS ──────TCP────────────┼───► [SPSC queue] ◄── one lock, N readers
+   OMS ──────TCP────────────┼───► [MPSC queue]  N readers, no mutex
       │   (private,         │        │                     │
       ▲    reliable,        │        v                     │
       │    ordered)         │   ═══ THE MATCHING THREAD ═══│
@@ -316,30 +316,24 @@ a race, and no amount of locking makes that reproducible. So there is exactly
 one matching thread, it owns the books outright, and it needs no locks
 because nothing else ever touches them.
 
-Commands reach it through a **single-producer / single-consumer (SPSC) ring
-buffer** (`common/spsc_queue.hpp`). It is lock-free without a compare-and-swap
-loop, which is worth understanding because it is the reason this queue is
-cheap:
+Commands reach it through a bounded **multi-producer / single-consumer
+(MPSC) ring** (`common/mpsc_queue.hpp`). Every connection reader may call
+`MatchingPipeline::submit()` concurrently; there is no submit mutex.
+Producers CAS-reserve slots, and per-slot publication tickets let the
+consumer preserve reservation order even when producers finish stores out
+of order.
 
-- The producer only ever writes the head index; the consumer only ever
-  writes the tail index. Neither atomic ever has two writers.
-- Each side does one acquire-load of the *other* side's index and one
-  release-store of its *own*, per operation. That release/acquire pair is
-  what guarantees the consumer never sees a slot before it is fully
-  constructed.
-- A CAS loop is what you need when multiple threads race to write the *same*
-  atomic. SPSC rules that out by contract, so a CAS would be unused
-  generality.
-- The two indices are `alignas(64)`, each on its own cache line, so the
-  producer's writes do not force the consumer's cache line to bounce between
-  cores. This is **false sharing**, and it is the difference between a fast
-  queue and a slow one.
+That defines sequencing explicitly:
 
-The gateway has N reader threads (one per connection) but the queue permits
-one producer, so submissions are serialized behind a single mutex. That is a
-deliberate tradeoff: `submit()` is not the hot path, and a mutex there is far
-simpler than making the queue multi-producer. The genuinely hot path —
-matching itself — stays single-threaded and lock-free.
+- One reader submitting A then B preserves A-before-B, so each session keeps
+  its TCP decode order.
+- Concurrent sessions are ordered by the lock-free admission race, not by
+  wall-clock TCP arrival or mutex acquisition.
+- The matching thread assigns `command_sequence` only after dequeue,
+  immediately before processing. A full-queue rejection consumes no
+  sequence number.
+
+Matching itself remains single-threaded and owns the books outright.
 
 **A full queue is a rejection, not a drop.** This is the sharpest contrast
 with the market-data side of the codebase, which has a `DroppingQueue` that
@@ -674,7 +668,8 @@ Collected in one place, since they are scattered through the walkthrough:
 | **Big-endian, explicit shifts** | struct layout is not a wire contract; shifts work on any host |
 | **Fixed-size payloads** | size known at compile time, so validation and decode are a few loads |
 | **`TCP_NODELAY` on** | Nagle's algorithm batches small writes to save bandwidth, which is exactly wrong for latency |
-| **SPSC queue, not a mutex** | one producer and one consumer by contract means no CAS and no lock |
+| **MPSC inbound command queue** | every connection reader may `submit()` concurrently; FIFO is CAS admission order, not a mutex |
+| **SPSC outbound per connection** | matching thread is the sole producer for that writer's queue |
 | **Cache-line-padded indices** | prevents false sharing between producer and consumer |
 | **Drop on a full market-data queue** | a stalled receive loop drops in the kernel instead, invisibly |
 | **Reject on a full command queue** | a silently dropped order is indistinguishable to the client from one never sent |
@@ -765,8 +760,8 @@ apps/
   market_simulator/    two simulated participants trading a running
                        trading_server over TCP + UDP
 ui/               React + Vite + TypeScript dashboard
-benchmarks/       Google Benchmark suites + a real TCP latency harness
-tests/            GoogleTest suite (464 tests)
+benchmarks/       microbenchmarks + staged and transport-floor TCP harnesses
+tests/            GoogleTest suite (483 tests)
 bench-results/    raw benchmark output, committed
 docs/             see below
 ```
@@ -835,6 +830,7 @@ them:
 ./build/bench_matching_engine
 ./build/bench_matching_workload
 ./build/bench_end_to_end_latency    # real TCP round trip vs. transport floor
+./build/bench_order_path_latency    # staged latency/load/syscall measurements
 ```
 
 ---

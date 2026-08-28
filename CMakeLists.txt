@@ -62,9 +62,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # the hand-rolled matching core, codecs, book, and SPSC queue is -- so a
 # small, standard,
 # well-regarded library is used instead of hand-rolling percentile/timing
-# machinery a second time (bench_end_to_end_latency.cpp below hand-rolls
-# only the one thing Google Benchmark's fixed-iteration model can't express
-# well: a real socket round trip's own latency distribution).
+# machinery a second time. The hand-rolled benchmark executables below cover
+# latency distributions, staged TCP load/syscall measurements, workload
+# scaling, and allocation profiling -- shapes that do not fit Google
+# Benchmark's fixed-iteration model cleanly.
 option(MDH_BUILD_BENCHMARKS "Build benchmarks/ (requires Google Benchmark via FetchContent)" ON)
 if(MDH_BUILD_BENCHMARKS)
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
@@ -237,6 +238,7 @@ add_executable(mdh_tests
     tests/test_udp_receiver.cpp
     tests/test_udp_replay_e2e.cpp
     tests/test_spsc_queue.cpp
+    tests/test_mpsc_queue.cpp
     tests/test_dropping_queue.cpp
     tests/test_backpressure_integration.cpp
     tests/test_snapshot.cpp
@@ -277,6 +279,7 @@ add_executable(mdh_tests
     tests/test_momentum_strategy.cpp
     tests/test_feed_subscriber.cpp
     tests/test_market_simulator_e2e.cpp
+    tests/test_latency_tracer.cpp
     tests/test_ui_gateway.cpp
     tests/test_failure_injection_gateway.cpp
     tests/test_failure_injection_market_data.cpp
@@ -324,6 +327,11 @@ if(MDH_BUILD_BENCHMARKS)
     add_executable(bench_end_to_end_latency benchmarks/bench_end_to_end_latency.cpp)
     target_link_libraries(bench_end_to_end_latency PRIVATE mdh_core)
     target_compile_options(bench_end_to_end_latency PRIVATE ${MDH_WARNING_FLAGS})
+
+    # Staged order-path latency (T0-T5) over real TCP via OrderEntryClient.
+    add_executable(bench_order_path_latency benchmarks/bench_order_path_latency.cpp)
+    target_link_libraries(bench_order_path_latency PRIVATE mdh_core)
+    target_compile_options(bench_order_path_latency PRIVATE ${MDH_WARNING_FLAGS})
 
     # The two matching-engine benchmarks below are also standalone rather
     # than Google Benchmark cases, for two different reasons.

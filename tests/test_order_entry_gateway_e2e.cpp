@@ -185,6 +185,29 @@ TEST(OrderEntryGatewayE2e, NewOrderRoundTripsToAnAcceptedResponse) {
     EXPECT_EQ(server.gateway().connection_count(), 1u);
 }
 
+TEST(OrderEntryGatewayE2e, OptionalIoMetricsCountActualServerCalls) {
+    RunningGateway server(OrderEntryGatewayOptions{
+        .enable_io_metrics = true,
+    });
+    ASSERT_TRUE(server.started());
+    server.gateway().deposit_cash(/*account_id=*/1, /*amount=*/1'000'000);
+
+    TestClient client;
+    ASSERT_TRUE(client.connect_to(server.port()));
+    client.send(Message{new_order(/*account=*/1, /*client_id=*/7, Side::Buy, /*price=*/100, /*qty=*/1,
+                                  TimeInForce::IOC)});
+    ASSERT_TRUE(client.receive().has_value());
+
+    const auto metrics = server.gateway().io_metrics();
+    EXPECT_GE(metrics.read_syscalls, 1u);
+    EXPECT_GT(metrics.bytes_read, 0u);
+    EXPECT_EQ(metrics.frames_decoded, 1u);
+    EXPECT_GE(metrics.write_syscalls, 1u);
+    EXPECT_GT(metrics.bytes_written, 0u);
+    EXPECT_EQ(metrics.reports_enqueued, 1u);
+    EXPECT_EQ(metrics.reports_written, 1u);
+}
+
 TEST(OrderEntryGatewayE2e, NewOrderWithoutSufficientFundsIsRejected) {
     RunningGateway server;
     ASSERT_TRUE(server.started());

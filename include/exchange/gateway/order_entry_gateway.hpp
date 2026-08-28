@@ -44,20 +44,29 @@
 //
 //   accept thread (one, polling)
 //       |
-//       +--> per connection: reader thread --> submit_command() --> pipeline
-//       |                                                              |
-//       +--> per connection: writer thread <-- outbound queue <-- route_event()
-//                                                          (runs on the matching thread)
+//       +--> per connection: reader thread --> pipeline.submit()  (MPSC)
+//       |                                              |
+//       |                                    matching thread (one)
+//       |                                              |
+//       +--> bounded outbound SPSC <-- route_event()
+//                    |
+//                    +--> per-connection writer (sleeps on wake_cv)
 //
 // One accept thread polls accept() in a non-blocking loop against a shared
 // stop token rather than blocking inside it -- see accept_loop() for why.
-// Each accepted connection then gets a reader thread and a writer thread of
-// its own, and those two are the only threads allowed to touch its socket.
+// Each accepted connection gets a blocking reader and a blocking writer.
+// The writer owns that socket's outbound direction.
 //
-// The pipeline's submit() takes a single producer, but this gateway has one
-// reader thread per connection, so submit_command() serializes them behind
-// submit_mutex_. A plain mutex is the right answer here: submit() is not the
-// hot path, and matching itself stays single-threaded and lock-free.
+// MatchingPipeline::submit() is MPSC: every reader may call it concurrently.
+// There is no submit_mutex_. Sequencing is not "whoever grabbed the mutex":
+//
+//   * One session: the reader is a single thread, so decode order is
+//     admission order is matching order (per-session FIFO).
+//   * Two sessions: matching order is the lock-free admission race into the
+//     pipeline queue. command_sequence is stamped on the matching thread in
+//     that order. TCP arrival time is not a promise.
+//
+// Matching itself stays single-threaded.
 //
 // route_event() is the sink the pipeline hands to its processor, so it runs
 // on the matching thread, synchronously, and must not block. It translates
@@ -156,6 +165,30 @@ struct OrderEntryGatewayOptions {
     // Runs on the matching thread, synchronously, under the same "must not
     // block" rule as route_event() itself. Null by default.
     EventSink extra_event_sink;
+
+    // How many immediately available outbound messages a writer may encode
+    // into one write(). It never waits for a batch to fill, so an isolated
+    // report still leaves promptly. Production is 4: that was the measured
+    // syscall win under load. The latency bench may still raise this to
+    // reproduce historical tables.
+    std::size_t writer_batch = 4;
+
+    // Benchmark/diagnostic counters around the actual server-side read() and
+    // write() call sites. Disabled in production by default; the disabled
+    // hot path is one relaxed atomic load.
+    bool enable_io_metrics = false;
+};
+
+struct OrderEntryIoMetrics {
+    std::uint64_t read_syscalls = 0;
+    std::uint64_t bytes_read = 0;
+    std::uint64_t frames_decoded = 0;
+    std::uint64_t write_syscalls = 0;
+    std::uint64_t bytes_written = 0;
+    std::uint64_t reports_enqueued = 0;
+    std::uint64_t reports_written = 0;
+    std::uint64_t write_errors = 0;
+    std::uint64_t outbound_drops = 0;
 };
 
 class OrderEntryGateway {
@@ -181,7 +214,7 @@ public:
     //      steps 3 and 4 walk the connection list.
     //   3. shutdown() every live socket. This is what unblocks each reader
     //      thread, which is otherwise parked in a blocking read().
-    //   4. Join every reader and writer thread.
+    //   4. Join every reader and writer.
     //   5. Stop the pipeline, which drains whatever is already queued.
     // Safe to call more than once, including from the destructor, and a
     // no-op on a gateway never started or already stopped.
@@ -203,6 +236,11 @@ public:
     // running is a data race -- unguarded at runtime, exactly like
     // MatchingPipeline::snapshot(), which has the same precondition.
     [[nodiscard]] EngineStateSnapshot snapshot() const { return engine_.snapshot(); }
+
+    // Best-effort inbound queue occupancy, safe from any thread.
+    [[nodiscard]] std::size_t matching_queue_size() const { return pipeline_.queue_size(); }
+    [[nodiscard]] std::size_t matching_queue_high_water_mark() const { return pipeline_.queue_high_water_mark(); }
+    [[nodiscard]] OrderEntryIoMetrics io_metrics() const;
 
     // Test and admin seeding, forwarded to the ledger -- the only way
     // balances ever start out non-zero. The ledger is not synchronized
@@ -312,8 +350,8 @@ private:
         std::jthread writer_thread;
     };
 
-    // Serializes pipeline submissions across every reader thread. Always use
-    // this rather than calling pipeline_.submit() directly.
+    // Forwards to the pipeline. Any reader thread may call this; the queue
+    // is MPSC and the matching thread is the sequencer.
     [[nodiscard]] bool submit_command(ExchangeCommand command);
 
     // ── Translation between the wire and the exchange core ────────────────
@@ -338,7 +376,7 @@ private:
     // framing is still intact.
     void connection_reader_loop(Connection& conn);
 
-    // Runs on this connection's writer thread. Drains, in this order: the
+    // Per-connection writer implementation. Drains, in this order: the
     // replay backlog handed over at bind time, the gateway's own replies,
     // and reports from the matching thread -- encoding and writing each.
     // write() can return a short count, so one call is not guaranteed to
@@ -347,6 +385,8 @@ private:
     // moment a producer pushes. Exits on the stop token, or as soon as its
     // connection is marked closed.
     void connection_writer_loop(Connection& conn, std::stop_token token);
+
+    void notify_writer(Connection& conn);
 
     // Binds this session to `account_id` on its first valid request and
     // hands over whatever reports accumulated for that account while it had
@@ -377,10 +417,12 @@ private:
     // else retained -- and then updates order ownership.
     void route_event(const ExchangeEvent& event);
 
-    // Pushes one report onto a connection's outbound queue and wakes its
-    // writer. Called with sessions_mutex_ held. A full queue drops: that
-    // writer has fallen behind, and the matching thread must not wait on it.
-    void deliver(Connection& conn, protocol::order_entry::Message message);
+    // Pushes one report onto a connection's outbound queue. The caller
+    // wakes the writer after dropping sessions_mutex_: notify_one() can
+    // switch to the writer thread, and holding the routing mutex across
+    // that hand-off stalls every reader in claim_order_ownership().
+    // Returns whether the writer should be woken.
+    [[nodiscard]] bool deliver(Connection& conn, protocol::order_entry::Message message);
 
     // Keeps ownership in step with the engine's live orders as events go by:
     // moves ownership to the new id on a replace, and drops keys whose order
@@ -446,7 +488,16 @@ private:
     // session that binds to it. Bounded by pending_report_capacity.
     std::unordered_map<AccountId, std::deque<protocol::order_entry::Message>> pending_reports_;
 
-    std::mutex submit_mutex_; // see submit_command()
+    std::atomic<bool> io_metrics_enabled_{false};
+    std::atomic<std::uint64_t> read_syscalls_{0};
+    std::atomic<std::uint64_t> bytes_read_{0};
+    std::atomic<std::uint64_t> frames_decoded_{0};
+    std::atomic<std::uint64_t> write_syscalls_{0};
+    std::atomic<std::uint64_t> bytes_written_{0};
+    std::atomic<std::uint64_t> reports_enqueued_{0};
+    std::atomic<std::uint64_t> reports_written_{0};
+    std::atomic<std::uint64_t> write_errors_{0};
+    std::atomic<std::uint64_t> outbound_drops_{0};
 
     MatchingEngine engine_;
     ledger::Ledger ledger_;

@@ -10,6 +10,7 @@
 #include <type_traits>
 #include <variant>
 
+#include "exchange/latency/latency_tracer.hpp"
 #include "protocol/order_entry/decoder.hpp"
 #include "protocol/order_entry/encoder.hpp"
 
@@ -32,13 +33,18 @@ constexpr auto kPollInterval = 1ms;
 
 OrderEntryGateway::OrderEntryGateway(std::uint16_t port, const OrderEntryGatewayOptions& options)
     : port_(port), options_(options),
+      io_metrics_enabled_(options.enable_io_metrics),
       engine_(std::span<const InstrumentId>(options.instruments), options.expected_resting_orders),
       risk_gated_engine_(engine_, ledger_, options_.risk_limits),
       pipeline_(
           EventSink{[this](const ExchangeEvent& event) { route_event(event); }},
-          sequencing::MatchingPipelineOptions{.queue_capacity = options_.matching_queue_capacity},
+          sequencing::MatchingPipelineOptions{
+              .queue_capacity = options_.matching_queue_capacity,
+          },
           sequencing::MatchingPipeline::Processor{[this](const ExchangeCommand& command, const EventSink& sink) {
+              latency::tracer().stamp_exchange_begin(command);
               risk_gated_engine_.process(command, sink);
+              latency::tracer().stamp_exchange_end(command);
           }}) {}
 
 OrderEntryGateway::~OrderEntryGateway() { stop(); }
@@ -71,7 +77,6 @@ void OrderEntryGateway::stop() {
             conn->writer_thread.join();
         }
     }
-
     pipeline_.stop();
 }
 
@@ -80,8 +85,21 @@ std::size_t OrderEntryGateway::connection_count() const {
     return connections_.size();
 }
 
+OrderEntryIoMetrics OrderEntryGateway::io_metrics() const {
+    return OrderEntryIoMetrics{
+        .read_syscalls = read_syscalls_.load(std::memory_order_relaxed),
+        .bytes_read = bytes_read_.load(std::memory_order_relaxed),
+        .frames_decoded = frames_decoded_.load(std::memory_order_relaxed),
+        .write_syscalls = write_syscalls_.load(std::memory_order_relaxed),
+        .bytes_written = bytes_written_.load(std::memory_order_relaxed),
+        .reports_enqueued = reports_enqueued_.load(std::memory_order_relaxed),
+        .reports_written = reports_written_.load(std::memory_order_relaxed),
+        .write_errors = write_errors_.load(std::memory_order_relaxed),
+        .outbound_drops = outbound_drops_.load(std::memory_order_relaxed),
+    };
+}
+
 bool OrderEntryGateway::submit_command(ExchangeCommand command) {
-    std::lock_guard<std::mutex> lock(submit_mutex_);
     return pipeline_.submit(std::move(command));
 }
 
@@ -107,6 +125,7 @@ void OrderEntryGateway::accept_loop() {
         conn_ptr->reader_thread = std::jthread([this, conn_ptr] { connection_reader_loop(*conn_ptr); });
         conn_ptr->writer_thread = std::jthread(
             [this, conn_ptr] { connection_writer_loop(*conn_ptr, stop_source_.get_token()); });
+        notify_writer(*conn_ptr);
     }
 }
 
@@ -116,6 +135,12 @@ void OrderEntryGateway::connection_reader_loop(Connection& conn) {
     std::array<std::byte, 4096> chunk{};
     while (true) {
         auto n = conn.socket.read(chunk);
+        if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
+            read_syscalls_.fetch_add(1, std::memory_order_relaxed);
+            if (n) {
+                bytes_read_.fetch_add(*n, std::memory_order_relaxed);
+            }
+        }
         if (!n || *n == 0) {
             break; // error, peer EOF, or this socket was shutdown() by stop() -- connection is done either way
         }
@@ -145,6 +170,10 @@ void OrderEntryGateway::connection_reader_loop(Connection& conn) {
                 continue; // malformed payload for an otherwise well-formed header -- drop just this one frame
             }
             const Message& message = std::get<Message>(message_result);
+            if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
+                frames_decoded_.fetch_add(1, std::memory_order_relaxed);
+            }
+            latency::tracer().stamp_server_decoded(message);
 
             auto command = to_command(message);
             if (!command) {
@@ -181,7 +210,7 @@ void OrderEntryGateway::connection_reader_loop(Connection& conn) {
     conn.closed.store(true, std::memory_order_release);
     unbind_session(conn);
     conn.socket.shutdown();       // this connection's writer may be blocked mid-write() on a dead socket
-    conn.wake_cv.notify_all();    // and if it isn't, wake it so it observes conn.closed instead of lingering until stop()
+    notify_writer(conn);          // wake the writer if it is waiting on this connection
 }
 
 void OrderEntryGateway::bind_session(Connection& conn, AccountId account_id) {
@@ -201,7 +230,7 @@ void OrderEntryGateway::bind_session(Connection& conn, AccountId account_id) {
         }
     }
     conn.account_id = account_id;
-    conn.wake_cv.notify_one(); // there may now be a backlog to write out
+    notify_writer(conn); // there may now be a backlog to write out
 }
 
 void OrderEntryGateway::unbind_session(Connection& conn) {
@@ -261,8 +290,13 @@ void OrderEntryGateway::reject_account_mismatch(Connection& conn, const Exchange
     // Connection::session_outbound). A full queue drops the rejection for
     // the same reason route_event() drops a report -- the client isn't
     // reading.
-    if (conn.session_outbound.try_push(Message{rejection})) {
-        conn.wake_cv.notify_one();
+    Message rejection_message{rejection};
+    if (conn.session_outbound.try_push(rejection_message)) {
+        if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
+            reports_enqueued_.fetch_add(1, std::memory_order_relaxed);
+        }
+        latency::tracer().stamp_writer_queued(rejection_message);
+        notify_writer(conn);
     }
 }
 
@@ -313,41 +347,88 @@ void OrderEntryGateway::connection_writer_loop(Connection& conn, std::stop_token
         return !conn.replay_backlog.empty() || conn.session_outbound.size() > 0 || conn.outbound.size() > 0;
     };
 
+    // Reused for every outbound frame. encode_message() appends, so this is
+    // cleared rather than reconstructed -- a per-message heap allocation
+    // here used to sit on the writer path of every execution report.
+    std::vector<std::byte> buf;
+    buf.reserve(64);
+    const std::size_t batch_limit = options_.writer_batch == 0 ? 1 : options_.writer_batch;
+    std::vector<Message> extra;
+    extra.reserve(batch_limit > 0 ? batch_limit - 1 : 0);
+
+    auto try_pop_any = [&]() -> std::optional<Message> {
+        if (auto backlog = next_backlog_message()) {
+            return backlog;
+        }
+        if (auto session = conn.session_outbound.try_pop()) {
+            return session;
+        }
+        return conn.outbound.try_pop();
+    };
+
+    auto wait_for_work = [&] {
+        std::unique_lock<std::mutex> lock(conn.wake_mutex);
+        conn.wake_cv.wait_for(lock, kPollInterval, [&] {
+            return token.stop_requested() || conn.closed.load(std::memory_order_acquire) || has_work();
+        });
+    };
+
     while (!token.stop_requested() && !conn.closed.load(std::memory_order_acquire)) {
-        auto message = next_backlog_message();
-        if (!message) {
-            message = conn.session_outbound.try_pop(); // the gateway's own replies, e.g. an account mismatch
-        }
-        if (!message) {
-            message = conn.outbound.try_pop();
-        }
-        if (!message) {
+        auto first = try_pop_any();
+        if (!first) {
             // wait_for()'s predicate is re-checked immediately, before ever
             // actually sleeping -- so a notify_one() (route_event() below)
             // or notify_all() (stop(), above) that already happened before
             // this wait began is never lost, only redundant with this
-            // re-check. kPollInterval is a safety-net timeout only, not the
-            // expected wake path -- see this class's own kPollInterval doc
-            // comment.
-            std::unique_lock<std::mutex> lock(conn.wake_mutex);
-            conn.wake_cv.wait_for(lock, kPollInterval, [&] {
-                return token.stop_requested() || conn.closed.load(std::memory_order_acquire) || has_work();
-            });
+            // re-check. kPollInterval is a safety-net timeout only -- see
+            // this class's own kPollInterval doc comment.
+            wait_for_work();
             continue;
         }
 
-        std::vector<std::byte> buf;
-        encode_message(*message, buf);
+        Message held = std::move(*first);
+        buf.clear();
+        encode_message(held, buf);
+
+        extra.clear();
+        while (1 + extra.size() < batch_limit) {
+            auto more = try_pop_any();
+            if (!more) {
+                break;
+            }
+            encode_message(*more, buf);
+            extra.push_back(std::move(*more));
+        }
 
         std::size_t written = 0;
         while (written < buf.size()) {
             auto n = conn.socket.write(std::span(buf).subspan(written));
+            if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
+                write_syscalls_.fetch_add(1, std::memory_order_relaxed);
+                if (n) {
+                    bytes_written_.fetch_add(*n, std::memory_order_relaxed);
+                }
+            }
             if (!n || *n == 0) {
+                if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
+                    write_errors_.fetch_add(1, std::memory_order_relaxed);
+                }
                 return; // write error, or a 0-byte write on a live socket -- either way, this connection is done
             }
             written += *n;
         }
+        latency::tracer().stamp_socket_written(held);
+        for (const auto& message : extra) {
+            latency::tracer().stamp_socket_written(message);
+        }
+        if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
+            reports_written_.fetch_add(1 + extra.size(), std::memory_order_relaxed);
+        }
     }
+}
+
+void OrderEntryGateway::notify_writer(Connection& conn) {
+    conn.wake_cv.notify_one();
 }
 
 void OrderEntryGateway::route_event(const ExchangeEvent& event) {
@@ -360,64 +441,75 @@ void OrderEntryGateway::route_event(const ExchangeEvent& event) {
         return; // e.g. a Book* event -- see to_execution_reports()'s own doc comment
     }
 
-    std::lock_guard<std::mutex> lock(sessions_mutex_);
-    for (auto& [key, message] : reports) {
-        // 1. The session that submitted this order, if it's still here.
-        if (auto owner = order_owner_.find(key);
-            owner != order_owner_.end() && !owner->second->closed.load(std::memory_order_acquire)) {
-            deliver(*owner->second, std::move(message));
-            continue;
-        }
+    // At most two connections (a trade's two sides). Collect wakeups so
+    // notify_one() runs without sessions_mutex_.
+    Connection* wake[2] = {nullptr, nullptr};
+    int wake_count = 0;
 
-        // 2. Otherwise one other live session of the account. Reached
-        // when the owning session disconnected but left a resting order
-        // behind (nothing cancels orders on disconnect), or when the
-        // command came from submit_command() rather than a socket at all.
-        auto sessions = account_sessions_.find(key.account_id);
-        if (sessions != account_sessions_.end()) {
-            Connection* fallback = nullptr;
-            for (Connection* session : sessions->second) {
-                if (!session->closed.load(std::memory_order_acquire)) {
-                    fallback = session;
-                    break;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        for (auto& [key, message] : reports) {
+            Connection* target = nullptr;
+
+            if (auto owner = order_owner_.find(key);
+                owner != order_owner_.end() && !owner->second->closed.load(std::memory_order_acquire)) {
+                target = owner->second;
+            } else {
+                auto sessions = account_sessions_.find(key.account_id);
+                if (sessions != account_sessions_.end()) {
+                    for (Connection* session : sessions->second) {
+                        if (!session->closed.load(std::memory_order_acquire)) {
+                            target = session;
+                            break;
+                        }
+                    }
                 }
             }
-            if (fallback != nullptr) {
-                deliver(*fallback, std::move(message));
+
+            if (target != nullptr) {
+                if (deliver(*target, std::move(message))) {
+                    if (wake_count == 0 || (wake_count == 1 && wake[0] != target)) {
+                        wake[wake_count++] = target;
+                    }
+                }
                 continue;
             }
+
+            if (options_.pending_report_capacity == 0) {
+                continue;
+            }
+            auto& pending = pending_reports_[key.account_id];
+            if (pending.size() >= options_.pending_report_capacity) {
+                pending.pop_front();
+            }
+            pending.push_back(std::move(message));
         }
 
-        // 3. Otherwise nobody is connected for this account at all -- hold
-        // the report so the next session to bind can reconcile against it.
-        if (options_.pending_report_capacity == 0) {
-            continue;
-        }
-        auto& pending = pending_reports_[key.account_id];
-        if (pending.size() >= options_.pending_report_capacity) {
-            pending.pop_front();
-        }
-        pending.push_back(std::move(message));
+        update_order_ownership(event);
     }
 
-    update_order_ownership(event);
+    for (int i = 0; i < wake_count; ++i) {
+        notify_writer(*wake[i]);
+    }
 }
 
-void OrderEntryGateway::deliver(Connection& conn, protocol::order_entry::Message message) {
-    // A full outbound queue means that connection's writer thread has
-    // fallen behind; dropped here rather than blocking (this function runs
-    // on the matching thread, see class-level comment on why it must not
-    // block) -- there is no synchronous caller here to hand a rejection
-    // back to the way MatchingPipeline::submit() can. Deliberately *not*
-    // retained in pending_reports_ either: that exists for an account with
-    // nobody listening, not for a client that is connected and not reading.
-    if (conn.outbound.try_push(std::move(message))) {
-        // No lock needed here -- see Connection::wake_cv's doc comment on
-        // why a notification racing ahead of the writer thread starting
-        // its wait is never lost, only redundant with that wait's own
-        // predicate re-check.
-        conn.wake_cv.notify_one();
+bool OrderEntryGateway::deliver(Connection& conn, protocol::order_entry::Message message) {
+    // A full outbound queue means that connection's writer has fallen
+    // behind; dropped rather than blocking -- this runs on the matching
+    // thread. The writer is woken by the caller after sessions_mutex_ is
+    // released.
+    if (conn.outbound.try_push(message)) {
+        if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
+            reports_enqueued_.fetch_add(1, std::memory_order_relaxed);
+        }
+        latency::tracer().stamp_first_event_if_unset(message);
+        latency::tracer().stamp_writer_queued(message);
+        return true;
     }
+    if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
+        outbound_drops_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
 }
 
 void OrderEntryGateway::update_order_ownership(const ExchangeEvent& event) {
@@ -473,7 +565,7 @@ std::optional<ExchangeCommand> OrderEntryGateway::to_command(const protocol::ord
             using T = std::decay_t<decltype(msg)>;
             if constexpr (std::is_same_v<T, NewOrder>) {
                 return ExchangeCommand{NewOrderCommand{
-                    .command_sequence = 0, // assigned by MatchingPipeline::submit(), see its own doc comment
+                    .command_sequence = 0, // assigned on the matching thread, see MatchingPipeline
                     .account_id = msg.account_id,
                     .client_order_id = msg.client_order_id,
                     .instrument_id = msg.instrument_id,

@@ -67,7 +67,8 @@ public:
     // (serialized by write_mutex_) -- cheap enough not to need anything
     // fancier, and simpler to make outright safe than to document a
     // single-caller restriction every caller has to remember (same
-    // rationale as the gateway's own submit_command()). Returns false on a
+    // rationale as making OrderEntryClient::send() mutex-safe: cheaper to
+    // be safe than to document a single-caller restriction). Returns false on a
     // write error, e.g. the connection has already dropped.
     [[nodiscard]] bool send(const protocol::order_entry::Message& message);
 
@@ -90,6 +91,7 @@ private:
     std::mutex write_mutex_;
     MessageSink sink_;
     std::vector<std::byte> read_buffer_; // reader-thread-only
+    std::vector<std::byte> write_buffer_; // reused across send(); guarded by write_mutex_
     std::jthread reader_thread_;
     std::atomic<bool> connected_{false};
 };

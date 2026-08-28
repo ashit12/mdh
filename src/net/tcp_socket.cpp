@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstring>
 #include <utility>
 
@@ -25,9 +26,14 @@ namespace {
 // guaranteed property of "a connected TcpSocket," not something every
 // caller must remember to opt into -- same rationale as accept()'s
 // unconditional O_NONBLOCK clearing right above this call's usual site.
-void disable_nagle(int fd) {
+void configure_connected_socket(int fd) {
     const int flag = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+#if defined(SO_NOSIGPIPE)
+    // BSD/macOS suppress SIGPIPE per socket. Linux has no SO_NOSIGPIPE and
+    // uses MSG_NOSIGNAL on each send() below.
+    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &flag, sizeof(flag));
+#endif
 }
 } // namespace
 
@@ -100,7 +106,7 @@ std::optional<TcpSocket> TcpSocket::accept() {
     if (flags >= 0) {
         ::fcntl(val, F_SETFL, flags & ~O_NONBLOCK);
     }
-    disable_nagle(val);
+    configure_connected_socket(val);
 
     return TcpSocket(val);
 }
@@ -121,7 +127,7 @@ bool TcpSocket::connect(const std::string& host, std::uint16_t port) {
     if (val < 0) {
         return false;
     }
-    disable_nagle(fd_);
+    configure_connected_socket(fd_);
     return true;
 }
 
@@ -153,7 +159,12 @@ std::optional<std::size_t> TcpSocket::write(std::span<const std::byte> data) {
     if (!is_open()) {
         return std::nullopt;
     }
-    const auto val = ::write(fd_, data.data(), data.size());
+#if defined(MSG_NOSIGNAL)
+    constexpr int flags = MSG_NOSIGNAL;
+#else
+    constexpr int flags = 0;
+#endif
+    const auto val = ::send(fd_, data.data(), data.size(), flags);
     if (val < 0) {
         return std::nullopt;
     }

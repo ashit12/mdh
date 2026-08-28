@@ -225,7 +225,7 @@ TEST(MatchingPipeline, CustomProcessorIsInvokedInsteadOfBareEngine) {
 //
 // Everything above submits from the test's own (single) thread, which never
 // exercises the actual reason MatchingPipeline exists: a dedicated producer
-// thread racing a dedicated matching thread across the same SpscQueue this
+// thread racing a dedicated matching thread across the same MPSC queue this
 // class owns. Run under ThreadSanitizer (MDH_ENABLE_TSAN) to check the
 // memory-ordering claims in this class's own doc comment, the same way
 // SpscQueue's concurrent tests do (test_spsc_queue.cpp).
@@ -291,6 +291,58 @@ TEST(MatchingPipeline, ConcurrentProducerThreadCommandsAllProcessedExactlyOnce) 
         ++accepted_count;
     }
     EXPECT_EQ(accepted_count, kCount);
+}
+
+TEST(MatchingPipeline, ConcurrentProducersKeepPerProducerFifoAndGaplessSequences) {
+    ThreadSafeCollectingSink out;
+    constexpr int kProducers = 4;
+    constexpr int kEach = 2'000;
+    MatchingPipelineOptions options;
+    options.instruments = {1};
+    options.queue_capacity = 128;
+    MatchingPipeline pipeline(out.sink(), options);
+
+    std::vector<std::jthread> producers;
+    producers.reserve(kProducers);
+    for (int p = 0; p < kProducers; ++p) {
+        producers.emplace_back([&, p] {
+            const AccountId account = static_cast<AccountId>(1000 + p);
+            for (int i = 0; i < kEach; ++i) {
+                while (!pipeline.submit(new_order(account, static_cast<ClientOrderId>(i), /*instrument=*/1, Side::Buy,
+                                                  100 + i, 1))) {
+                    std::this_thread::yield();
+                }
+            }
+        });
+    }
+    producers.clear(); // join
+
+    const std::size_t expected = static_cast<std::size_t>(kProducers * kEach);
+    ASSERT_TRUE(wait_until([&] { return pipeline.commands_processed() == expected; }, 15s));
+    pipeline.stop();
+    EXPECT_EQ(pipeline.commands_processed(), expected);
+
+    std::vector<int> last_id(static_cast<std::size_t>(kProducers), -1);
+    std::vector<bool> seen(expected + 1, false);
+    int accepted = 0;
+    for (const auto& ev : out.events()) {
+        if (!std::holds_alternative<OrderAccepted>(ev)) {
+            continue;
+        }
+        const auto& acc = std::get<OrderAccepted>(ev);
+        const int producer = static_cast<int>(acc.account_id - 1000);
+        ASSERT_GE(producer, 0);
+        ASSERT_LT(producer, kProducers);
+        EXPECT_EQ(static_cast<int>(acc.client_order_id), last_id[static_cast<std::size_t>(producer)] + 1);
+        last_id[static_cast<std::size_t>(producer)] = static_cast<int>(acc.client_order_id);
+
+        ASSERT_GE(acc.command_sequence, 1u);
+        ASSERT_LE(acc.command_sequence, static_cast<CommandSequence>(expected));
+        ASSERT_FALSE(seen[acc.command_sequence]);
+        seen[acc.command_sequence] = true;
+        ++accepted;
+    }
+    EXPECT_EQ(accepted, kProducers * kEach);
 }
 
 } // namespace mdh::exchange::sequencing

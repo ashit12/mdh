@@ -8,7 +8,7 @@
 #include <thread>
 #include <vector>
 
-#include "common/spsc_queue.hpp"
+#include "common/mpsc_queue.hpp"
 #include "exchange/core/commands.hpp"
 #include "exchange/core/event_sink.hpp"
 #include "exchange/matching/matching_engine.hpp"
@@ -16,8 +16,26 @@
 #include "exchange/sequencing/command_sequencer.hpp"
 
 // The sequencer and matching thread: everything between "commands arrive
-// somehow" and the deterministic, single-threaded matching engine. It uses
-// SpscQueue unchanged.
+// somehow" and the deterministic, single-threaded matching engine.
+//
+// ── Sequencing semantics ──────────────────────────────────────────────────
+// command_sequence is the matching engine's total order. It is assigned on
+// the matching thread, immediately before process(), never by a client and
+// never by a gateway reader. A command that never enters the queue is not
+// sequenced, so a full-queue rejection cannot punch a gap in the stream.
+//
+// The queue is FIFO in *admission* order: the order of successful
+// try_push() reservations. Consequences, stated as rules rather than
+// implications:
+//
+//   1. Per producer FIFO. One thread that submit()s A then B has A
+//      processed before B. A connection's reader is one producer, so a
+//      session's own commands stay in decode order.
+//   2. Cross-producer order is the lock-free admission race, not wall-clock
+//      TCP arrival and not a mutex. Two readers that submit concurrently
+//      are ordered by who reserved the slot; that is the matching order.
+//   3. Matching remains single-threaded. Concurrent submit() does not mean
+//      concurrent process().
 //
 // ── Why this is not a DroppingQueue ───────────────────────────────────────
 // Market data can afford to drop a frame -- downstream it shows up as a
@@ -28,19 +46,14 @@
 //
 // So submit() reports a full queue as an explicit `false` instead of
 // swallowing it. Turning that into a client-facing "busy, retry" reply is
-// the gateway's business; this class stops at "was this command sequenced
+// the gateway's business; this class stops at "was this command admitted
 // and queued, yes or no."
 //
 // ── Threads ───────────────────────────────────────────────────────────────
-// One producer, one consumer, exactly as SpscQueue requires. submit() must
-// be called from a single thread: the sequencer's counter is a plain
-// non-atomic relying on that, the same way the queue's own head index does.
-//
-// The matching thread is started in the constructor and joined in stop() or
-// the destructor. It is the only consumer and the only thread that ever
-// calls into the matching engine, which is what preserves the engine's
-// single-threaded determinism even though commands now arrive from
-// elsewhere.
+// Many producers, one consumer. submit() is safe from any number of
+// threads (the queue is MPSC). The matching thread is the only consumer
+// and the only thread that ever calls into the matching engine or the
+// sequencer.
 //
 // The EventSink runs synchronously on the matching thread. This class adds
 // no buffering or thread-hopping on the way out -- a caller that needs
@@ -91,10 +104,11 @@ public:
     MatchingPipeline(MatchingPipeline&&) = delete;
     MatchingPipeline& operator=(MatchingPipeline&&) = delete;
 
-    // Producer side only. Gives `command` its authoritative sequence number
-    // and queues it for the matching thread. Returns false, having sequenced
-    // and processed nothing, if the queue is full -- see the class comment
-    // on why that is a rejection rather than a silent drop.
+    // Any producer. Admits `command` to the matching queue without assigning
+    // a sequence number. Returns false, having sequenced and processed
+    // nothing, if the queue is full -- see the class comment on why that is
+    // a rejection rather than a silent drop, and on when sequence numbers
+    // are assigned.
     [[nodiscard]] bool submit(ExchangeCommand command);
 
     // Asks the matching thread to stop once it has processed everything
@@ -120,13 +134,13 @@ public:
 
 private:
     EventSink sink_;
-    CommandSequencer sequencer_; // producer thread only
-    SpscQueue<ExchangeCommand> queue_;
+    CommandSequencer sequencer_; // matching thread only
+    MpscQueue<ExchangeCommand> queue_;
     MatchingEngine engine_; // matching thread only while running; see snapshot()
     Processor processor_;   // matching thread only, like engine_
 
     std::atomic<std::size_t> commands_processed_{0}; // matching thread writes
-    std::atomic<std::size_t> commands_rejected_{0};  // producer thread writes
+    std::atomic<std::size_t> commands_rejected_{0};  // any producer thread writes
 
     MatchingPipelineOptions options_;
     std::stop_source stop_source_;

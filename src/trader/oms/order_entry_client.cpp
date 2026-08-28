@@ -5,6 +5,7 @@
 #include <utility>
 #include <variant>
 
+#include "exchange/latency/latency_tracer.hpp"
 #include "protocol/order_entry/decoder.hpp"
 #include "protocol/order_entry/encoder.hpp"
 
@@ -24,13 +25,15 @@ bool OrderEntryClient::connect(const std::string& host, std::uint16_t port) {
 }
 
 bool OrderEntryClient::send(const protocol::order_entry::Message& message) {
-    std::vector<std::byte> buf;
-    protocol::order_entry::encode_message(message, buf);
+    latency::tracer().stamp_client_submit(message);
 
     std::lock_guard<std::mutex> lock(write_mutex_);
+    write_buffer_.clear();
+    protocol::order_entry::encode_message(message, write_buffer_);
+
     std::size_t written = 0;
-    while (written < buf.size()) {
-        auto n = socket_.write(std::span(buf).subspan(written));
+    while (written < write_buffer_.size()) {
+        auto n = socket_.write(std::span(write_buffer_).subspan(written));
         if (!n || *n == 0) {
             return false;
         }
@@ -71,6 +74,7 @@ void OrderEntryClient::reader_loop() {
             auto message_result = decode_message(std::span(read_buffer_).first(frame_size));
             read_buffer_.erase(read_buffer_.begin(), read_buffer_.begin() + static_cast<std::ptrdiff_t>(frame_size));
             if (const auto* message = std::get_if<Message>(&message_result)) {
+                latency::tracer().stamp_client_decoded(*message);
                 sink_(*message);
             }
             // A malformed payload under an otherwise well-formed header

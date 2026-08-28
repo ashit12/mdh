@@ -18,9 +18,8 @@
 // behavior sent over real TCP sockets, checking the two properties every
 // fault class below must satisfy: (1) the gateway itself never crashes or
 // hangs, and (2) a fault on one connection never degrades or blocks any
-// *other* connection, since route_event()/submit_command() run on shared
-// threads (the matching thread and, respectively, connection-specific
-// threads -- see order_entry_gateway.hpp's own concurrency-model comment).
+// *other* connection, since route_event() runs on the shared matching thread
+// and submit() is MPSC into that same pipeline.
 //
 // Unlike tests/test_order_entry_decode_errors.cpp (unit-level: calls
 // decode_message() directly on hand-built byte spans, proving the codec

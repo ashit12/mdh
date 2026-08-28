@@ -17,14 +17,23 @@ and how the trader-side book representation behaves as depth grows.
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j --target \
     bench_protocol_codec bench_matching_engine bench_order_book \
-    bench_spsc_queue bench_end_to_end_latency
+    bench_spsc_queue bench_end_to_end_latency bench_order_path_latency \
+    bench_matching_workload bench_matching_memory
 
 ./build-release/bench_protocol_codec
 ./build-release/bench_matching_engine
 ./build-release/bench_order_book
 ./build-release/bench_spsc_queue
 ./build-release/bench_end_to_end_latency 20000   # optional iteration count, default 10000
+./build-release/bench_order_path_latency          # staged TCP latency/load/syscalls
+./build-release/bench_matching_workload
+./build-release/bench_matching_memory
 ```
+
+`bench_order_path_latency` is the primary order-path harness; see
+[`docs/latency_benchmark.md`](latency_benchmark.md). The older
+`bench_end_to_end_latency` remains useful for its canned transport-floor
+comparison.
 
 **Debug-build numbers are meaningless and must never be compared against the ones
 below** — unoptimized codec/matching/book code plus (if enabled) sanitizer
@@ -262,8 +271,8 @@ independent runs back to back, to confirm this wasn't a fluke):
 roughly a 30-40x reduction**. What's left (tens of μs, not sub-μs) is now
 consistent with genuine, unavoidable costs this design still has: two real context
 switches (reader thread → matching thread → writer thread, each a real OS thread
-hand-off, not a poll), the `submit_mutex_`/`sessions_mutex_` locks each message
-crosses, and this machine's own scheduler wake-up latency for a *notified* (not
+hand-off, not a poll), the `sessions_mutex_` each message still crosses for
+ownership/routing, and this machine's own scheduler wake-up latency for a *notified* (not
 merely timed-out) thread — three orders of magnitude smaller than before, but not
 zero, because this is still a real multi-thread, real-syscall design, not a
 kernel-bypass/busy-spin one. The occasional multi-ms outlier still visible in `max`

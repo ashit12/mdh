@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <vector>
 
+#include "common/monotonic_ticks.hpp"
+
 // A high-resolution monotonic tick source, plus the honest
 // characterisation of its own limits, for measuring individual
 // matching-engine operations whose true cost is in the low hundreds of
@@ -51,64 +53,14 @@
 // operations -- rather than from averaging per-operation samples.
 namespace mdh::exchange::testing {
 
-enum class TimerSource {
-    ArmGenericCounter,
-    X86Tsc,
-    SteadyClock,
-};
+using mdh::TimerSource;
 
-#if defined(__aarch64__)
+inline constexpr TimerSource kTimerSource = mdh::kTimerSource;
+inline constexpr const char* kTimerSourceName = mdh::kTimerSourceName;
 
-inline constexpr TimerSource kTimerSource = TimerSource::ArmGenericCounter;
-inline constexpr const char* kTimerSourceName = "AArch64 CNTVCT_EL0 (isb-serialised)";
+[[nodiscard]] inline std::uint64_t timer_ticks() noexcept { return mdh::monotonic_ticks(); }
 
-// `isb` before the read stops the counter read from being satisfied out of
-// order with respect to the surrounding instructions -- without it an
-// aggressive out-of-order core can retire the read early and shrink (or
-// stretch) the interval being measured. It costs ~11 ns, which calibrate()
-// reports rather than hides.
-[[nodiscard]] inline std::uint64_t timer_ticks() noexcept {
-    std::uint64_t ticks = 0;
-    __asm__ __volatile__("isb\n\tmrs %0, cntvct_el0" : "=r"(ticks) : : "memory");
-    return ticks;
-}
-
-// The frequency the architecture *declares* for the counter. Reported
-// alongside the measured rate so a discrepancy is visible instead of
-// silently assumed away.
-[[nodiscard]] inline double declared_ticks_per_second() noexcept {
-    std::uint64_t freq = 0;
-    __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
-    return static_cast<double>(freq);
-}
-
-#elif defined(__x86_64__)
-
-inline constexpr TimerSource kTimerSource = TimerSource::X86Tsc;
-inline constexpr const char* kTimerSourceName = "x86-64 RDTSC (lfence-serialised)";
-
-[[nodiscard]] inline std::uint64_t timer_ticks() noexcept {
-    __builtin_ia32_lfence();
-    return __builtin_ia32_rdtsc();
-}
-
-// No portable way to ask the hardware; calibrate() measures it instead.
-[[nodiscard]] inline double declared_ticks_per_second() noexcept { return 0.0; }
-
-#else
-
-inline constexpr TimerSource kTimerSource = TimerSource::SteadyClock;
-inline constexpr const char* kTimerSourceName = "std::chrono::steady_clock";
-
-[[nodiscard]] inline std::uint64_t timer_ticks() noexcept {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-            .count());
-}
-
-[[nodiscard]] inline double declared_ticks_per_second() noexcept { return 1e9; }
-
-#endif
+[[nodiscard]] inline double declared_ticks_per_second() noexcept { return mdh::declared_ticks_per_second(); }
 
 struct TimerCalibration {
     const char* source_name = kTimerSourceName;

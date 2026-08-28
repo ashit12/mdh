@@ -27,7 +27,8 @@ MatchingPipeline::MatchingPipeline(EventSink sink, const MatchingPipelineOptions
             if (options_.matching_delay.count() > 0) {
                 std::this_thread::sleep_for(options_.matching_delay); // simulated slow matching core, see MatchingPipelineOptions
             }
-            processor_(*command, sink_);
+            ExchangeCommand sequenced = sequencer_.sequence(std::move(*command));
+            processor_(sequenced, sink_);
             commands_processed_.fetch_add(1, std::memory_order_relaxed);
         }
     });
@@ -43,29 +44,14 @@ void MatchingPipeline::stop() {
 }
 
 bool MatchingPipeline::submit(ExchangeCommand command) {
-    // Checked before assigning a sequence number, not after: a command that
-    // never actually enters the queue must not consume an authoritative
-    // CommandSequence value either, or the sequence stream would show a
-    // permanent gap for a command the matching engine never even attempted
-    // to process. Race-free specifically because submit() is producer-only
-    // (see class-level doc comment): nothing else can grow queue_'s
-    // occupancy between this check and the push below.
-    if (queue_.size() >= queue_.capacity()) {
+    // Unsequenced on purpose: sequence numbers are matching-thread-only, so
+    // a command that never enters the queue cannot punch a gap. See this
+    // class's sequencing-semantics comment.
+    if (!queue_.try_push(std::move(command))) {
         commands_rejected_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-
-    ExchangeCommand sequenced = sequencer_.sequence(std::move(command));
-    if (queue_.try_push(std::move(sequenced))) {
-        return true;
-    }
-
-    // Unreachable in practice given the single-producer invariant the check
-    // above already relies on -- kept as a real, structured branch rather
-    // than an assumption, matching this codebase's preference for
-    // structured returns over asserts.
-    commands_rejected_.fetch_add(1, std::memory_order_relaxed);
-    return false;
+    return true;
 }
 
 } // namespace mdh::exchange::sequencing
