@@ -70,7 +70,7 @@ strategy
      -> ExchangeEvent
         ├─> execution report -> TCP -> OrderEntryClient
         │      -> OrderManagementSystem -> PositionTracker + PnlTracker
-        └─> MarketDataPublisher -> UDP
+        └─> MarketDataPublisher -> SPSC -> routing thread -> UDP
                -> FeedSubscriber -> apply_frame_result -> BookManager
                   -> StrategyRuntime -> strategy
 ```

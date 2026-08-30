@@ -14,12 +14,18 @@ and records how the distribution moves under load.
 
 The primary harness is `bench_order_path_latency`. It:
 
-1. Starts a real `OrderEntryGateway` (the same TCP order-entry object `trading_server`
-   uses; matching, risk, and ledger are behind it, never called from the bench).
-2. Connects with the production `OrderEntryClient`.
-3. Submits `NewOrder` (IOC, empty book → one `Accepted` per command, no book growth).
-4. Stores **raw per-order tick samples**, then computes percentiles after the timed
-   region. Statistics are not updated on the hot path.
+1. Times `MatchingEngine::process()` on the same IOC empty-book command, in
+   process, with no sockets. That number is the matcher ceiling.
+2. Starts a real `OrderEntryGateway` (the same TCP order-entry object
+   `trading_server` uses; matching, risk, and ledger are behind it).
+3. Connects with the production `OrderEntryClient`.
+4. Submits `NewOrder` (IOC, empty book → one `Accepted` per command, no book
+   growth) over loopback TCP.
+5. Stores **raw per-order tick samples**, then computes percentiles after the
+   timed region. Statistics are not updated on the hot path.
+
+These two surfaces print on every TCP run. They are different ceilings.
+Matcher ops/s is not the exchange's throughput.
 
 `trading_server` is not spawned as a second process: its order-entry surface **is**
 `OrderEntryGateway` over TCP. Spawning the UI/UDP process would confound the
@@ -27,8 +33,9 @@ measurement with HTTP and market-data publish. Cross-process tracing would also 
 shared memory; the timestamps here are correlated in one process on a shared
 monotonic counter.
 
-Isolated matching-engine benches remain in `benchmarks/bench_matching_engine.cpp`.
-They are not the headline numbers.
+Isolated matching-engine benches remain in `benchmarks/bench_matching_engine.cpp`
+(GTC rest, fills, sweeps). Those are a different command shape than the IOC
+empty-book used here. Neither is a TCP number.
 
 How to run:
 
@@ -38,9 +45,14 @@ cmake --build build-release -j --target bench_order_path_latency
 ./build-release/bench_order_path_latency
 ```
 
-Optional flags: `--workload sequential|sustained|multi|burst|all`,
+Optional flags: `--workload sequential|sustained|multi|burst|soak|idle|core|all`,
 `--sequential-samples N`, `--sustained-samples N`, `--max-clients N`,
-`--writer-batch N`.
+`--multi-samples N`, `--idle-clients N`, `--idle-samples N`,
+`--writer-batch N`, `--soak-orders N`, `--soak-seconds S`, `--market-data`.
+
+`--workload soak` and `--workload idle` are **not** part of `all`. Soak: see
+§16. Idle: many long-lived sessions, one active sender; see §18. `--workload
+multi --max-clients N` sweeps 1, 2, 4, … N flood clients (default N=16).
 
 Production is always matcher `yield()` plus a sleeping per-connection writer
 with opportunistic outbound batching (default `--writer-batch 4`; never waits
@@ -132,8 +144,10 @@ not change wire contents.
 |---|---|
 | **Sequential** | One client; wait for T5 before the next send. Minimal queueing. |
 | **Sustained** | One client; offered 1k / 10k / 50k / 100k orders/s. If send falls behind the schedule, the harness **does not** accumulate debt into a catch-up burst; achieved rate is reported. |
-| **Multi-client** | 1, 2, 4, 8, 16 clients, each blasting its sample count then waiting. This is an in-flight flood, not a paced fair-share test. |
+| **Multi-client** | Powers of two up to `--max-clients` (default 16). Each client blasts its sample count then waits. This is an in-flight flood, not a paced fair-share test, and not a model of member-firm sessions. |
+| **Idle population** | Powers of two up to `--idle-clients`. All sessions stay connected; **one** sends sequential IOCs. This is the thread-per-connection tax. Not part of `all`. |
 | **Burst** | 8 clients; 40 rounds of 100 orders then 10 ms idle. |
+| **Matching-core** | Same IOC empty-book command, `MatchingEngine::process()` only. Always printed with TCP runs. |
 
 Gateway queues in the harness are 8192 (inbound and outbound) so the measurement is
 not an artificial 1024-slot cliff.
@@ -712,3 +726,273 @@ Verification after this simplification: Debug 479 tests passed; ASan+UBSan and
 TSan 472 each with `UdpReplayE2E.*` excluded (same unrelated UDP-replay
 limitation as §14.9). Four experimental tests were deleted with the
 implementations they covered.
+
+---
+
+## 16. One million orders in a minute (soak)
+
+This is a **paced** TCP soak, not a flood. 1_000_000 IOC `NewOrder`s against an
+empty book at 1_000_000 / 60 ≈ **16_667/s** for 60 seconds. That rate sits
+between the measured 10k/s (holds ~70 µs p50) and the ~41k/s pipelined ceiling
+in §14.3. The question is whether latency, inbound-queue occupancy, and
+completions stay flat for a full minute.
+
+```bash
+./build-release/bench_order_path_latency --workload soak
+# shorter smoke: --soak-orders 20000 --soak-seconds 2
+```
+
+What to look at:
+
+- `achieved` ≈ `offered`, wall ≈ 60s
+- `received` includes warmup; should be `warmup + sent`
+- matching-queue p50/p99 stay near 0 (matcher is not backing up)
+- e2e p50 stays in the sequential/10k neighbourhood; p99 should not walk away
+  over the minute (percentiles are over the whole run, not a time series)
+- `traces` may be a bit below `sent`: the tracer is a direct-mapped table;
+  soak uses 2²² slots. Collisions drop samples, not orders.
+
+Not claimed: real NIC, pinned cores, 1M **resting** orders, or multi-instrument
+mix. Matcher isolation remains `bench_matching_workload`.
+
+### 16.1 Measurement (Release, Apple M3 Pro, loopback, 2026-08-29)
+
+| | |
+|---|---|
+| Offered | 16_667/s |
+| Achieved | 16_572/s |
+| Wall | 60.34 s |
+| Sent / received | 1_000_000 / 1_000_200 (incl. 200 warmup) |
+| Traces | 1_000_000 |
+| Matching queue | p50=0, p99=1, max=158 |
+| Outbound drops | 0 |
+
+End-to-end (µs): p50 **82.5**, p90 93.4, p99 203, p99.9 1_235, max 10_303.
+`exchange_processing` p50 **1.63 µs**. The p99.9/max tail is still T0→T1 /
+scheduler, not the matcher backing up.
+
+A paced million orders in a minute completes. It does not prove the 50k/s
+flood path, and max is still a laptop outlier.
+
+---
+
+## 17. Market-data routing thread
+
+### 17.1 Change
+
+`trading_server` used to run the entire market-data path synchronously from
+`OrderEntryGateway::extra_event_sink`, on the matching thread:
+
+```text
+matching → MarketDataPublisher → pack_frames → send_to(each port)
+```
+
+It now uses one `MarketDataRouter`:
+
+```text
+matching → MarketDataPublisher → bounded SPSC<protocol::Event>
+                                      ↓
+                               routing thread
+                               pack_frames → send_to(each port)
+```
+
+The matching thread still assigns the market-data event sequence and timestamp
+before `try_push()`. This is intentional: if the queue is full, the event is
+dropped but its sequence number is consumed, so the next received event exposes
+a gap. Packet construction and every UDP syscall are on the routing thread.
+Private TCP reports are unchanged and never enter this queue.
+
+Queue capacity is 8192. The producer never blocks. Shutdown drains the queue
+after the gateway has drained matching. `dropped_count()` and
+`queue_high_water_mark()` make overload visible.
+
+### 17.2 Before/after method
+
+`bench_order_path_latency --market-data` changes its normal IOC request into a
+GTC buy. Each command therefore produces one private `Accepted` plus one public
+`BookOrderAdded`. The public event is translated, packed, and sent by UDP to
+loopback. Release, 8,000 timed commands per row, Apple M3 Pro, 2026-08-30.
+
+Both arms were measured with the same binary source, differing only in whether
+the sink was invoked from the matching thread or handed to the router. The two
+binaries were run **alternately, four times each**, and every number below is
+the median of those four runs. This matters: a single inline run measured
+sequential throughput at 10,093/s, while the median of four is 11,590/s, so
+early single-run figures overstated the gain.
+
+**T2→T3 (`exchange_processing`) — the stage the change targets, µs:**
+
+| Workload | p50 in→rt | p90 in→rt | p99 in→rt | p99.9 in→rt | max in→rt |
+|---|---|---|---|---|---|
+| Sequential | 21.5 → **3.2** | 23.7 → **3.7** | 34.6 → **16.9** | 79.1 → **34.1** | 117 → **55** |
+| Sustained 1k | 23.9 → **3.2** | 27.8 → **4.2** | 61.6 → **18.4** | 119 → **46** | 322 → **156** |
+| Sustained 10k | 23.3 → **3.3** | 28.8 → **3.8** | 106 → **21.2** | 170 → **50** | 448 → **298** |
+| Sustained 50k | 17.9 → **1.3** | 22.2 → **9.0** | 51.9 → **19.8** | 121 → **31** | 158 → **60** |
+| Sustained 100k | 17.7 → **1.2** | 22.5 → **8.8** | 66.7 → **20.1** | 122 → **32** | 812 → **680** |
+
+Every percentile improves, not only the median: the p99.9 of this stage falls
+by roughly 3–4× at every rate. The remaining routed p99.9 of 30–50 µs is
+scheduler noise on the matching thread, not market-data work.
+
+**End-to-end (T0→T5) and throughput:**
+
+| Workload | achieved/s in→rt | e2e p50 in→rt | e2e p90 in→rt | e2e p99.9 in→rt |
+|---|---|---|---|---|
+| Sequential | 11,590 → 11,468 | 71.5 → 73.9 µs | 79.1 → 79.7 µs | 222 → 230 µs |
+| Sustained 1k | 1,000 → 1,000 | 235 → 256 µs | 280 → 289 µs | 1,760 → 3,001 µs |
+| Sustained 10k | 9,998 → 10,000 | 74.4 → **70.5** µs | 113 → **94.0** µs | 1,305 → **399** µs |
+| Sustained 50k | 33,057 → **40,800** | 30.4 → **3.49** ms | 49.8 → **6.56** ms | 52.2 → **7.15** ms |
+| Sustained 100k | 32,890 → **40,222** | 40.6 → **13.7** ms | 59.3 → **24.7** ms | 61.7 → **24.7** ms |
+
+Across all routed runs every datagram was sent, drops were zero, and queue
+high-water was 20–86 of 8,192.
+
+### 17.3 Why an 18–20 µs stage win is not an 18–20 µs end-to-end win
+
+At sequential and 1k/s, end-to-end is flat (within noise, and p50 is even
+~2 µs worse). That is not a measurement error, and the stage timings explain it:
+
+| Sequential stage | p50 inline | p50 routed | delta |
+|---|---:|---:|---:|
+| client_to_server (T0→T1) | 29.9 | 31.0 | +1.1 |
+| server_pre_match (T1→T2) | 3.6 | 3.7 | +0.1 |
+| exchange_processing (T2→T3) | 21.5 | 3.2 | **−18.3** |
+| writer_handoff (T4→T4′) | 16.9 | 16.3 | −0.6 |
+| server_to_client (T4′→T5) | 20.4 | 21.8 | +1.4 |
+| **end_to_end (T0→T5)** | **71.5** | **73.9** | **+2.4** |
+
+The five stages sum to 92 µs while end-to-end is 71 µs, because they overlap.
+`exchange_processing` is `t2_exchange_begin → t3_exchange_end`, spanning the
+whole command, whereas `t4_writer_queued` is stamped inside `route_event()`
+*before* the command finishes. `MatchingEngine::process_new_order()` emits the
+private `OrderAccepted` first and only then rests the order and emits the public
+`BookOrderAdded`. So the client's reply was already on its writer queue, being
+encoded and written, while the matching thread was still inside `pack_frames()`
+and `send_to()` for market data.
+
+The inline UDP cost was therefore concurrent with the reply path, not in series
+with it, and removing it shortens no critical path that one client's round trip
+traverses. What it does free is the matching thread itself, for the *next*
+command. That shows up exactly where serialisation matters:
+
+- **10k/s tail**: e2e p99.9 drops 1,305 → 399 µs, and per-run p99.9 goes from
+  `[669, 1097, 1512, 10066]` to `[290, 361, 437, 884]`. Inline, a `send_to()`
+  stall let the inbound MPSC back up; the queue-depth p99 was 31 (max 72) in one
+  such run. Routed, those stalls stop reaching the order path.
+- **Saturation**: throughput rises ~1.22× at both 50k and 100k offered. The
+  large e2e improvement there is a consequence of that, not an independent win —
+  the client offers more than the system accepts, so e2e is mostly queueing
+  delay, which drains faster at higher throughput.
+- **1k/s p99.9** (1,760 → 3,001 µs) is the one row that looks worse. The
+  per-run spread is `[417, 1410, 2111, 8510]` inline against
+  `[428, 756, 5245, 5685]` routed — both dominated by single multi-millisecond
+  scheduler outliers on an idle-ish laptop. Four runs cannot separate those, and
+  this is not claimed as a regression or an improvement.
+
+Summary: T2→T3 improves 3–7× at every percentile; end-to-end is unchanged at
+low load, improves ~3× in the 10k/s tail, and improves largely via throughput
+at saturation.
+
+This does not measure UDP receive latency or guarantee delivery. It measures
+the order-path cost of publishing real market data and proves that UDP routing
+no longer holds the matching thread.
+
+Verification: Debug **481/481** tests passed. ASan+UBSan and TSan each passed
+**474/474** with the same seven `UdpReplayE2E` tests excluded as §14.9.
+
+---
+
+## 18. Two ceilings, flood vs idle sessions, and the thread-count knee
+
+A real order-entry gateway serves member firms: a bounded population of
+long-lived, well-behaved sessions (tens to low thousands), not tens of
+thousands of anonymous connections. This is not a consumer-facing API
+gateway. The useful question is not a round concurrent-user number. It is
+whether this thread-per-connection design's knee sits above or below that
+population.
+
+The default `multi` workload does not answer that. It is an in-flight flood:
+every client sends as fast as `write()` allows, then waits. That stresses
+queue depth and loopback TCP, and it already leaves sequential-RTT territory
+at two clients. Raising `--max-clients` past 16 does not suddenly reveal a
+hidden 10k-user path. It confirms the flood is a latency pile-up, with
+occasional scheduler storms when too many hot threads share a laptop.
+
+The idle-population workload is the thread-count test: N sessions stay
+connected (gateway reader blocked in `read()`, writer asleep on the CV,
+client reader likewise idle) and **one** session sends sequential IOCs.
+Server thread count is `2N+2`.
+
+```bash
+./build-release/bench_order_path_latency --workload multi --max-clients 64 --multi-samples 800
+./build-release/bench_order_path_latency --workload idle --idle-clients 512 --idle-samples 2000
+```
+
+`all` still defaults to `--max-clients 16` and does not run idle.
+
+### 18.1 Two ceilings, same process (Release, Apple M3 Pro, 2026-08-30)
+
+Same IOC empty-book `NewOrder`. Do not mix with `bench_matching_engine`'s GTC
+rest (~169 ns) or with a filled book.
+
+| Surface | Achieved | What it includes |
+|---|---|---|
+| Matching-core only (`MatchingEngine::process`) | **~55–82 M/s** (12–18 ns/op) | Matcher, discard sink, no sockets, no risk, no ledger |
+| TCP sequential (1 session, wait for reply) | **~11 k/s** (~73 µs p50) | Real loopback TCP, 2+2 server threads, risk, ledger, routing, client reader |
+| TCP pipelined (1 session, no wait, §14) | **~35–42 k/s** | Same path, in-flight queueing; e2e is then mostly wait in the pipeline |
+
+The matcher has two orders of magnitude of headroom over the TCP path for
+this command shape. End-to-end throughput is sockets and threads.
+
+### 18.2 Flood: raise `--max-clients` past 16
+
+Three Release runs, 400–800 samples/client. Throughput is noisy because the
+timed window is a pile-up; p50 is the honest signal.
+
+| Clients | Achieved /s (runs) | e2e p50 |
+|---|---|---|
+| 1 | 22k / 31k / 24k | 4–9 ms |
+| 2 | 43–48k | 8–19 ms |
+| 4 | 41–47k | 19–45 ms |
+| 8 | 33–58k | 29–153 ms |
+| 16 | 24–58k | 48–145 ms |
+| 32 | 0.8k / 1.7k / 35k | 79–213 ms |
+| 64 | 3.3k / 23k / 34k | 243–619 ms |
+
+There is no throughput knee hiding past 16. Flood p50 is already milliseconds
+at one pipelined client and grows with in-flight depth. At 32 and 64, some
+runs fall to a few thousand/s with millions of involuntary context switches
+— a scheduler storm, not the matcher backing up (`exchange_processing` p50
+stays sub-microsecond). That is the design being asked to keep `2N` hot
+threads plus `N` client readers runnable at once.
+
+### 18.3 Idle sessions: the thread-count knee
+
+One sequential sender, N−1 silent live sessions. 2,000 timed orders. Same
+machine.
+
+| Sessions N | Server threads (2N+2) | Achieved /s | e2e p50 µs | e2e p90 µs | e2e p99 µs | switches/order |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 4 | 10_944 | 72.9 | 94.8 | 163 | 10.9 |
+| 8 | 18 | 11_267 | 72.9 | 80.9 | 161 | 11.5 |
+| 16 | 34 | 11_213 | 73.0 | 81.4 | 163 | 12.1 |
+| 32 | 66 | 10_670 | 73.7 | 92.6 | 182 | 13.6 |
+| 64 | 130 | 9_892 | 75.4 | 116 | 176 | 16.9 |
+| 128 | 258 | 8_524 | 79.9 | 142 | 211 | 24.8 |
+| 256 | 514 | 5_115 | 139 | 266 | 404 | 55.6 |
+| 512 | 1_026 | 178 | 222 | 10_535 | 45_392 | 882 |
+
+Through **~64 sessions** the active client's sequential RTT is unchanged
+(~73–75 µs p50, ~11 k/s). At **128** p50 is still 80 µs with a fatter p90.
+**256** is the first clear tax: p50 almost doubles, throughput halves,
+switches/order 5×. **512** is the cliff: p90 jumps to 10 ms, 882 involuntary
+switches per order.
+
+A member-firm population of tens to low hundreds of long-lived sessions sits
+on the flat part of this curve on this laptop. A few hundred is the beginning
+of the tax. A thousand thread-pairs is past the design. That is the number
+this architecture owns, not "10k concurrent users."
+
+Linux with pinned cores and `epoll` instead of one blocking thread per
+direction would move this knee; it would not turn the matcher into the
+limiter. The matcher was never the limiter on this path.

@@ -49,7 +49,7 @@ figures in this document come from a `-DCMAKE_BUILD_TYPE=Release` build.
 - **Date:** 2026-08-09
 - **Host:** Apple M3 Pro, 12 logical cores (`arm64`, macOS/Darwin 25.5.0)
 - **Compiler/flags:** AppleClang, `-DCMAKE_BUILD_TYPE=Release`, same `-Wall -Wextra
-  -Wpedantic -Wshadow -Wconversion` warning set as every other target in this repo
+  -Wpedantic -Wshadow -Wconversion -Werror` warning set as every other target in this repo
   (all four `benchmark::benchmark`-linked binaries build warning-clean under it)
 - **Google Benchmark:** v1.9.1, fetched via the same `FetchContent` pattern already used
   for googletest/cpp-httplib/nlohmann-json (see `CMakeLists.txt`)

@@ -20,8 +20,9 @@ apps/trading_server
     OrderEntryGateway  --tcp:7100-------------------+
          |                                          |
          +--extra_event_sink--> MarketDataPublisher |
+                                  -> SPSC -> router  |
                                       |              |
-                                     udp:7101         |
+                                     udp:7101        |
                                       |              |
                                   UiGateway ----------+  (its own Sessions connect back over tcp:7100)
                                       |

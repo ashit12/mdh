@@ -3,8 +3,8 @@
 //
 //   OrderEntryGateway -- real TCP order entry, on --tcp-port
 //        |
-//        +--> extra_event_sink --> MarketDataPublisher --> UDP, on every
-//        |    --market-data-port given
+//        +--> extra_event_sink --> MarketDataRouter SPSC --> routing thread
+//        |    --> UDP, on every --market-data-port given
 //        |
 //   UiGateway -- listens on the FIRST of those UDP ports to reconstruct a
 //        live book, and holds one trader-side OMS and client per demo
@@ -26,10 +26,10 @@
 // feed of its own, so this flag now collects a list and every published
 // event goes to all of them. Listing one port behaves exactly as before.
 //
-// Fanning out here, in the app that already owns the socket and the
-// publisher, rather than inside MarketDataPublisher or the gateway, keeps
-// both of those unaware that subscribers exist at all: the publisher still
-// emits wire events into one sink, and this file decides where they go.
+// Fanning out here, in the app that owns the socket and router, rather than
+// inside the gateway, keeps order entry unaware that subscribers exist:
+// MarketDataRouter emits wire events into one downstream sink, and this
+// file decides where they go.
 //
 // Shutdown is Ctrl+C and nothing more, the same scope decision the other
 // demo apps make. Everything is then torn down in dependency order: the UI
@@ -48,7 +48,7 @@
 #include <vector>
 
 #include "exchange/gateway/order_entry_gateway.hpp"
-#include "exchange/market_data/market_data_publisher.hpp"
+#include "exchange/market_data/market_data_router.hpp"
 #include "net/packet.hpp"
 #include "net/udp_socket.hpp"
 #include "ui_gateway/ui_gateway.hpp"
@@ -147,19 +147,25 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    // ── Market-data publishing: exchange event -> wire event -> UDP ───────
-    // Owned here rather than inside the gateway, so the gateway stays
-    // unaware market data exists at all. Captured by reference into
-    // extra_event_sink below; both outlive the gateway, which is all that
-    // lambda's lifetime depends on -- none of these three reference each
-    // other, so their declaration order does not matter.
-    market_data::MarketDataPublisher publisher;
+    // ── Market-data publishing: exchange event -> SPSC -> routing thread -> UDP
+    // The matching thread assigns the feed sequence and performs one bounded
+    // push. Packet construction, fan-out and send_to() run on the router.
     net::UdpSocket market_data_socket;
     if (!market_data_socket.is_open()) {
         std::cerr << "failed to create market-data UDP socket\n";
         return EXIT_FAILURE;
     }
     std::uint64_t next_packet_sequence = 1;
+    market_data::MarketDataRouter market_data_router{
+        [&](const protocol::Event& wire_event) {
+            const std::array<protocol::Event, 1> frames{wire_event};
+            auto datagram = net::pack_frames(next_packet_sequence++, std::span<const protocol::Event>(frames));
+            for (std::uint16_t port : args->market_data_ports) {
+                (void)market_data_socket.send_to(datagram, "127.0.0.1", port);
+            }
+        },
+    };
+    market_data_router.start();
 
     // Declared up here because the exchange needs the instrument list before
     // it is constructed, not just when accounts are seeded: this is the
@@ -169,18 +175,7 @@ int main(int argc, char** argv) {
 
     OrderEntryGatewayOptions gateway_options;
     gateway_options.instruments = ui_options.demo_instrument_ids;
-    gateway_options.extra_event_sink = [&](const ExchangeEvent& event) {
-        publisher.publish(event, [&](const protocol::Event& wire_event) {
-            const std::array<protocol::Event, 1> frames{wire_event};
-            // One packet sequence number per published event, not per
-            // datagram sent: every subscriber must see the same numbering,
-            // or each extra port would look like a gap to the one before it.
-            auto datagram = net::pack_frames(next_packet_sequence++, std::span<const protocol::Event>(frames));
-            for (std::uint16_t port : args->market_data_ports) {
-                (void)market_data_socket.send_to(datagram, "127.0.0.1", port);
-            }
-        });
-    };
+    gateway_options.extra_event_sink = market_data_router.sink();
 
     OrderEntryGateway gateway(args->tcp_port, gateway_options);
 
@@ -230,6 +225,7 @@ int main(int argc, char** argv) {
         std::cerr << "failed to start UI gateway (http-port " << args->http_port << " or market-data-port "
                    << ui_market_data_port << " already in use?)\n";
         gateway.stop();
+        market_data_router.stop();
         return EXIT_FAILURE;
     }
     std::cout << "ui gateway listening on http:" << *ui.local_http_port() << " (market data on udp:"
@@ -255,5 +251,9 @@ int main(int argc, char** argv) {
     std::cout << "\nshutting down...\n";
     ui.stop();
     gateway.stop();
+    market_data_router.stop();
+    std::cout << "market-data router: routed " << market_data_router.routed_count() << ", dropped "
+              << market_data_router.dropped_count() << ", queue high-water "
+              << market_data_router.queue_high_water_mark() << "\n";
     return EXIT_SUCCESS;
 }

@@ -112,12 +112,15 @@ and `tests/test_cross_venue_arbitrage_strategy_e2e.cpp` — the latter running t
 complete, independent exchange stacks side by side with one strategy trading
 both).
 
-`MarketDataPublisher` is wired into a live, long-running process:
+`MarketDataPublisher` is wired into a live, long-running process through a
+bounded asynchronous router:
 `apps/trading_server/main.cpp` constructs an
 `OrderEntryGateway` with a purely additive
-`OrderEntryGatewayOptions::extra_event_sink` hook that fans every matching-
-thread event out to `MarketDataPublisher` in addition to `RiskGatedEngine`'s
-own `Ledger` wiring, publishing real UDP frames on a configurable port.
+`OrderEntryGatewayOptions::extra_event_sink` hook. The matching thread
+translates public events and pushes them into `MarketDataRouter`'s SPSC;
+the router thread packs and publishes real UDP datagrams on configurable
+ports. Queue-full drops are visible as feed sequence gaps and never block
+matching. `RiskGatedEngine`'s own `Ledger` wiring remains synchronous.
 `ui_gateway::UiGateway` (`include/ui_gateway/`, `src/ui_gateway/`) listens to
 that same UDP port in its own background thread to reconstruct a live
 `book::BookManager` (reusing the trader side's own
@@ -310,7 +313,7 @@ smoke test, later turned into the test file, mattered):
 
 `tests/test_ui_gateway.cpp` is the UI gateway's loop-closing test, same shape as every
 other `*_e2e.cpp` in this codebase: a real `OrderEntryGateway` (with
-`extra_event_sink` wired to a real `MarketDataPublisher` over a real UDP socket) plus a
+`extra_event_sink` wired through a real `MarketDataRouter` to a real UDP socket) plus a
 real `UiGateway`, driven entirely through `httplib::Client` against the actual REST/SSE
 surface — never by reaching into either class's internals. It proves, over real sockets,
 real threads, and real JSON: account auto-provisioning and 404s for accounts outside the

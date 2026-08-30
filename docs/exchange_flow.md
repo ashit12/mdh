@@ -263,10 +263,12 @@ tests are.
 
 `apps/trading_server/main.cpp` is the long-running exchange process outside
 of tests. It constructs a real `OrderEntryGateway` with a purely additive
-`OrderEntryGatewayOptions::extra_event_sink` hook (invoked synchronously from
-`route_event()`, on the matching thread, alongside `RiskGatedEngine`'s own
-`Ledger` wiring) that fans every event out to a real `MarketDataPublisher`,
-publishing real UDP frames on a configurable port -- the same wiring
+`OrderEntryGatewayOptions::extra_event_sink` hook. On the matching thread,
+that hook translates public events with `MarketDataPublisher` and performs
+one bounded SPSC push into `MarketDataRouter`; a dedicated routing thread
+packs and fans real UDP datagrams to the configured ports. A full queue
+drops the newest event without blocking matching, after its feed sequence
+has been assigned so subscribers can detect the gap. This is the same wiring
 `test_market_data_e2e.cpp` proves correct in isolation, now connected to
 live traffic.
 
@@ -955,7 +957,8 @@ driven by an HTTP request through `ui_gateway::UiGateway`, and
 `apps/live_strategy_demo/`'s real `MarketMakerStrategy` trading against a
 real, running `trading_server` (see `docs/live_demo.md` for a full real
 run). `apps/trading_server/main.cpp` is the long-running process outside of
-tests, with `MarketDataPublisher` wired into its matching thread for real.
+tests, with `MarketDataPublisher` feeding a bounded SPSC and dedicated UDP
+routing thread for real.
 
 What's still **not** assembled into one live call path or app:
 

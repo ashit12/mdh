@@ -13,7 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include "exchange/gateway/order_entry_gateway.hpp"
-#include "exchange/market_data/market_data_publisher.hpp"
+#include "exchange/market_data/market_data_router.hpp"
 #include "net/packet.hpp"
 #include "net/udp_receiver.hpp"
 #include "net/udp_socket.hpp"
@@ -48,13 +48,14 @@ namespace {
 class RunningStack {
 public:
     explicit RunningStack(ui_gateway::UiGatewayOptions ui_options = {}) : market_data_port_(pick_ephemeral_udp_port()) {
-        gateway_options_.extra_event_sink = [this](const ExchangeEvent& event) {
-            publisher_.publish(event, [this](const protocol::Event& wire_event) {
+        market_data_router_ = std::make_unique<market_data::MarketDataRouter>(
+            [this](const protocol::Event& wire_event) {
                 const std::array<protocol::Event, 1> frames{wire_event};
                 auto datagram = net::pack_frames(next_packet_sequence_++, std::span<const protocol::Event>(frames));
                 (void)market_data_socket_.send_to(datagram, "127.0.0.1", market_data_port_);
             });
-        };
+        market_data_router_->start();
+        gateway_options_.extra_event_sink = market_data_router_->sink();
         // The exchange trades exactly the instruments the UI knows about,
         // the same way apps/trading_server wires the two together.
         gateway_options_.instruments = ui_options.demo_instrument_ids;
@@ -78,6 +79,7 @@ public:
     ~RunningStack() {
         if (ui_) ui_->stop();
         if (gateway_) gateway_->stop();
+        if (market_data_router_) market_data_router_->stop();
     }
 
     RunningStack(const RunningStack&) = delete;
@@ -89,9 +91,9 @@ public:
 
 private:
     std::uint16_t market_data_port_;
-    market_data::MarketDataPublisher publisher_;
     net::UdpSocket market_data_socket_;
     std::uint64_t next_packet_sequence_ = 1;
+    std::unique_ptr<market_data::MarketDataRouter> market_data_router_;
     gateway::OrderEntryGatewayOptions gateway_options_;
     std::unique_ptr<gateway::OrderEntryGateway> gateway_;
     bool gateway_started_ = false;

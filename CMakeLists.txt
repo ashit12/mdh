@@ -14,7 +14,7 @@ if(MDH_ENABLE_TSAN AND (MDH_ENABLE_ASAN OR MDH_ENABLE_UBSAN))
     message(FATAL_ERROR "MDH_ENABLE_TSAN cannot be combined with ASan/UBSan in the same binary -- build it separately.")
 endif()
 
-set(MDH_WARNING_FLAGS -Wall -Wextra -Wpedantic -Wshadow -Wconversion)
+set(MDH_WARNING_FLAGS -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror)
 
 # ── Google Test ────────────────────────────────────────────────────────────
 include(FetchContent)
@@ -112,6 +112,7 @@ add_library(mdh_core
     src/exchange/risk/risk_engine.cpp
     src/exchange/risk/risk_gated_engine.cpp
     src/exchange/market_data/market_data_publisher.cpp
+    src/exchange/market_data/market_data_router.cpp
     src/protocol/order_entry/encoder.cpp
     src/protocol/order_entry/decoder.cpp
     src/exchange/gateway/order_entry_gateway.cpp
@@ -257,6 +258,7 @@ add_executable(mdh_tests
     tests/test_risk_engine.cpp
     tests/test_risk_gated_engine.cpp
     tests/test_market_data_publisher.cpp
+    tests/test_market_data_router.cpp
     tests/test_market_data_e2e.cpp
     tests/test_order_entry_codec.cpp
     tests/test_order_entry_decode_errors.cpp

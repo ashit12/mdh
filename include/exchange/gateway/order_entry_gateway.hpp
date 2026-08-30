@@ -159,8 +159,9 @@ struct OrderEntryGatewayOptions {
     // produces, called from route_event() alongside -- never instead of --
     // the per-connection wire routing. Unlike the wire path, which only
     // looks at account-addressed events, this sees everything, including the
-    // anonymous book and trade events. Wiring a MarketDataPublisher in here
-    // is what lets a live feed watch a real running gateway.
+    // anonymous book and trade events. Production wires a MarketDataRouter
+    // here: it translates and performs one bounded SPSC push, while its
+    // routing thread packs and sends UDP.
     //
     // Runs on the matching thread, synchronously, under the same "must not
     // block" rule as route_event() itself. Null by default.

@@ -12,7 +12,7 @@
 
 #include "book/order_book.hpp"
 #include "exchange/gateway/order_entry_gateway.hpp"
-#include "exchange/market_data/market_data_publisher.hpp"
+#include "exchange/market_data/market_data_router.hpp"
 #include "net/packet.hpp"
 #include "net/udp_receiver.hpp"
 #include "net/udp_socket.hpp"
@@ -34,7 +34,7 @@
 //     -> OrderEntryClient -> TCP -> OrderEntryGateway -> MatchingPipeline
 //       -> risk + ledger -> MatchingEngine -> ExchangeEvent
 //         -> execution report -> TCP -> OMS -> PnlTracker
-//         -> MarketDataPublisher -> UDP -> FeedSubscriber
+//         -> MarketDataPublisher -> SPSC router -> UDP -> FeedSubscriber
 //            -> BookManager -> StrategyRuntime -> strategy
 //
 // which is the point of the exercise and the reason this test is slow and
@@ -138,13 +138,14 @@ class Exchange {
 public:
     Exchange() : market_data_port_(pick_ephemeral_udp_port()) {
         options_.instruments = {kInstrument};
-        options_.extra_event_sink = [this](const ExchangeEvent& event) {
-            publisher_.publish(event, [this](const protocol::Event& wire_event) {
+        market_data_router_ = std::make_unique<exchange::market_data::MarketDataRouter>(
+            [this](const protocol::Event& wire_event) {
                 const std::array<protocol::Event, 1> frames{wire_event};
                 const auto datagram = net::pack_frames(next_packet_sequence_++, std::span<const protocol::Event>(frames));
                 (void)market_data_socket_.send_to(datagram, "127.0.0.1", market_data_port_);
             });
-        };
+        market_data_router_->start();
+        options_.extra_event_sink = market_data_router_->sink();
         gateway_ = std::make_unique<gateway::OrderEntryGateway>(0, options_);
 
         // Both participant accounts funded before start(), the way
@@ -161,6 +162,9 @@ public:
         if (gateway_) {
             gateway_->stop();
         }
+        if (market_data_router_) {
+            market_data_router_->stop();
+        }
     }
 
     Exchange(const Exchange&) = delete;
@@ -172,9 +176,9 @@ public:
 
 private:
     std::uint16_t market_data_port_;
-    exchange::market_data::MarketDataPublisher publisher_;
     net::UdpSocket market_data_socket_;
     std::uint64_t next_packet_sequence_ = 1;
+    std::unique_ptr<exchange::market_data::MarketDataRouter> market_data_router_;
     gateway::OrderEntryGatewayOptions options_;
     std::unique_ptr<gateway::OrderEntryGateway> gateway_;
     bool started_ = false;

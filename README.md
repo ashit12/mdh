@@ -144,11 +144,11 @@ Here is the whole system in one picture. Each box is code in this repo.
       │                     │        v  events             │
       │                     │   ┌────┴────┬──────────┐     │
       └──[SPSC queue]◄──────┼───┤         │          │     │
-        writer thread       │  ledger   market-data  │     │
-        (per client)        │           publisher    │     │
-                            └────────────┬───────────┘     │
-                                         │                 │
-                                         └───UDP broadcast──┼──►  market-data
+        writer thread       │  ledger   MD publisher │     │
+        (per client)        │           → [SPSC]     │     │
+                            └───────────────┬─────────┘     │
+                                          v routing thread │
+                                          └──UDP unicast───┼──►  market-data
                                           (public, lossy,   │      listeners,
                                            unordered)       │      the dashboard,
                                                             │      other strategies
@@ -481,6 +481,12 @@ found the queue empty, and that sleep *dominated the measured end-to-end
 latency* of the whole system. It was the single largest improvement in the
 project's latency history.
 
+Market data follows the same non-blocking rule. The matching thread assigns
+the public feed sequence and pushes the wire event to a bounded SPSC queue.
+A dedicated routing thread packs UDP datagrams and fans them out. A full
+queue drops the newest market-data event; because its feed sequence was
+already assigned, subscribers observe a gap rather than silent divergence.
+
 ---
 
 ## Market data: the public broadcast
@@ -787,8 +793,8 @@ cmake -S . -B build-asan -DMDH_ENABLE_ASAN=ON -DMDH_ENABLE_UBSAN=ON
 cmake -S . -B build-tsan -DMDH_ENABLE_TSAN=ON   # separate: can't combine with ASan
 ```
 
-Everything compiles with `-Wall -Wextra -Wpedantic -Wshadow -Wconversion`
-and the build is warning-clean.
+Everything compiles with `-Wall -Wextra -Wpedantic -Wshadow -Wconversion
+-Werror` (warnings are errors; the build is warning-clean).
 
 **Run the whole stack:**
 
