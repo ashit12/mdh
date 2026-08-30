@@ -6,6 +6,11 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/types.h>
+#endif
+
 #include "exchange/sequencing/matching_pipeline.hpp"
 #include "exchange/testing/matching_scenarios.hpp"
 
@@ -344,5 +349,53 @@ TEST(MatchingPipeline, ConcurrentProducersKeepPerProducerFifoAndGaplessSequences
     }
     EXPECT_EQ(accepted, kProducers * kEach);
 }
+
+TEST(MatchingPipeline, UnsetMatchingCpuLeavesTheThreadUnpinned) {
+    ThreadSafeCollectingSink out;
+    MatchingPipeline pipeline(out.sink(), MatchingPipelineOptions{.instruments = {1}});
+    ASSERT_TRUE(wait_until([&] { return pipeline.matching_affinity_ready(); }));
+    EXPECT_FALSE(pipeline.matching_cpu_pinned());
+    EXPECT_TRUE(pipeline.matching_affinity_error().empty());
+    EXPECT_TRUE(pipeline.submit(new_order(100, 1, 1, Side::Buy, 100, 1)));
+    ASSERT_TRUE(wait_until([&] { return pipeline.commands_processed() == 1; }));
+}
+
+TEST(MatchingPipeline, FailedPinIsReportedAndMatchingStillRuns) {
+    ThreadSafeCollectingSink out;
+    MatchingPipelineOptions options;
+    options.instruments = {1};
+    // Larger than CPU_SETSIZE on every host, so the helper rejects it before
+    // the syscall. Does not require any particular CPU to exist.
+    options.matching_cpu = 65535;
+    MatchingPipeline pipeline(out.sink(), options);
+    ASSERT_TRUE(wait_until([&] { return pipeline.matching_affinity_ready(); }));
+    EXPECT_FALSE(pipeline.matching_cpu_pinned());
+    EXPECT_FALSE(pipeline.matching_affinity_error().empty());
+    EXPECT_TRUE(pipeline.submit(new_order(100, 1, 1, Side::Buy, 100, 1)));
+    ASSERT_TRUE(wait_until([&] { return pipeline.commands_processed() == 1; }));
+}
+
+#if defined(__linux__)
+TEST(MatchingPipeline, PinsMatchingThreadToCpuZeroWhenRequested) {
+    ThreadSafeCollectingSink out;
+    MatchingPipelineOptions options;
+    options.instruments = {1};
+    options.matching_cpu = 0; // present on every Linux host; CPU 1 may not be
+    MatchingPipeline pipeline(out.sink(), options);
+    ASSERT_TRUE(wait_until([&] { return pipeline.matching_affinity_ready(); }));
+    EXPECT_TRUE(pipeline.matching_cpu_pinned()) << pipeline.matching_affinity_error();
+    EXPECT_TRUE(pipeline.matching_affinity_error().empty());
+    ASSERT_NE(pipeline.matching_thread_id(), 0u);
+
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    ASSERT_EQ(0, sched_getaffinity(static_cast<pid_t>(pipeline.matching_thread_id()), sizeof(allowed), &allowed));
+    EXPECT_TRUE(CPU_ISSET(0, &allowed));
+    EXPECT_EQ(1, CPU_COUNT(&allowed));
+
+    EXPECT_TRUE(pipeline.submit(new_order(100, 1, 1, Side::Buy, 100, 1)));
+    ASSERT_TRUE(wait_until([&] { return pipeline.commands_processed() == 1; }));
+}
+#endif
 
 } // namespace mdh::exchange::sequencing

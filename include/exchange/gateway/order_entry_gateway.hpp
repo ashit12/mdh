@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -178,6 +179,12 @@ struct OrderEntryGatewayOptions {
     // write() call sites. Disabled in production by default; the disabled
     // hot path is one relaxed atomic load.
     bool enable_io_metrics = false;
+
+    // Forwarded to MatchingPipelineOptions::matching_cpu. Unset by default:
+    // the matching thread is not pinned, which is what every test and the
+    // trading_server demo want. The order-path bench sets this to isolate
+    // matching on a dedicated CPU (1 on the current isolcpus host).
+    std::optional<unsigned> matching_cpu{};
 };
 
 struct OrderEntryIoMetrics {
@@ -241,6 +248,10 @@ public:
     // Best-effort inbound queue occupancy, safe from any thread.
     [[nodiscard]] std::size_t matching_queue_size() const { return pipeline_.queue_size(); }
     [[nodiscard]] std::size_t matching_queue_high_water_mark() const { return pipeline_.queue_high_water_mark(); }
+    [[nodiscard]] std::uint64_t matching_thread_id() const { return pipeline_.matching_thread_id(); }
+    [[nodiscard]] bool matching_affinity_ready() const { return pipeline_.matching_affinity_ready(); }
+    [[nodiscard]] bool matching_cpu_pinned() const { return pipeline_.matching_cpu_pinned(); }
+    [[nodiscard]] std::string matching_affinity_error() const { return pipeline_.matching_affinity_error(); }
     [[nodiscard]] OrderEntryIoMetrics io_metrics() const;
 
     // Test and admin seeding, forwarded to the ledger -- the only way

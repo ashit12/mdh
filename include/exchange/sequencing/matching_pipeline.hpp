@@ -3,8 +3,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <optional>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -78,6 +81,15 @@ struct MatchingPipelineOptions {
     // submit()'s backpressure path deterministically instead of hoping the
     // OS scheduler produces a slow enough consumer. Zero by default.
     std::chrono::microseconds matching_delay{0};
+
+    // If set, the matching thread pins itself to this logical CPU at start,
+    // via pthread_setaffinity_np on Linux. Unset means leave placement to
+    // the scheduler -- the default, so tests and macOS builds do not depend
+    // on a particular CPU existing. Pinning is not a realtime policy; the
+    // thread keeps whatever scheduling class it already had. A failed pin
+    // is reported through MatchingPipeline::matching_affinity_error() and
+    // does not stop the thread.
+    std::optional<unsigned> matching_cpu{};
 };
 
 class MatchingPipeline {
@@ -132,6 +144,28 @@ public:
     }
     [[nodiscard]] std::size_t commands_rejected() const { return commands_rejected_.load(std::memory_order_relaxed); }
 
+    // Linux tid of the matching thread, 0 until that thread has started
+    // (and always 0 on non-Linux). Safe from any thread.
+    [[nodiscard]] std::uint64_t matching_thread_id() const {
+        return matching_thread_id_.load(std::memory_order_acquire);
+    }
+
+    // True once the matching thread has finished its start-of-thread
+    // affinity attempt (or decided none was requested). Safe from any thread.
+    [[nodiscard]] bool matching_affinity_ready() const {
+        return matching_affinity_ready_.load(std::memory_order_acquire);
+    }
+
+    // True only if matching_cpu was set and the pin succeeded.
+    [[nodiscard]] bool matching_cpu_pinned() const {
+        return matching_cpu_pinned_.load(std::memory_order_acquire);
+    }
+
+    // Empty unless pinning was requested and failed (or is unsupported).
+    // Meaningful after matching_affinity_ready(). Copied under no lock:
+    // written once, before the ready flag is published.
+    [[nodiscard]] std::string matching_affinity_error() const { return matching_affinity_error_; }
+
 private:
     EventSink sink_;
     CommandSequencer sequencer_; // matching thread only
@@ -143,6 +177,10 @@ private:
     std::atomic<std::size_t> commands_rejected_{0};  // any producer thread writes
 
     MatchingPipelineOptions options_;
+    std::string matching_affinity_error_;
+    std::atomic<std::uint64_t> matching_thread_id_{0};
+    std::atomic<bool> matching_affinity_ready_{false};
+    std::atomic<bool> matching_cpu_pinned_{false};
     std::stop_source stop_source_;
     std::jthread matching_thread_; // last: it must see a fully built *this
 };

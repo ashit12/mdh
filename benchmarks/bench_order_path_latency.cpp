@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <sys/resource.h>
@@ -66,6 +67,7 @@ struct Args {
     bool run_soak = false;
     bool run_idle = false;
     bool run_core = true;
+    std::optional<unsigned> matching_cpu;
 };
 
 [[nodiscard]] Args parse_args(int argc, char** argv) {
@@ -118,6 +120,8 @@ struct Args {
             }
         } else if (flag == "--market-data") {
             args.market_data = true;
+        } else if (flag == "--matching-cpu") {
+            if (const char* v = next()) args.matching_cpu = static_cast<unsigned>(std::atoi(v));
         } else if (flag == "--workload") {
             const char* v = next();
             if (v == nullptr) continue;
@@ -373,6 +377,7 @@ private:
         .accept_backlog = std::max({16, args.max_clients, args.idle_clients}),
         .writer_batch = args.writer_batch,
         .enable_io_metrics = true,
+        .matching_cpu = args.matching_cpu,
     };
     if (args.market_data) {
         options.extra_event_sink = market_data_router.sink();
@@ -799,6 +804,19 @@ int main(int argc, char** argv) {
     if (!gateway->start()) {
         std::fprintf(stderr, "failed to start gateway\n");
         return EXIT_FAILURE;
+    }
+    if (args.matching_cpu.has_value()) {
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (!gateway->matching_affinity_ready() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(1ms);
+        }
+        if (!gateway->matching_cpu_pinned()) {
+            std::fprintf(stderr, "failed to pin matching thread to CPU %u: %s\n", *args.matching_cpu,
+                         gateway->matching_affinity_error().c_str());
+            return EXIT_FAILURE;
+        }
+        std::printf("matching thread pinned to CPU %u (tid=%llu)\n", *args.matching_cpu,
+                    static_cast<unsigned long long>(gateway->matching_thread_id()));
     }
     seed_accounts(*gateway, std::max({1, args.max_clients, args.idle_clients}));
 

@@ -1,7 +1,10 @@
 #include "exchange/sequencing/matching_pipeline.hpp"
 
+#include <cstdio>
 #include <span>
 #include <utility>
+
+#include "common/thread_affinity.hpp"
 
 namespace mdh::exchange::sequencing {
 
@@ -14,6 +17,17 @@ MatchingPipeline::MatchingPipeline(EventSink sink, const MatchingPipelineOptions
                               })),
       options_(options) {
     matching_thread_ = std::jthread([this] {
+        matching_thread_id_.store(calling_thread_id(), std::memory_order_release);
+        if (options_.matching_cpu.has_value()) {
+            if (auto error = pin_calling_thread_to_cpu(*options_.matching_cpu)) {
+                matching_affinity_error_ = std::move(*error);
+                std::fprintf(stderr, "MatchingPipeline: %s\n", matching_affinity_error_.c_str());
+            } else {
+                matching_cpu_pinned_.store(true, std::memory_order_relaxed);
+            }
+        }
+        matching_affinity_ready_.store(true, std::memory_order_release);
+
         const auto token = stop_source_.get_token();
         while (true) {
             auto command = queue_.try_pop();

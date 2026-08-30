@@ -108,6 +108,7 @@ add_library(mdh_core
     src/replay/event_file_reader.cpp
     src/replay/event_file_writer.cpp
     src/common/sequence_validator.cpp
+    src/common/thread_affinity.cpp
     src/replay/replay_engine.cpp
     src/replay/snapshot.cpp
     src/book/order_book.cpp

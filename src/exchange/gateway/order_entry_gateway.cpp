@@ -40,6 +40,7 @@ OrderEntryGateway::OrderEntryGateway(std::uint16_t port, const OrderEntryGateway
           EventSink{[this](const ExchangeEvent& event) { route_event(event); }},
           sequencing::MatchingPipelineOptions{
               .queue_capacity = options_.matching_queue_capacity,
+              .matching_cpu = options_.matching_cpu,
           },
           sequencing::MatchingPipeline::Processor{[this](const ExchangeCommand& command, const EventSink& sink) {
               latency::tracer().stamp_exchange_begin(command);
