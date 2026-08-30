@@ -58,7 +58,7 @@ MatchingPipeline::MatchingPipeline(EventSink sink, const MatchingPipelineOptions
                 if (token.stop_requested()) {
                     break; // stop requested and the queue is now empty: drain complete
                 }
-                cpu_relax();
+                std::this_thread::yield();                
                 continue;
             }
             if (options_.matching_delay.count() > 0) {
