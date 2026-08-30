@@ -48,7 +48,13 @@ cmake --build build-release -j --target bench_order_path_latency
 Optional flags: `--workload sequential|sustained|multi|burst|soak|idle|core|all`,
 `--sequential-samples N`, `--sustained-samples N`, `--max-clients N`,
 `--multi-samples N`, `--idle-clients N`, `--idle-samples N`,
-`--writer-batch N`, `--soak-orders N`, `--soak-seconds S`, `--market-data`.
+`--writer-batch N`, `--soak-orders N`, `--soak-seconds S`, `--market-data`,
+`--matching-cpu N` (Linux only; pin the matching thread — see §19),
+`--mlockall` (Linux only, off by default; `mlockall(MCL_CURRENT | MCL_FUTURE)`
+before any timed work, so paging can be A/B’d against the unlocked run).
+`mlockall` with `MCL_FUTURE` fails if `RLIMIT_MEMLOCK` is too small
+(`ulimit -l`); the bench prints `strerror(errno)` and exits rather than
+continuing unlocked.
 
 `--workload soak` and `--workload idle` are **not** part of `all`. Soak: see
 §16. Idle: many long-lived sessions, one active sender; see §18. `--workload
@@ -135,6 +141,10 @@ not change wire contents.
 - **Build:** AppleClang, `-DCMAKE_BUILD_TYPE=Release`, same warning set as the rest of the repo
 - **Load:** development laptop, not an isolated/pinned machine. `max` and sometimes
   p99.9 include scheduler preemption.
+- **Later Linux isolation numbers** (GCP Xeon, pinned matcher, `isolcpus=1`) are
+  §19. They do not replace the laptop tables above; they answer a different
+  question (what `server_pre_match` looks like when the matcher actually owns a
+  core).
 
 ---
 
@@ -267,8 +277,10 @@ matching → writer → client reader) plus loopback TCP. `writer_handoff` (~16 
 is the largest *server-side* stage; `client_to_server` (~32 µs) is the largest
 overall, and most of that is syscalls and the NIC/loopback, not encode.
 
-**Idle (1k/s):** matching `yield()` and writer `wait_for` put cores to sleep.
-Wakeup, not work, dominates p50.
+**Idle (1k/s, this laptop):** matching `yield()` and writer `wait_for` put cores
+to sleep. Wakeup, not work, dominates p50. That reading does **not** survive a
+genuinely isolated matching core — see §19.3. Hundreds of microseconds of
+`server_pre_match` on Linux were an affinity bug, not `yield()`.
 
 **Above ~34–35k/s offered, and any flood of concurrent clients:** the process
 cannot drain commands as fast as they are written. Matching is still one thread;
@@ -348,6 +360,12 @@ Related: [`docs/benchmarks.md`](benchmarks.md) §7 (earlier writer-poll fix),
 ---
 
 ## 13. Thread-handoff experiment (yield vs busy-spin)
+
+Laptop, unpinned, matcher **and** writers. A later Linux experiment that pinned
+only the matcher (§19.4) is the one that decides production idle policy. Do not
+read the hundreds-of-microseconds `server_pre_match` numbers in this section, or
+the “`yield()` is the wakeup tax” story, as applying to an isolated matching
+CPU: that conclusion was wrong when the matcher had not actually been pinned.
 
 **Question:** is the ~35k/s knee scheduler wakeup (reader→matcher `yield()`,
 matcher→writer `wait_for`), or the TCP path?
@@ -995,4 +1013,247 @@ this architecture owns, not "10k concurrent users."
 
 Linux with pinned cores and `epoll` instead of one blocking thread per
 direction would move this knee; it would not turn the matcher into the
-limiter. The matcher was never the limiter on this path.
+limiter. The matcher was never the limiter on this path. §19 is the Linux
+pinned-core measurement of that claim.
+
+---
+
+## 19. CPU isolation and matcher affinity (Linux GCP, 2026-08-30)
+
+Laptop tables in §1–§18 stay the record they were. This section is a later
+session on a different machine: a 4-vCPU GCP VM with kernel isolation and an
+explicit matching-thread pin. The question was whether `server_pre_match`
+(T1→T2: decoded-on-server to matching-thread-begin) is a scheduler-wakeup
+tax that isolation can remove.
+
+It is, once the matcher is actually on the isolated CPU. The dominant finding
+is not a new idle policy and not a kernel-tuning laundry list. It is that
+`--matching-cpu` is optional, `taskset` on the process is inherited, and a
+run that looks “isolated” can still have the matcher on CPU0.
+
+### 19.1 Machine and topology
+
+- **Host:** GCP Debian 13 VM, Intel Xeon Platinum 8481C
+- **Topology:** 4 logical CPUs / 2 physical cores
+  - CPU0 + CPU2 = physical core 0
+  - CPU1 + CPU3 = physical core 1
+- **Clock:** x86 TSC path of `monotonic_ticks()` (not the AArch64 CNTVCT
+  numbers in §2)
+- **Build:** Release, `bench_order_path_latency`
+
+Kernel boot parameters:
+
+```text
+isolcpus=1
+nohz_full=1
+rcu_nocbs=1
+```
+
+CPU3 is kept **offline** so the matcher’s physical core has no live SMT
+sibling. CPU2 stays **online** as CPU0’s sibling, for non-matching work.
+
+Final placement:
+
+| CPUs | Role |
+|---|---|
+| CPU0 + CPU2 | Benchmark client, TCP gateway readers/writers, accept thread, general process / housekeeping |
+| CPU1 | Matching thread only |
+| CPU3 | Offline |
+
+The matching thread is pinned in-process:
+
+```text
+--matching-cpu 1
+```
+
+The rest of the process is constrained from the shell (nice is not a
+scheduling-class change to `SCHED_FIFO`):
+
+```bash
+sudo nice -n -20 taskset -c 0,2 ./build-release/bench_order_path_latency --matching-cpu 1
+```
+
+`taskset` here lists only the housekeeping CPUs. It does **not** by itself
+put the matcher on CPU1. `isolcpus=1` keeps unpinned threads off CPU1;
+`--matching-cpu 1` is what moves the matcher onto it. Both are required.
+
+### 19.2 The pinning trap (largest result)
+
+Earlier runs used:
+
+```bash
+taskset -c 0 ./build-release/bench_order_path_latency
+```
+
+without `--matching-cpu 1`.
+
+`MatchingPipelineOptions::matching_cpu` is unset by default. The matching
+thread then inherits the process affinity, so it stays on CPU0 with the
+gateway, the clients, and housekeeping — even when the operator believed
+CPU1 was “the matching CPU.”
+
+That configuration produced **misleading** `server_pre_match` of typically
+**hundreds of microseconds** under sustained traffic. It is easy to blame
+`std::this_thread::yield()` on an empty matching queue for that delay. That
+blame is wrong. The matcher was not on the isolated core; it was competing
+for CPU0, and `yield()` was handing that contended core back to everyone
+else.
+
+Once the matcher was genuinely pinned to CPU1, median `server_pre_match`
+collapsed to **sub-microsecond**:
+
+| Workload | `server_pre_match` p50 |
+|---|---|
+| Sequential | ~0.84–0.87 µs |
+| Sustained 1k/s | ~0.85 µs |
+| Sustained 10k/s | ~0.83–0.85 µs |
+| Sustained 50k/s | ~0.81 µs |
+| Sustained 100k/s | ~0.85–0.88 µs |
+
+This was the largest and most important latency improvement of the
+OS/affinity session. Future runs that omit `--matching-cpu` while using
+`taskset` will rediscover the hundreds-of-microseconds number and should
+treat it as a misconfigured pin, not as a new matcher bug.
+
+### 19.3 Stable tuned baseline (`yield()`, CPU0+CPU2 / CPU1)
+
+Repeated `yield()` runs on the topology in §19.1. Matcher idle remains
+`std::this_thread::yield()` (see §19.5). Matching-core-only and TCP
+end-to-end are different surfaces; do not compare them as if they were one
+number.
+
+Matching-core only (`MatchingEngine::process`, same IOC empty-book shape):
+**~90–92 M ops/s**, **~10.9–11.0 ns/op**.
+
+TCP path, low load:
+
+| Workload | Achieved | e2e p50 | e2e p99 | `server_pre_match` p50 |
+|---|---|---|---|---|
+| Sequential | (RTT-limited) | ~28.1 µs | ~36–37 µs | ~0.85 µs |
+| Sustained 1k/s | ~1k/s | ~28–29 µs | — | ~0.85 µs |
+| Sustained 10k/s | ~10k/s | ~26 µs | — | ~0.84 µs |
+| Sustained 50k/s | ~50k/s | ~27 µs | — | ~0.81 µs |
+| Sustained 100k/s | **~96k/s** | ~29–31 µs | — | ~0.85 µs |
+
+Laptop sequential e2e was ~73 µs p50 (§18.1). The VM sequential ~28 µs is
+the same code on a different OS, clock, and pin; it is not a like-for-like
+before/after against the M3 tables.
+
+### 19.4 `yield()` vs busy-spin (`_mm_pause()`)
+
+The matching thread idles with `std::this_thread::yield()` when the MPSC
+queue is empty. A busy-spin using x86 `_mm_pause()` was measured on the
+**correctly pinned** topology (matcher on CPU1).
+
+Under that topology, busy-spin improved median `server_pre_match` by only
+**~0.1–0.2 µs**:
+
+| Idle policy | `server_pre_match` p50 |
+|---|---|
+| `yield()` | ~0.8–0.9 µs |
+| `_mm_pause()` busy-spin | ~0.7 µs |
+
+That is not a meaningful enough gain to justify burning a dedicated logical
+CPU at 100% while idle. Whole-system e2e was noisy and often not better.
+**Production keeps `std::this_thread::yield()`.** Busy-spin is not a retained
+optimisation.
+
+The earlier “`yield()` costs ~700 µs of `server_pre_match`” reading was the
+§19.2 affinity trap. On an isolated CPU1, `yield()` is already sub-microsecond
+at p50.
+
+### 19.5 Housekeeping: CPU0 only vs CPU0+CPU2
+
+With CPU1 for matching and only CPU0 for every other thread, low-load e2e
+was better:
+
+| Workload | e2e p50 (CPU0-only housekeeping) |
+|---|---|
+| Sequential | ~16–17 µs |
+| Sustained 1k/s | ~17 µs |
+
+Multi-client throughput suffered: gateway, client, reader, and writer
+threads all competed for CPU0.
+
+Bringing CPU2 back and allowing the non-matcher process `taskset -c 0,2`
+raised loaded throughput while keeping matcher `server_pre_match` sub-µs:
+
+| Workload | CPU0 only | CPU0+CPU2 |
+|---|---|---|
+| Sustained 100k/s achieved | ~82k/s | ~96k/s |
+| Multi 4 achieved | ~384k/s | ~560–590k/s |
+| Multi 8 achieved | ~378k/s | ~520–630k/s |
+| Multi 16 achieved | ~400k/s | ~620–640k/s |
+
+Tradeoff:
+
+- **CPU0-only housekeeping:** best low-load e2e.
+- **CPU0+CPU2 housekeeping:** better throughput and flood scaling; slightly
+  higher low-load e2e (~16–17 µs → ~28 µs sequential p50).
+
+The chosen topology is CPU0+CPU2 for non-matching work, CPU1 for matching,
+CPU3 offline: the better balanced system, not the lowest sequential p50.
+
+Multi-client floods vary run-to-run; the ranges above are representative,
+not a single cherry-picked execution.
+
+### 19.6 Other OS experiments
+
+Tried, then discarded:
+
+| Change | Outcome |
+|---|---|
+| THP always vs never | No meaningful improvement. Keep the distro default. |
+| IRQ affinity | No useful gain; tails sometimes worse. Reverted. |
+| Whole-process `SCHED_FIFO` | Disastrous. Starved other threads; multi-second latency. Never use whole-process real-time scheduling for this thread-per-connection design. |
+| `sched_autogroup_enabled=0` | Did not help. Restored to enabled. |
+| Larger TCP socket buffers | Not pursued: localhost tiny-message latency is not buffer-capacity limited. |
+| `TCP_NODELAY` | Already enabled. |
+| `net.core.busy_poll` / `busy_read` | Not enabled. This harness is localhost TCP; it does not traverse a physical NIC. |
+
+### 19.7 Where latency remains
+
+After a correct pin, the matcher is no longer the main latency bottleneck
+on this path.
+
+For normal single-client sustained workloads:
+
+- `server_pre_match` p50 **< 1 µs**
+- `exchange_processing` only a few microseconds
+
+Remaining large p99 / p99.9 spikes frequently sit in `client_to_server`,
+`writer_handoff`, and `server_to_client`. Future optimisation belongs on
+the TCP / gateway / writer / output path, not on matching-queue handoff.
+
+Matching-core-only ~90 M/s is still not the exchange’s TCP throughput.
+Sockets and threads remain the ceiling (§18.1, restated on this host).
+
+### 19.8 Integrity and caveats
+
+- This is a cloud VM under KVM. Host scheduler noise affects tails. Use it
+  for relative A/B, p50, and throughput — not as evidence of deterministic
+  production-grade p99.9.
+- Repeated `yield()` runs established the stable matcher-side result
+  (~0.8 µs `server_pre_match` p50). One noisy multi-client execution is not
+  a result.
+- `server_pre_match` is T2 − T1 as in §3: decoded-on-server to
+  matching-thread-begin.
+- Matching-queue occupancy sometimes reports values near `UINT64_MAX`. That
+  is an instrumentation / underflow bug, not a real queue depth. Do not
+  interpret it as backlog.
+- Do not mix these TCP numbers with `bench_matching_engine` GTC-rest (~169 ns
+  on the laptop) or with a filled book.
+
+### 19.9 Takeaway
+
+The dominant optimisation from this tuning session was explicit physical-core
+isolation of the matching thread. Correctly pinning the matcher to CPU1 reduced
+median `server_pre_match` from hundreds of microseconds in the broken
+affinity configuration to ~0.8 µs, while keeping matching-core throughput near
+90 M ops/s. A second housekeeping SMT thread improved system throughput,
+producing the final balanced topology of CPU0+CPU2 for non-matching work, CPU1
+for matching, and CPU3 offline. Matcher idle stays `yield()`; busy-spin was
+measured and not kept. The trap to remember: `taskset` without
+`--matching-cpu` pins the matcher to the housekeeping set, and the resulting
+hundreds of microseconds look like a `yield()` problem they are not.
+

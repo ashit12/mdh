@@ -23,6 +23,11 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <cerrno>
+#include <sys/mman.h>
+#endif
+
 #include "exchange/gateway/order_entry_gateway.hpp"
 #include "exchange/latency/latency_tracer.hpp"
 #include "exchange/matching/matching_engine.hpp"
@@ -68,6 +73,7 @@ struct Args {
     bool run_idle = false;
     bool run_core = true;
     std::optional<unsigned> matching_cpu;
+    bool mlockall = false;
 };
 
 [[nodiscard]] Args parse_args(int argc, char** argv) {
@@ -122,6 +128,8 @@ struct Args {
             args.market_data = true;
         } else if (flag == "--matching-cpu") {
             if (const char* v = next()) args.matching_cpu = static_cast<unsigned>(std::atoi(v));
+        } else if (flag == "--mlockall") {
+            args.mlockall = true;
         } else if (flag == "--workload") {
             const char* v = next();
             if (v == nullptr) continue;
@@ -775,6 +783,25 @@ WorkloadStats run_idle_population(OrderEntryGateway& gateway, const Args& args, 
 
 int main(int argc, char** argv) {
     const Args args = parse_args(argc, argv);
+    if (args.mlockall) {
+#if defined(__linux__)
+        // Before any timed work: lock pages already mapped and every mapping
+        // this process creates later. Off by default -- this is an A/B on
+        // whether paging shows up in tails, not a production default.
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+            std::fprintf(stderr,
+                         "mlockall(MCL_CURRENT | MCL_FUTURE) failed: %s (errno=%d). "
+                         "MCL_FUTURE can fail when RLIMIT_MEMLOCK is too small "
+                         "(ulimit -l); raise the memlock limit and retry.\n",
+                         std::strerror(errno), errno);
+            return EXIT_FAILURE;
+        }
+        std::printf("mlockall(MCL_CURRENT | MCL_FUTURE) ok\n");
+#else
+        std::fprintf(stderr, "--mlockall is Linux-only\n");
+        return EXIT_FAILURE;
+#endif
+    }
     const TimerCalibration cal = calibrate_timer();
     print_timer_calibration(cal);
 

@@ -6,30 +6,7 @@
 
 #include "common/thread_affinity.hpp"
 
-#if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#endif
-
 namespace mdh::exchange::sequencing {
-
-namespace {
-
-// Hint to the CPU that this is a spin-wait. The matching thread is meant to
-// stay on its core: yield() returned it to the scheduler, and under sparse
-// traffic the next command then waited hundreds of microseconds to be
-// scheduled again. This is not a blocking wait and does not touch the queue.
-inline void cpu_relax() noexcept {
-#if defined(__x86_64__) || defined(__i386__)
-    _mm_pause();
-#elif defined(__aarch64__)
-    __asm__ __volatile__("yield" ::: "memory");
-#else
-    __asm__ __volatile__("" ::: "memory");
-#endif
-}
-
-} // namespace
-
 
 MatchingPipeline::MatchingPipeline(EventSink sink, const MatchingPipelineOptions& options, Processor processor)
     : sink_(std::move(sink)), queue_(options.queue_capacity),
