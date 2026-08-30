@@ -16,6 +16,25 @@ endif()
 
 set(MDH_WARNING_FLAGS -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror)
 
+# -Wextra already makes GCC report every field a designated initializer leaves
+# out. Clang keeps the same check behind its own switch, so a macOS build is
+# silent on exactly the omissions that fail a GCC build -- which is how this
+# repo shipped code that only broke on Linux. Enabling it wherever it exists
+# holds both toolchains to one rule: a field a call site is allowed to omit
+# states its default in the struct declaration, so the default is written
+# once next to the field instead of being assumed at every use.
+#
+# Probed rather than assumed, since older Clang releases lack the flag and
+# GCC has never had it under this name. -Werror during the probe stops Clang
+# from accepting an unknown -W option with only a warning.
+include(CheckCXXCompilerFlag)
+set(CMAKE_REQUIRED_FLAGS -Werror)
+check_cxx_compiler_flag(-Wmissing-designated-field-initializers MDH_HAS_WMISSING_DESIGNATED_FIELD_INIT)
+unset(CMAKE_REQUIRED_FLAGS)
+if(MDH_HAS_WMISSING_DESIGNATED_FIELD_INIT)
+    list(APPEND MDH_WARNING_FLAGS -Wmissing-designated-field-initializers)
+endif()
+
 # ── Google Test ────────────────────────────────────────────────────────────
 include(FetchContent)
 FetchContent_Declare(
@@ -287,7 +306,10 @@ add_executable(mdh_tests
     tests/test_failure_injection_market_data.cpp
     tests/test_matching_engine_stress.cpp
 )
-target_link_libraries(mdh_tests PRIVATE mdh_ui_gateway httplib nlohmann_json::nlohmann_json gtest gtest_main)
+# gtest_main alone: it already carries gtest as a public dependency, and
+# naming both puts libgtest.a on the link line twice, which the macOS linker
+# reports as a duplicate library.
+target_link_libraries(mdh_tests PRIVATE mdh_ui_gateway httplib nlohmann_json::nlohmann_json gtest_main)
 target_compile_options(mdh_tests PRIVATE ${MDH_WARNING_FLAGS})
 
 include(GoogleTest)

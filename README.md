@@ -794,7 +794,12 @@ cmake -S . -B build-tsan -DMDH_ENABLE_TSAN=ON   # separate: can't combine with A
 ```
 
 Everything compiles with `-Wall -Wextra -Wpedantic -Wshadow -Wconversion
--Werror` (warnings are errors; the build is warning-clean).
+-Werror` (warnings are errors), warning-clean under both AppleClang and GCC.
+Clang additionally gets `-Wmissing-designated-field-initializers`, which is
+the check GCC already applies under `-Wextra`: without it a macOS build stays
+silent on the omitted-field diagnostics that fail a GCC build. Any field a
+call site may leave out of a designated initializer therefore declares its
+default next to the field.
 
 **Run the whole stack:**
 

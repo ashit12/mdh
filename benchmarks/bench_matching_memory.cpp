@@ -72,6 +72,16 @@ std::uint64_t g_size_histogram[kHistogramBuckets] = {};
 std::uint64_t g_large_allocation_count = 0;
 std::uint64_t g_large_bytes = 0;
 
+// GCC inlines this into each operator new below and then cannot prove the
+// pointer it is handed was written, because the only caller that does not
+// assign it directly hands it to posix_memalign as an out-parameter.
+// allocate_aligned() initialises it to nullptr before that call and returns
+// early if the call fails, so there is no path here with an indeterminate
+// pointer -- the analysis just cannot see through the out-parameter.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 [[nodiscard]] std::size_t block_size(void* pointer, std::size_t requested) {
 #if defined(__APPLE__)
     (void)requested;
@@ -84,6 +94,9 @@ std::uint64_t g_large_bytes = 0;
     return requested;
 #endif
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 void record_allocation(void* pointer, std::size_t requested) {
     const std::size_t size = block_size(pointer, requested);
@@ -128,7 +141,19 @@ void release(void* pointer) {
         return;
     }
     record_deallocation(pointer);
+    // GCC pairs allocation with deallocation by function identity and reports
+    // free() on memory it traced back to operator new. That pairing is the
+    // entire point of this file: the operator new overloads below *are*
+    // malloc, so free is the matching release, and the mismatch the warning
+    // describes cannot be expressed away in code.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
     std::free(pointer);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 }
 
 } // namespace

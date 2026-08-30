@@ -172,9 +172,21 @@ TEST(EventSink, CollectsMultipleEventsEmittedForOneCommand) {
     // EventSink shape itself (a plain callable) is sufficient for a test to
     // collect an ordered sequence of heterogeneous events from one logical
     // operation.
-    sink(OrderAccepted{.event_sequence = 1});
-    sink(TradeExecuted{.event_sequence = 2});
-    sink(BookOrderReduced{.event_sequence = 3});
+    // Zero-initialised and then given a sequence number, rather than built
+    // with a designated initializer naming one field: only the sequence
+    // matters to what is being asserted, and the event types deliberately
+    // declare no per-field defaults, so naming one field would leave the
+    // rest indeterminate.
+    OrderAccepted accepted{};
+    accepted.event_sequence = 1;
+    TradeExecuted traded{};
+    traded.event_sequence = 2;
+    BookOrderReduced reduced{};
+    reduced.event_sequence = 3;
+
+    sink(accepted);
+    sink(traded);
+    sink(reduced);
 
     ASSERT_EQ(collected.size(), 3u);
     EXPECT_TRUE(std::holds_alternative<OrderAccepted>(collected[0]));

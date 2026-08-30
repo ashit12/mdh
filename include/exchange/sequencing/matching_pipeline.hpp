@@ -68,7 +68,7 @@ struct MatchingPipelineOptions {
     // rejected. Empty means an engine that rejects everything, which is the
     // right default for a class whose job is transport: a caller that has
     // not said what it trades has not finished configuring it.
-    std::vector<InstrumentId> instruments;
+    std::vector<InstrumentId> instruments{};
 
     // Passed to the engine -- see kDefaultExpectedRestingOrders for what it
     // buys and what guessing low costs.

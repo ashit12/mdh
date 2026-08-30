@@ -27,7 +27,7 @@ struct ReplayOptions {
     // it was written. A real system would fetch a current snapshot per
     // recovery; that needs snapshot-serving infrastructure this project does
     // not model.
-    std::optional<std::string> recovery_snapshot_path;
+    std::optional<std::string> recovery_snapshot_path{};
 };
 
 struct ReplayOutcome {

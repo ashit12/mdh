@@ -124,7 +124,7 @@ struct OrderEntryGatewayOptions {
     // InvalidInstrument over the wire. Instrument ids arrive from clients,
     // so without this list every id a client invented got a book of its own.
     // Empty rejects every order, so a real deployment must set it.
-    std::vector<InstrumentId> instruments;
+    std::vector<InstrumentId> instruments{};
 
     // The pipeline's inbound command queue.
     std::size_t matching_queue_capacity = 1024;
@@ -165,7 +165,7 @@ struct OrderEntryGatewayOptions {
     //
     // Runs on the matching thread, synchronously, under the same "must not
     // block" rule as route_event() itself. Null by default.
-    EventSink extra_event_sink;
+    EventSink extra_event_sink{};
 
     // How many immediately available outbound messages a writer may encode
     // into one write(). It never waits for a batch to fill, so an isolated
