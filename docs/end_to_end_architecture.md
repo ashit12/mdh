@@ -37,7 +37,7 @@ just in prose.
 │       │ TCP binary order-entry protocol                                                       │
 │       ▼                                                                                       │
 │  Order-entry gateway ──────────────────────────────────────────  exchange/gateway/            │
-│       │  per-connection readers call MatchingPipeline::submit() concurrently                  │
+│       │  I/O thread calls MatchingPipeline::submit() (MPSC)                                  │
 │       ▼                                                                                       │
 │  MPSC command queue (common::MpscQueue) ────────────────────────  common/mpsc_queue.hpp       │
 │       │  admission FIFO; per-session FIFO; no submit mutex                                    │
@@ -352,9 +352,11 @@ directly by `route_event()` instead of polling on a timer, plus `TCP_NODELAY` wa
 to every connected `TcpSocket` (a second, previously-unexamined latency source the same
 investigation turned up). Re-measured after both fixes, p50 dropped to ~73 μs — roughly
 a 17x reduction, verified with two independent 20,000-sample runs, documented in
-`docs/benchmarks.md` §7.2. `bench_order_path_latency` is now the primary live
-TCP harness; `bench_end_to_end_latency` remains for its unique canned
-transport-floor comparison.
+`docs/benchmarks.md` §7.2. The gateway later replaced those per-connection
+reader/writer threads with one `IoPoller` I/O thread (epoll/kqueue) plus the
+matching thread; see `docs/latency_benchmark.md` §20. `bench_order_path_latency`
+is now the primary live TCP harness; `bench_end_to_end_latency` remains for its
+unique canned transport-floor comparison.
 
 ### The live demonstration
 

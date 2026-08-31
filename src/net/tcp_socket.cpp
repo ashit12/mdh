@@ -8,32 +8,24 @@
 #include <unistd.h>
 
 #include <cerrno>
-#include <cstring>
 #include <utility>
 
 namespace mdh::net {
 
 namespace {
-// Disables Nagle's algorithm: without this, the kernel can hold a small
-// outbound write (e.g. one encoded protocol frame) back for a brief moment
-// hoping to coalesce it with another, waiting on an ACK of the previous
-// segment before sending. This project's protocol is request/response,
-// latency-sensitive, and already sends whole, already-batched frames one
-// write() at a time (see encode_message() call sites) -- there is nothing
-// for Nagle's coalescing to usefully buy here, only latency it can add.
-// Applied unconditionally to every connected socket (both accept()'s
-// server-side result and connect()'s client-side one) so this is a
-// guaranteed property of "a connected TcpSocket," not something every
-// caller must remember to opt into -- same rationale as accept()'s
-// unconditional O_NONBLOCK clearing right above this call's usual site.
 void configure_connected_socket(int fd) {
     const int flag = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 #if defined(SO_NOSIGPIPE)
-    // BSD/macOS suppress SIGPIPE per socket. Linux has no SO_NOSIGPIPE and
-    // uses MSG_NOSIGNAL on each send() below.
     ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &flag, sizeof(flag));
 #endif
+}
+
+[[nodiscard]] IoStatus status_from_errno(int err) {
+    if (err == EAGAIN || err == EWOULDBLOCK) {
+        return IoStatus::WouldBlock;
+    }
+    return IoStatus::Error;
 }
 } // namespace
 
@@ -62,10 +54,6 @@ bool TcpSocket::listen(std::uint16_t port, int backlog) {
         return false;
     }
 
-    // Lets a test or restarted process immediately rebind a port still in
-    // TIME_WAIT from a just-closed prior socket -- see this method's header
-    // doc comment. Not fatal if it fails; bind()/listen() below are the
-    // operations that actually matter.
     const int reuse = 1;
     ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
@@ -80,35 +68,25 @@ bool TcpSocket::listen(std::uint16_t port, int backlog) {
     return ::listen(fd_, backlog) == 0;
 }
 
-std::optional<TcpSocket> TcpSocket::accept() {
+AcceptResult TcpSocket::accept() {
     if (!is_open()) {
-        return std::nullopt;
+        return {.status = IoStatus::Error, .socket = std::nullopt};
     }
-    const auto val = ::accept(fd_, nullptr, nullptr);
-    if (val < 0) {
-        return std::nullopt;
+    for (;;) {
+        const auto val = ::accept(fd_, nullptr, nullptr);
+        if (val >= 0) {
+            const int flags = ::fcntl(val, F_GETFL, 0);
+            if (flags >= 0) {
+                ::fcntl(val, F_SETFL, flags & ~O_NONBLOCK);
+            }
+            configure_connected_socket(val);
+            return {.status = IoStatus::Ok, .socket = TcpSocket(val)};
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        return {.status = status_from_errno(errno), .socket = std::nullopt};
     }
-
-    // On BSD-derived kernels (including macOS), a socket returned by
-    // accept() inherits the listening socket's O_NONBLOCK flag rather than
-    // starting fresh like a newly ::socket()-ed fd does (unlike Linux,
-    // where it never does) -- since this class's own listen()/accept()
-    // pattern requires the *listening* socket to be non-blocking (see
-    // accept()'s own doc comment on why), every accepted connection on
-    // such a platform would otherwise silently come back non-blocking too,
-    // even though callers (e.g. the gateway's per-connection reader/writer
-    // threads) are documented and entitled to assume a freshly accepted
-    // TcpSocket behaves like a freshly constructed one: blocking by
-    // default. Clearing it here, unconditionally, makes that guarantee
-    // hold on every platform this project targets rather than only on
-    // Linux.
-    const int flags = ::fcntl(val, F_GETFL, 0);
-    if (flags >= 0) {
-        ::fcntl(val, F_SETFL, flags & ~O_NONBLOCK);
-    }
-    configure_connected_socket(val);
-
-    return TcpSocket(val);
 }
 
 bool TcpSocket::connect(const std::string& host, std::uint16_t port) {
@@ -120,7 +98,7 @@ bool TcpSocket::connect(const std::string& host, std::uint16_t port) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-        return false; // host must be an IPv4 dotted-decimal literal, e.g. "127.0.0.1"
+        return false;
     }
 
     const auto val = ::connect(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
@@ -144,41 +122,52 @@ std::optional<std::uint16_t> TcpSocket::local_port() const {
     return ntohs(addr.sin_port);
 }
 
-std::optional<std::size_t> TcpSocket::read(std::span<std::byte> buf) {
+IoResult TcpSocket::read(std::span<std::byte> buf) {
     if (!is_open()) {
-        return std::nullopt;
+        return {.status = IoStatus::Error};
     }
-    const auto val = ::read(fd_, buf.data(), buf.size());
-    if (val < 0) {
-        return std::nullopt;
+    for (;;) {
+        const auto val = ::read(fd_, buf.data(), buf.size());
+        if (val >= 0) {
+            return {.status = IoStatus::Ok, .n = static_cast<std::size_t>(val)};
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        return {.status = status_from_errno(errno)};
     }
-    return val;
 }
 
-std::optional<std::size_t> TcpSocket::write(std::span<const std::byte> data) {
+IoResult TcpSocket::write(std::span<const std::byte> data) {
     if (!is_open()) {
-        return std::nullopt;
+        return {.status = IoStatus::Error};
     }
 #if defined(MSG_NOSIGNAL)
     constexpr int flags = MSG_NOSIGNAL;
 #else
     constexpr int flags = 0;
 #endif
-    const auto val = ::send(fd_, data.data(), data.size(), flags);
-    if (val < 0) {
-        return std::nullopt;
+    for (;;) {
+        const auto val = ::send(fd_, data.data(), data.size(), flags);
+        if (val >= 0) {
+            return {.status = IoStatus::Ok, .n = static_cast<std::size_t>(val)};
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        return {.status = status_from_errno(errno)};
     }
-    return val;
 }
 
-void TcpSocket::set_non_blocking() {
+bool TcpSocket::set_non_blocking() {
     if (!is_open()) {
-        return;
+        return false;
     }
     const int flags = ::fcntl(fd_, F_GETFL, 0);
-    if (flags >= 0) {
-        ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0) {
+        return false;
     }
+    return ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
 void TcpSocket::shutdown() {

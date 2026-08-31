@@ -3,6 +3,11 @@
 // for order entry. MatchingEngine is also timed in-process as a separate
 // ceiling so TCP numbers are not confused with matcher throughput.
 //
+// The gateway side is two threads: one IoPoller I/O thread (accept/read/write)
+// and one matching thread. Each OrderEntryClient still has its own reader
+// thread. --writer-batch is opportunistic encode-into-one-write on the I/O
+// thread; it never waits for a batch to fill.
+//
 // Workloads: sequential, sustained, multi-client flood, idle-session
 // population, burst. Matching-core-only always prints first unless disabled.
 //
@@ -450,7 +455,7 @@ void print_matching_core(const MatchingCoreStats& core) {
                 core.operations, core.elapsed_s);
     std::printf("  achieved=%.0f/s  ns/op=%.1f\n", core.ops_per_sec, core.ns_per_op);
     std::printf("  This is the matcher ceiling on this machine for this order shape. TCP numbers below\n");
-    std::printf("  are a different ceiling (sockets, 2N+2 threads, risk, ledger, routing).\n");
+    std::printf("  are a different ceiling (sockets, I/O + matching threads, risk, ledger, routing).\n");
 }
 
 void seed_accounts(OrderEntryGateway& gateway, int clients) {
@@ -850,8 +855,8 @@ int main(int argc, char** argv) {
     std::printf("\nmdh order-path latency  (OrderEntryClient -> TCP -> OrderEntryGateway -> TCP -> client)\n");
     std::printf("%s NewOrder; one Accepted per command%s.\n", args.market_data ? "GTC" : "IOC",
                 args.market_data ? " plus one public BookOrderAdded event" : " against an empty book");
-    std::printf("writer_batch=%zu  writers=per-connection (sleeping)\n", args.writer_batch);
-    std::printf("thread model: 2N+2 server threads (N readers, N writers, accept, matcher).\n");
+    std::printf("writer_batch=%zu  (I/O thread opportunistic encode; never waits to fill)\n", args.writer_batch);
+    std::printf("thread model: 2 server threads (IoPoller I/O + matcher); plus N client reader threads.\n");
     if (args.run_core) {
         std::printf("matching-core ceiling (same process, same order shape): %.0f/s (%.1f ns/op)\n",
                     core.ops_per_sec, core.ns_per_op);

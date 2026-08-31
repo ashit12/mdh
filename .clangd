@@ -1,0 +1,12 @@
+# Without this, clangd auto-discovers whichever compile_commands.json it finds
+# first among the build*/ trees. That is usually the stale build/ configure,
+# which predates several sources (io_poller, kqueue_poller, bench_capacity,
+# test_io_poller) and so leaves them on guessed flags -- reported in the editor
+# as undeclared types in headers that compile cleanly. It could also pick a
+# GCC configure, whose flags are not the ones the clang build uses.
+#
+# build-release is the database the benchmark and test instructions in docs/
+# already tell you to generate, so pin clangd to it. Regenerate with:
+#   cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+CompileFlags:
+  CompilationDatabase: build-release

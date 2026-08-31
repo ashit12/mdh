@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 
@@ -130,6 +132,10 @@ public:
         return [this](const ExchangeEvent& event) { apply(event); };
     }
 
+    // Map sizes for soak / capacity benches. Safe from any thread.
+    [[nodiscard]] std::size_t account_count() const { return account_count_->load(std::memory_order_relaxed); }
+    [[nodiscard]] std::size_t hold_count() const { return hold_count_->load(std::memory_order_relaxed); }
+
 private:
     // One open reservation against a still-live resting order.
     struct Hold {
@@ -186,10 +192,15 @@ private:
     // Settles both legs (buyer and seller) of a trade.
     void on_trade_executed(const TradeExecuted& event);
 
+    AccountBalances& account_ref(AccountId account_id);
+    void erase_hold(std::unordered_map<HoldKey, Hold, HoldKeyHash>::iterator it);
+
     // Every account's balances, keyed by account id.
     std::unordered_map<AccountId, AccountBalances> accounts_;
     // Every currently-open reservation, keyed by (account, client_order_id).
     std::unordered_map<HoldKey, Hold, HoldKeyHash> holds_;
+    std::unique_ptr<std::atomic<std::size_t>> account_count_ = std::make_unique<std::atomic<std::size_t>>(0);
+    std::unique_ptr<std::atomic<std::size_t>> hold_count_ = std::make_unique<std::atomic<std::size_t>>(0);
 };
 
 } // namespace mdh::exchange::ledger

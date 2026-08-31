@@ -54,17 +54,16 @@ normal test suite.
 
 ## 3. `OrderEntryGateway` TCP fault matrix (`tests/test_failure_injection_gateway.cpp`)
 
-Six tests, each isolating one fault against the live gateway's accept thread,
-per-connection reader thread, or per-connection writer thread (see
-`order_entry_gateway.hpp`'s own concurrency-model comment for exactly which thread
-does what).
+Six tests, each isolating one fault against the live gateway's I/O thread
+(accept + read + write on IoPoller) or matching thread (see
+`order_entry_gateway.hpp`'s own concurrency-model comment).
 
 | Fault injected | Test | Gateway's documented response | Verified consequence |
 |---|---|---|---|
 | A single byte that is not any known `MessageType` | `InvalidTypeByteDesyncsOnlyThatConnectionNotTheGatewayOrOtherConnections` | Treated identically to "header not fully arrived yet" — there is no way to tell the two apart from a length-prefixed byte stream alone, so the byte is never discarded | *This* connection is permanently desynchronized (even a subsequent well-formed message on it is never recognized) — a deliberate, documented consequence, not a crash. A brand-new connection still round-trips normally; `connection_count()` still reflects both. |
 | Well-formed header, `side` byte mutated to neither `Buy` nor `Sell` | `WellFormedHeaderWithInvalidPayloadFieldDropsOnlyThatFrameAndKeepsTheConnectionOpen` | Framing (header) is trusted, so only that one frame is dropped; the connection stays open and synchronized | The very next, valid message on the same connection is accepted normally (proven by it getting `client_order_id` 2, not 1 — the corrupted frame never produced a delayed response either). |
-| Header promising N payload bytes, connection closed after sending only N/2, no FIN | `TruncatedPayloadNeverCompletedThenAbruptDisconnectDoesNotCrashTheGateway` | Reader thread blocks in `read()` waiting for the rest; an abrupt (non-graceful) disconnect unblocks it via `read()` returning 0/error | Gateway keeps running; a fresh connection afterward works normally. |
-| TCP handshake completes, then immediate disconnect, zero bytes ever sent | `AbruptDisconnectImmediatelyAfterConnectingNeverHavingSentAnythingIsHarmless` | `accept_loop()` never assumes a client message is coming | Repeated 5x; gateway still services a well-behaved connection afterward. `connection_count()` correctly reflects all 6 connections (5 abandoned + 1 live) — it never decreases, by design (see `Connection`'s own comment on why dead connections are not pruned). |
+| Header promising N payload bytes, connection closed after sending only N/2, no FIN | `TruncatedPayloadNeverCompletedThenAbruptDisconnectDoesNotCrashTheGateway` | I/O thread keeps the partial frame in `read_buffer` until hangup; `read()` then returns EOF/Error | Gateway keeps running; a fresh connection afterward works normally. |
+| TCP handshake completes, then immediate disconnect, zero bytes ever sent | `AbruptDisconnectImmediatelyAfterConnectingNeverHavingSentAnythingIsHarmless` | I/O thread never assumes a client message is coming | Repeated 5x; gateway still services a well-behaved connection afterward. `connection_count()` correctly reflects all 6 connections (5 abandoned + 1 live) — it never decreases, by design (see `Connection`'s own comment on why dead connections are not pruned). |
 | A client that sends far more orders than `outbound_queue_capacity` can hold and never reads any response | `SlowNonReadingClientOverflowingItsOutboundQueueNeverBlocksAnotherConnection` | `route_event()` uses non-blocking `try_push()`; a full per-connection outbound queue silently drops that message rather than blocking the shared matching thread | A second, well-behaved client gets fast, complete service throughout (asserted per-message, not just at the end) — proving the matching thread was never blocked by the first client's full queue. The slow client eventually sees `0 < responses ≤ capacity` once drained, proving the system stayed consistent even though that one client lost messages by policy. |
 | 4KB of deterministic non-protocol noise (a stand-in for a port scanner or misconfigured client) | `FloodOfRandomBytesFromANonProtocolClientDoesNotCrashTheGatewayOrOtherConnections` | Same header/payload framing logic as above — never calls anything on a "message" that was never decoded | Gateway and a second, well-behaved connection are both unaffected. |
 

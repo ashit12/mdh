@@ -55,7 +55,9 @@ public:
         // Non-blocking so receive() below can poll with a bounded timeout
         // instead of risking an indefinite hang if the gateway never
         // responds (e.g. because of a bug this test is meant to catch).
-        socket_.set_non_blocking();
+        if (!socket_.set_non_blocking()) {
+            return false;
+        }
         return true;
     }
 
@@ -65,10 +67,10 @@ public:
         std::size_t written = 0;
         while (written < buf.size()) {
             auto n = socket_.write(std::span(buf).subspan(written));
-            if (n) {
-                written += *n;
+            if (n.ok()) {
+                written += n.n;
             } else {
-                std::this_thread::sleep_for(1ms); // EWOULDBLOCK -- kernel send buffer momentarily full
+                std::this_thread::sleep_for(1ms); // WouldBlock -- kernel send buffer momentarily full
             }
         }
     }
@@ -89,8 +91,9 @@ public:
                 return std::nullopt;
             }
             std::array<std::byte, 512> chunk{};
-            if (auto n = socket_.read(chunk); n && *n > 0) {
-                buffer_.insert(buffer_.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*n));
+            const auto n = socket_.read(chunk);
+            if (n.ok() && n.n > 0) {
+                buffer_.insert(buffer_.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(n.n));
             } else {
                 std::this_thread::sleep_for(1ms);
             }

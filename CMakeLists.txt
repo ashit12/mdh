@@ -152,6 +152,14 @@ add_library(mdh_core
 target_include_directories(mdh_core PUBLIC include)
 target_compile_options(mdh_core PRIVATE ${MDH_WARNING_FLAGS})
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(mdh_core PRIVATE src/net/epoll_poller.cpp)
+elseif(APPLE OR CMAKE_SYSTEM_NAME MATCHES "BSD")
+    target_sources(mdh_core PRIVATE src/net/kqueue_poller.cpp)
+else()
+    message(FATAL_ERROR "mdh requires epoll (Linux) or kqueue (macOS/BSD)")
+endif()
+
 # ── Experimental: boost::unordered_flat_map for MatchingBook's order index ──
 # A/B toggle only, OFF by default (std::unordered_map, unchanged). Isolates
 # exactly one type swap in matching_book.hpp behind MDH_USE_BOOST_FLAT_MAP so
@@ -254,6 +262,7 @@ add_executable(mdh_tests
     tests/test_replay_e2e.cpp
     tests/test_udp_socket.cpp
     tests/test_tcp_socket.cpp
+    tests/test_io_poller.cpp
     tests/test_packet_framing.cpp
     tests/test_packet_sequence_tracker.cpp
     tests/test_udp_receiver.cpp
@@ -377,4 +386,8 @@ if(MDH_BUILD_BENCHMARKS)
     add_executable(bench_matching_memory benchmarks/bench_matching_memory.cpp)
     target_link_libraries(bench_matching_memory PRIVATE mdh_core)
     target_compile_options(bench_matching_memory PRIVATE ${MDH_WARNING_FLAGS})
+
+    add_executable(bench_capacity benchmarks/bench_capacity.cpp)
+    target_link_libraries(bench_capacity PRIVATE mdh_core)
+    target_compile_options(bench_capacity PRIVATE ${MDH_WARNING_FLAGS})
 endif()

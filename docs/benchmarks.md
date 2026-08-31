@@ -18,7 +18,7 @@ cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j --target \
     bench_protocol_codec bench_matching_engine bench_order_book \
     bench_spsc_queue bench_end_to_end_latency bench_order_path_latency \
-    bench_matching_workload bench_matching_memory
+    bench_matching_workload bench_matching_memory bench_capacity
 
 ./build-release/bench_protocol_codec
 ./build-release/bench_matching_engine
@@ -28,10 +28,14 @@ cmake --build build-release -j --target \
 ./build-release/bench_order_path_latency          # staged TCP latency/load/syscalls
 ./build-release/bench_matching_workload
 ./build-release/bench_matching_memory
+./build-release/bench_capacity --scenario all   # matching-thread ceiling, e2e knee, queues, fairness, recovery
 ```
 
 `bench_order_path_latency` is the primary order-path harness; see
-[`docs/latency_benchmark.md`](latency_benchmark.md). The older
+[`docs/latency_benchmark.md`](latency_benchmark.md). Capacity and failure-path
+questions (matching-thread ceiling, offered-rate knee, connection scaling,
+queue drops, fairness, snapshot recovery, soak) are `bench_capacity` in that
+same document. The older
 `bench_end_to_end_latency` remains useful for its canned transport-floor
 comparison.
 
@@ -288,7 +292,10 @@ found by guessing — the condition-variable change alone accounts for essential
 of the ~17x median improvement; `TCP_NODELAY` was a real, previously-unexamined
 gap (worth fixing regardless, since it has no downside for this protocol) but a
 secondary contributor on loopback, where ACKs return almost instantly regardless of
-Nagle's algorithm.
+Nagle's algorithm. The later replacement of per-connection reader/writer
+threads with a single `IoPoller` I/O thread is documented in
+[`docs/latency_benchmark.md`](latency_benchmark.md) §20; the ~73 µs p50
+above is the CV-wakeup measurement, not that later change.
 
 ---
 

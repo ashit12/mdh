@@ -5,10 +5,10 @@
 
 namespace mdh::exchange::ledger {
 
-void Ledger::deposit_cash(AccountId account_id, Balance amount) { accounts_[account_id].cash_total += amount; }
+void Ledger::deposit_cash(AccountId account_id, Balance amount) { account_ref(account_id).cash_total += amount; }
 
 void Ledger::deposit_position(AccountId account_id, InstrumentId instrument_id, Quantity amount) {
-    accounts_[account_id].position_total[instrument_id] += amount;
+    account_ref(account_id).position_total[instrument_id] += amount;
 }
 
 Balance Ledger::available_cash(AccountId account_id) const {
@@ -54,25 +54,30 @@ void Ledger::open_hold(AccountId account_id, ClientOrderId client_order_id, Inst
     if (quantity == 0) {
         return; // nothing to reserve (e.g. a GTC order that fully matched immediately, see on_order_replaced)
     }
-    AccountBalances& balances_ref = accounts_[account_id];
+    AccountBalances& balances_ref = account_ref(account_id);
     if (side == Side::Buy) {
         balances_ref.cash_reserved += static_cast<Balance>(quantity) * limit_price;
     } else {
         balances_ref.position_reserved[instrument_id] += quantity;
     }
-    holds_[HoldKey{account_id, client_order_id}] = Hold{
-        .instrument_id = instrument_id,
-        .side = side,
-        .limit_price = limit_price,
-        .remaining = quantity,
-    };
+    const HoldKey key{account_id, client_order_id};
+    const auto [it, inserted] = holds_.insert_or_assign(key, Hold{
+                                                               .instrument_id = instrument_id,
+                                                               .side = side,
+                                                               .limit_price = limit_price,
+                                                               .remaining = quantity,
+                                                           });
+    (void)it;
+    if (inserted) {
+        hold_count_->fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void Ledger::release_hold_fully(AccountId account_id, const Hold& hold) {
     if (hold.remaining == 0) {
         return;
     }
-    AccountBalances& balances_ref = accounts_[account_id];
+    AccountBalances& balances_ref = account_ref(account_id);
     if (hold.side == Side::Buy) {
         balances_ref.cash_reserved -= static_cast<Balance>(hold.remaining) * hold.limit_price;
     } else {
@@ -82,7 +87,7 @@ void Ledger::release_hold_fully(AccountId account_id, const Hold& hold) {
 
 void Ledger::settle_leg(const TradeCounterparty& leg, Side side, InstrumentId instrument_id, Price trade_price,
                          Quantity trade_quantity) {
-    AccountBalances& balances_ref = accounts_[leg.account_id];
+    AccountBalances& balances_ref = account_ref(leg.account_id);
 
     const auto hold_it = holds_.find(HoldKey{leg.account_id, leg.client_order_id});
     if (hold_it != holds_.end()) {
@@ -101,7 +106,7 @@ void Ledger::settle_leg(const TradeCounterparty& leg, Side side, InstrumentId in
         }
         hold.remaining = leg.remaining_quantity;
         if (hold.remaining == 0) {
-            holds_.erase(hold_it);
+            erase_hold(hold_it);
         }
     }
     // Settlement (moving `total`) happens whether or not a hold existed --
@@ -134,7 +139,7 @@ void Ledger::on_order_replaced(const OrderReplaced& event) {
     }
     const Hold old_hold = it->second;
     release_hold_fully(event.account_id, old_hold);
-    holds_.erase(it);
+    erase_hold(it);
     // Uniform for both of MatchingEngine's replace paths (priority-
     // preserving and cancel-plus-new): release the old hold in full, then
     // open a fresh one at the new price/quantity. When price is unchanged
@@ -150,7 +155,7 @@ void Ledger::on_order_cancelled(const OrderCancelled& event) {
         return; // nothing was ever held for this order (should not happen; see on_order_replaced's comment)
     }
     release_hold_fully(event.account_id, it->second);
-    holds_.erase(it);
+    erase_hold(it);
 }
 
 void Ledger::on_trade_executed(const TradeExecuted& event) {
@@ -176,6 +181,19 @@ void Ledger::apply(const ExchangeEvent& event) {
             // why Book* events are deliberately anonymous) -- no-ops.
         },
         event);
+}
+
+AccountBalances& Ledger::account_ref(AccountId account_id) {
+    auto [it, inserted] = accounts_.try_emplace(account_id);
+    if (inserted) {
+        account_count_->fetch_add(1, std::memory_order_relaxed);
+    }
+    return it->second;
+}
+
+void Ledger::erase_hold(std::unordered_map<HoldKey, Hold, HoldKeyHash>::iterator it) {
+    holds_.erase(it);
+    hold_count_->fetch_sub(1, std::memory_order_relaxed);
 }
 
 } // namespace mdh::exchange::ledger

@@ -80,8 +80,10 @@ TEST(OrderEntryClient, SendEncodesAndWritesAWholeFrameThePeerCanDecode) {
 
     OrderEntryClient client([](const Message&) {});
     ASSERT_TRUE(client.connect("127.0.0.1", port));
-    auto peer = listener.accept();
-    ASSERT_TRUE(peer.has_value());
+    auto accepted = listener.accept();
+    ASSERT_EQ(accepted.status, IoStatus::Ok);
+    ASSERT_TRUE(accepted.socket.has_value());
+    auto& peer = *accepted.socket;
 
     const Message sent{NewOrder{.account_id = 1,
                                  .client_order_id = 2,
@@ -98,9 +100,9 @@ TEST(OrderEntryClient, SendEncodesAndWritesAWholeFrameThePeerCanDecode) {
     const auto expected_size = HEADER_SIZE + payload_size_for(MessageType::NewOrder);
     const auto deadline = std::chrono::steady_clock::now() + 1000ms;
     while (received.size() < expected_size && std::chrono::steady_clock::now() < deadline) {
-        auto n = peer->read(chunk);
-        if (n && *n > 0) {
-            received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*n));
+        auto n = peer.read(chunk);
+        if (n.ok() && n.n > 0) {
+            received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(n.n));
         }
     }
     ASSERT_EQ(received.size(), expected_size);
@@ -119,8 +121,10 @@ TEST(OrderEntryClient, MessagesWrittenByThePeerArriveViaTheSinkInOrder) {
     MessageCollector collector;
     OrderEntryClient client(std::ref(collector));
     ASSERT_TRUE(client.connect("127.0.0.1", port));
-    auto peer = listener.accept();
-    ASSERT_TRUE(peer.has_value());
+    auto accepted = listener.accept();
+    ASSERT_EQ(accepted.status, IoStatus::Ok);
+    ASSERT_TRUE(accepted.socket.has_value());
+    auto& peer = *accepted.socket;
 
     const Message first{Accepted{.account_id = 1,
                                   .client_order_id = 2,
@@ -141,7 +145,7 @@ TEST(OrderEntryClient, MessagesWrittenByThePeerArriveViaTheSinkInOrder) {
     std::vector<std::byte> buf;
     encode_message(first, buf);
     encode_message(second, buf);
-    ASSERT_TRUE(peer->write(buf).has_value());
+    ASSERT_TRUE(peer.write(buf).ok());
 
     ASSERT_TRUE(collector.wait_for_count(2));
     const auto messages = collector.messages();
@@ -157,8 +161,9 @@ TEST(OrderEntryClient, DisconnectUnblocksTheReaderThreadAndIsIdempotent) {
 
     OrderEntryClient client([](const Message&) {});
     ASSERT_TRUE(client.connect("127.0.0.1", port));
-    auto peer = listener.accept();
-    ASSERT_TRUE(peer.has_value());
+    auto accepted = listener.accept();
+    ASSERT_EQ(accepted.status, IoStatus::Ok);
+    ASSERT_TRUE(accepted.socket.has_value());
 
     client.disconnect();
     client.disconnect(); // safe to call again -- must not hang or crash
@@ -175,8 +180,9 @@ TEST(OrderEntryClient, IsConnectedBecomesFalseAfterThePeerCloses) {
     ASSERT_TRUE(client.is_connected());
 
     {
-        auto peer = listener.accept();
-        ASSERT_TRUE(peer.has_value());
+        auto accepted = listener.accept();
+        ASSERT_EQ(accepted.status, IoStatus::Ok);
+        ASSERT_TRUE(accepted.socket.has_value());
     } // peer's destructor closes its socket -- an orderly EOF for the client's reader thread
 
     const auto deadline = std::chrono::steady_clock::now() + 1000ms;

@@ -34,10 +34,10 @@ bool OrderEntryClient::send(const protocol::order_entry::Message& message) {
     std::size_t written = 0;
     while (written < write_buffer_.size()) {
         auto n = socket_.write(std::span(write_buffer_).subspan(written));
-        if (!n || *n == 0) {
+        if (!n.ok() || n.n == 0) {
             return false;
         }
-        written += *n;
+        written += n.n;
     }
     return true;
 }
@@ -55,10 +55,10 @@ void OrderEntryClient::reader_loop() {
     std::array<std::byte, 4096> chunk{};
     while (true) {
         auto n = socket_.read(chunk);
-        if (!n || *n == 0) {
-            break; // error, peer EOF, or shutdown() from disconnect() -- this session is done either way
+        if (!n.ok() || n.n == 0) {
+            break; // error, WouldBlock on a blocking socket, peer EOF, or shutdown()
         }
-        read_buffer_.insert(read_buffer_.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*n));
+        read_buffer_.insert(read_buffer_.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(n.n));
 
         while (true) {
             auto header_result = decode_header(read_buffer_);

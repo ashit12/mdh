@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -148,6 +149,19 @@ public:
     // same orders rest on both.
     [[nodiscard]] EngineStateSnapshot snapshot() const;
 
+    // Directory size: how many orders currently rest. Safe from any thread.
+    [[nodiscard]] std::size_t resting_order_count() const {
+        return resting_orders_->load(std::memory_order_relaxed);
+    }
+
+    struct BookMemoryStats {
+        std::size_t live_orders = 0;
+        std::size_t slab_capacity = 0;
+    };
+
+    // Sum of per-book slab occupancy. Matching-thread or after stop() only.
+    [[nodiscard]] BookMemoryStats book_memory_stats() const;
+
 private:
     static constexpr std::uint32_t kNoSlot = ~0U;
 
@@ -261,6 +275,7 @@ private:
     std::vector<std::pair<InstrumentId, std::uint32_t>> by_id_;
 
     std::pmr::unordered_map<LiveKey, OrderRef, LiveKeyHash> orders_;
+    std::unique_ptr<std::atomic<std::size_t>> resting_orders_ = std::make_unique<std::atomic<std::size_t>>(0);
 
     // Engine-owned counters -- no clock, no randomness, so a replay produces
     // the same numbers.

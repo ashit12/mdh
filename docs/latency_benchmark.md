@@ -27,6 +27,11 @@ The primary harness is `bench_order_path_latency`. It:
 These two surfaces print on every TCP run. They are different ceilings.
 Matcher ops/s is not the exchange's throughput.
 
+**Matching-thread ceiling and the other capacity questions** live in
+`bench_capacity`, not here. Empty-book IOC `MatchingEngine::process()` is a
+microbenchmark of the matcher in isolation; it is **not** the headline
+matching-thread number. See [§ Capacity program](#capacity-program) below.
+
 `trading_server` is not spawned as a second process: its order-entry surface **is**
 `OrderEntryGateway` over TCP. Spawning the UI/UDP process would confound the
 measurement with HTTP and market-data publish. Cross-process tracing would also need
@@ -60,12 +65,14 @@ continuing unlocked.
 §16. Idle: many long-lived sessions, one active sender; see §18. `--workload
 multi --max-clients N` sweeps 1, 2, 4, … N flood clients (default N=16).
 
-Production is always matcher `yield()` plus a sleeping per-connection writer
-with opportunistic outbound batching (default `--writer-batch 4`; never waits
-to fill). `--writer-batch` remains so the §14.3 tables can be reproduced.
-Wait-policy and shared-writer switches were measurement tools; they are
-documented in §13–§14 and were removed from the tree after those experiments
-(see §15).
+Production is matcher `yield()` plus **one** `IoPoller` I/O thread
+(`kqueue` on macOS/BSD, `epoll` on Linux) with opportunistic outbound
+batching (default `--writer-batch 4`; never waits to fill). Matching never
+writes a socket; it enqueues onto a per-connection SPSC and wakes the poller
+via a dirty list. `--writer-batch` remains so the §14.3 tables can be
+reproduced. Wait-policy and shared-writer switches, and later the
+per-connection reader/writer threads, were measurement tools or superseded
+architecture; they are documented in §13–§15 and §20.
 
 Debug and sanitizer builds are not comparable to the tables below.
 
@@ -105,12 +112,12 @@ the same slot (`t5` first and last, report counts).
 | Stamp | Where | Meaning |
 |---|---|---|
 | **T0** | `OrderEntryClient::send()`, before encode | Client submit |
-| **T1** | Gateway reader, after a complete frame decodes | Server has the order |
+| **T1** | Gateway I/O thread, after a complete frame decodes | Server has the order |
 | **T2** | Matching thread, before `RiskGatedEngine::process` | Exchange processing begins |
 | **T3a** | `deliver()`, first private report queued | First execution event |
 | **T3** | Matching thread, after `process` returns | Exchange processing complete (includes routing onto the outbound SPSC queue) |
-| **T4a** | Same `deliver()` | Handed to the connection writer queue |
-| **T4** | Writer thread, after `write()` completes | Response left the server socket |
+| **T4a** | Same `deliver()` | Handed to the connection outbound queue (dirty-list wake of the I/O thread) |
+| **T4** | I/O thread, after `write()` completes | Response left the server socket |
 | **T5** | Client reader, after decode, before the user sink | Client has the first execution report |
 
 Derived intervals:
@@ -120,7 +127,7 @@ Derived intervals:
 | `client_to_server` | T1 − T0 | Client encode + `write()`, loopback TCP, server `read()` + decode |
 | `server_pre_match` | T2 − T1 | Ownership claim, lock-free MPSC `submit()`, matching-thread wakeup, then `CommandSequencer` immediately before `process` |
 | `exchange_processing` | T3 − T2 | Risk + ledger + matching + `route_event()` (no writer `write()`) |
-| `writer_handoff` | T4 − T4a | Writer wakeup, encode, `write()` |
+| `writer_handoff` | T4 − T4a | I/O-thread wake (dirty list / poller), encode, `write()` |
 | `server_to_client` | T5 − T4 | Loopback TCP + client `read()` + decode |
 | `end_to_end` | T5 − T0 | First execution report back to the client |
 
@@ -155,7 +162,7 @@ not change wire contents.
 | **Sequential** | One client; wait for T5 before the next send. Minimal queueing. |
 | **Sustained** | One client; offered 1k / 10k / 50k / 100k orders/s. If send falls behind the schedule, the harness **does not** accumulate debt into a catch-up burst; achieved rate is reported. |
 | **Multi-client** | Powers of two up to `--max-clients` (default 16). Each client blasts its sample count then waits. This is an in-flight flood, not a paced fair-share test, and not a model of member-firm sessions. |
-| **Idle population** | Powers of two up to `--idle-clients`. All sessions stay connected; **one** sends sequential IOCs. This is the thread-per-connection tax. Not part of `all`. |
+| **Idle population** | Powers of two up to `--idle-clients`. All sessions stay connected; **one** sends sequential IOCs. Historically the 2N+2 thread-per-connection tax (§18); now fd/poller cost plus N client readers (§20). Not part of `all`. |
 | **Burst** | 8 clients; 40 rounds of 100 orders then 10 ms idle. |
 | **Matching-core** | Same IOC empty-book command, `MatchingEngine::process()` only. Always printed with TCP runs. |
 
@@ -602,11 +609,6 @@ The shared writer:
 The matching thread still only enqueues. It never writes or waits for socket
 writability.
 
-This is a portable first step, not the final event loop. A production shared
-writer should replace the 100 µs blocked-socket retry with a readiness backend:
-`kqueue` on macOS/BSD and `epoll` on Linux behind one abstraction (with `poll`
-as a portable fallback).
-
 ### 14.5 Per-connection versus shared writer
 
 Shared writer was an experimental second architecture. It is no longer in
@@ -709,24 +711,25 @@ touch TCP order entry.
 - Benchmark floods are deliberately unpaced and amplify socket-buffer and
   scheduler effects; high-N results require ranges, not one lucky run.
 - Metrics count server I/O only.
-- Server I/O remains one blocking reader thread and one sleeping writer
-  thread per connection.
+- Server I/O at the time of this milestone was still one blocking reader
+  thread and one sleeping writer thread per connection. That is no longer
+  production; see §20.
 
 The remaining knee is T0→T1 and T4→T5 (TCP in-flight), not the matcher.
 
 ---
 
-## 15. Settled production path
+## 15. Settled production path (after MPSC / batching; before IoPoller)
 
 After the MPSC, busy-spin, batching, and shared-writer measurements, production
-is one path:
+was one path **until the I/O multiplexer in §20**:
 
 ```text
 reader threads → MPSC → single matcher → bounded per-connection outbound queues
                                         → sleeping per-connection writers
 ```
 
-- Matcher idle is `std::this_thread::yield()`. Writers sleep on `wake_cv`.
+- Matcher idle is `std::this_thread::yield()`. Writers slept on `wake_cv`.
 - Outbound batching is opportunistic and capped at 4 by default: encode
   whatever is already queued, then `write()` immediately.
 - Matching never writes sockets. A full outbound queue drops the report.
@@ -738,12 +741,15 @@ reader threads → MPSC → single matcher → bounded per-connection outbound q
   were not.
 
 The remaining bench-only knob is `--writer-batch N` (default 4) so §14.3 can
-be reproduced without a second writer architecture.
+be reproduced without a second writer architecture. That knob still applies
+on the IoPoller I/O thread.
 
 Verification after this simplification: Debug 479 tests passed; ASan+UBSan and
 TSan 472 each with `UdpReplayE2E.*` excluded (same unrelated UDP-replay
 limitation as §14.9). Four experimental tests were deleted with the
 implementations they covered.
+
+§18–§19 numbers were taken on this 2N+2 path. Current production is §20.
 
 ---
 
@@ -926,20 +932,25 @@ A real order-entry gateway serves member firms: a bounded population of
 long-lived, well-behaved sessions (tens to low thousands), not tens of
 thousands of anonymous connections. This is not a consumer-facing API
 gateway. The useful question is not a round concurrent-user number. It is
-whether this thread-per-connection design's knee sits above or below that
-population.
+where the connection-count knee sits for that population.
 
-The default `multi` workload does not answer that. It is an in-flight flood:
-every client sends as fast as `write()` allows, then waits. That stresses
-queue depth and loopback TCP, and it already leaves sequential-RTT territory
-at two clients. Raising `--max-clients` past 16 does not suddenly reveal a
-hidden 10k-user path. It confirms the flood is a latency pile-up, with
-occasional scheduler storms when too many hot threads share a laptop.
+The tables in this section were measured on the **2N+2 thread-per-connection
+gateway** of §15. They remain the record of that tax. Current production is
+one I/O thread plus the matcher (§20); re-running idle/flood now measures
+poller + N client reader threads, not 2N gateway threads.
 
-The idle-population workload is the thread-count test: N sessions stay
-connected (gateway reader blocked in `read()`, writer asleep on the CV,
-client reader likewise idle) and **one** session sends sequential IOCs.
-Server thread count is `2N+2`.
+The default `multi` workload does not answer member-firm capacity. It is an
+in-flight flood: every client sends as fast as `write()` allows, then waits.
+That stresses queue depth and loopback TCP, and it already leaves
+sequential-RTT territory at two clients. Raising `--max-clients` past 16
+does not suddenly reveal a hidden 10k-user path. It confirms the flood is a
+latency pile-up, with occasional scheduler storms when too many hot threads
+share a laptop.
+
+The idle-population workload is the thread-count test for **that**
+architecture: N sessions stay connected (gateway reader blocked in `read()`,
+writer asleep on the CV, client reader likewise idle) and **one** session
+sends sequential IOCs. Server thread count was `2N+2`.
 
 ```bash
 ./build-release/bench_order_path_latency --workload multi --max-clients 64 --multi-samples 800
@@ -956,7 +967,7 @@ rest (~169 ns) or with a filled book.
 | Surface | Achieved | What it includes |
 |---|---|---|
 | Matching-core only (`MatchingEngine::process`) | **~55–82 M/s** (12–18 ns/op) | Matcher, discard sink, no sockets, no risk, no ledger |
-| TCP sequential (1 session, wait for reply) | **~11 k/s** (~73 µs p50) | Real loopback TCP, 2+2 server threads, risk, ledger, routing, client reader |
+| TCP sequential (1 session, wait for reply) | **~11 k/s** (~73 µs p50) | Real loopback TCP, 2+2 server threads of the §15 gateway, risk, ledger, routing, client reader |
 | TCP pipelined (1 session, no wait, §14) | **~35–42 k/s** | Same path, in-flight queueing; e2e is then mostly wait in the pipeline |
 
 The matcher has two orders of magnitude of headroom over the TCP path for
@@ -1011,10 +1022,10 @@ on the flat part of this curve on this laptop. A few hundred is the beginning
 of the tax. A thousand thread-pairs is past the design. That is the number
 this architecture owns, not "10k concurrent users."
 
-Linux with pinned cores and `epoll` instead of one blocking thread per
-direction would move this knee; it would not turn the matcher into the
-limiter. The matcher was never the limiter on this path. §19 is the Linux
-pinned-core measurement of that claim.
+Linux with pinned cores would still move this knee; it would not turn the
+matcher into the limiter. The matcher was never the limiter on this path.
+§19 is the Linux pinned-core measurement of that claim, still on 2N+2.
+§20 is the later replacement of those 2N gateway I/O threads with `IoPoller`.
 
 ---
 
@@ -1056,7 +1067,7 @@ Final placement:
 
 | CPUs | Role |
 |---|---|
-| CPU0 + CPU2 | Benchmark client, TCP gateway readers/writers, accept thread, general process / housekeeping |
+| CPU0 + CPU2 | Benchmark client, TCP gateway readers/writers, accept thread, general process / housekeeping (2N+2 gateway of §15) |
 | CPU1 | Matching thread only |
 | CPU3 | Offline |
 
@@ -1205,7 +1216,7 @@ Tried, then discarded:
 |---|---|
 | THP always vs never | No meaningful improvement. Keep the distro default. |
 | IRQ affinity | No useful gain; tails sometimes worse. Reverted. |
-| Whole-process `SCHED_FIFO` | Disastrous. Starved other threads; multi-second latency. Never use whole-process real-time scheduling for this thread-per-connection design. |
+| Whole-process `SCHED_FIFO` | Disastrous. Starved other threads; multi-second latency. Never use whole-process real-time scheduling for this many concurrent I/O threads. |
 | `sched_autogroup_enabled=0` | Did not help. Restored to enabled. |
 | Larger TCP socket buffers | Not pursued: localhost tiny-message latency is not buffer-capacity limited. |
 | `TCP_NODELAY` | Already enabled. |
@@ -1256,4 +1267,82 @@ for matching, and CPU3 offline. Matcher idle stays `yield()`; busy-spin was
 measured and not kept. The trap to remember: `taskset` without
 `--matching-cpu` pins the matcher to the housekeeping set, and the resulting
 hundreds of microseconds look like a `yield()` problem they are not.
+
+---
+
+## 20. IoPoller I/O thread (current production, 2026-08-31)
+
+The tables in §1–§19 were measured against the 2N+2 gateway of §15.
+Production I/O is now one thread on `IoPoller` (`kqueue` on this macOS
+checkout, `epoll` on Linux) plus the matching thread.
+
+```text
+OrderEntryClient  (blocking send + one reader thread per client)
+        │
+        ▼  TCP
+gateway I/O thread   IoPoller: accept, read, write; partial read/write buffers
+        │            MatchingPipeline::submit() (MPSC)
+        ▼
+matching thread      yield() when idle; never writes a socket
+        │            per-connection outbound SPSC + dirty-list wake
+        ▼
+same I/O thread      encode up to writer_batch, write()
+```
+
+Stamp meanings in §3 match this path: T1 and T4 are the I/O thread, not a
+per-connection reader or writer. `writer_handoff` is poller wake + encode +
+`write()`. `--writer-batch` still caps how many already-queued reports go
+into one `write()`; it never waits to fill. `TcpSocket::read`/`write`/
+`accept` return a tri-state (`Ok` / `WouldBlock` / `Error`) so EAGAIN is not
+collapsed into a disconnect.
+
+`bench_order_path_latency` now prints `2 server threads (IoPoller I/O +
+matcher)` plus N client readers. `--workload idle` therefore no longer
+stresses 2N gateway threads; it stresses registered fds, the poller, and
+the in-process client readers. Connection scaling at a **low** rate per
+session is `bench_capacity --scenario connections`, not the flood `multi`
+workload.
+
+Do not rewrite the historical IOC tables above. They remain valid for that
+command shape on that architecture. Do not mix them with a re-run on
+IoPoller as if they were the same experiment.
+
+---
+
+## Capacity program
+
+`bench_order_path_latency` answers staged TCP latency for IOC-on-empty-book.
+The questions below are a different program: mixed traffic, production queue
+sizes (1024 ingest / 1024 outbound / 8192 market-data), and failure paths.
+The harness is `bench_capacity`.
+
+```bash
+cmake --build build-release -j --target bench_capacity
+./build-release/bench_capacity --scenario matching-thread
+./build-release/bench_capacity --scenario e2e-knee
+./build-release/bench_capacity --scenario connections
+./build-release/bench_capacity --scenario queue-drops
+./build-release/bench_capacity --scenario fairness
+./build-release/bench_capacity --scenario recovery
+./build-release/bench_capacity --scenario soak --soak-hours 4
+./build-release/bench_capacity --scenario all          # 1, 2, 4, 5, 6 — not connections or soak
+./build-release/bench_capacity --quick --scenario all   # shorter streams for a smoke run
+```
+
+Shared mix: 40% rest / 25% cross / 20% cancel / 10% replace / 5% IOC-FOK,
+1000 orders/side seed, 64-tick band (`WorkloadMix::realistic()`).
+
+| Scenario | Question | Headline |
+|---|---|---|
+| `matching-thread` | How many commands/s can the **production matching thread** do with zero sockets? | `CommandSequencer` → `RiskGatedEngine` (risk + ledger) → `MatchingEngine::process`. Empty-book IOC `process()` is a footnote, not this number. |
+| `e2e-knee` | At what offered TCP rate does achieved stop tracking and p99.9 blow up? | Geometric sweep from 5k/s; last tracking rate, first failure, achieved plateau. Mixed GTC, not a 100k token target. |
+| `connections` | Does 2 server threads stay healthy as N grows with **low** rate per connection? | 1, 10, 100, 1k, 2k, 5k, 10k. Spawn/connect failure is a result, not a harness bug. This process also has N client readers. |
+| `queue-drops` | When does each bounded queue actually drop, and what does a client see? | Ingest MPSC: `submit()` false; gateway currently **silent** (no Rejected). Outbound SPSC: engine committed, missing reports. MD `DroppingQueue`: detectable sequence gap. If TCP never fills ingest, that is reported; in-process flood is the matching-thread backpressure point. |
+| `fairness` | Does a polite client's p99 stay near isolation when others flood? | One 1k/s client vs N flooders; polite-only percentiles. |
+| `recovery` | How long is a subscriber blind after a gap? | `read_snapshot` + book rebuild vs depth. Lost sequences are **not** replayed (no retransmission). Second clock: UDP listen drain during delayed recovery. |
+| `soak` | Do RSS / resting orders / ledger maps / queue HWMs stay flat for hours? | Default 4h below the e2e knee. Latency tracing is off so the tracer ring cannot look like a leak. Sample interval 30s (`--quick` is 2s). |
+
+Do not rewrite the historical IOC tables in the sections above. They remain
+valid for that command shape. Do not mix them with the matching-thread mixed
+headline or with a mixed-GTC TCP knee.
 

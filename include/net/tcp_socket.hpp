@@ -8,6 +8,19 @@
 
 namespace mdh::net {
 
+// Distinguishes a successful transfer from "the socket is fine but nothing
+// is ready" (EAGAIN/EWOULDBLOCK on a non-blocking fd) from a real failure.
+// Blocking I/O never produces WouldBlock; collapsing that into Error used
+// to be safe and is no longer, once the gateway waits on epoll/kqueue.
+enum class IoStatus : std::uint8_t { Ok, WouldBlock, Error };
+
+struct IoResult {
+    IoStatus status = IoStatus::Error;
+    std::size_t n = 0; // bytes moved; read Ok with n==0 is peer EOF
+
+    [[nodiscard]] bool ok() const { return status == IoStatus::Ok; }
+};
+
 // RAII wrapper over a POSIX TCP stream socket -- the
 // order-entry gateway's transport primitive, the same role UdpSocket plays
 // for market data. Uses the same BSD sockets API as UdpSocket (shared by
@@ -48,20 +61,22 @@ public:
     [[nodiscard]] bool listen(std::uint16_t port, int backlog = 16);
 
     // Server side. Accepts one pending connection, if any, returning it as
-    // a new, already-connected TcpSocket. Returns std::nullopt if none is
-    // currently pending -- including EWOULDBLOCK/EAGAIN when this
-    // (listening) socket is non-blocking -- or on any other error.
+    // a new, already-connected TcpSocket. WouldBlock means none is currently
+    // pending (including EAGAIN/EWOULDBLOCK on a non-blocking listener).
+    // Error is every other failure, including EMFILE/ENFILE -- the gateway
+    // must not treat those as "try accept again immediately."
     //
-    // ── Why the gateway must call this in a non-blocking poll loop ──────
-    // See this class's shutdown() doc comment: unlike a blocked read() on
-    // an already-connected socket, a thread blocked *inside* accept() on a
-    // listening socket cannot be reliably unblocked from another thread on
-    // every platform this project targets. accept() itself has no timeout
-    // parameter, so the only portable way to make an accept loop stoppable
-    // is to never block in accept() at all -- put the listening socket in
-    // non-blocking mode (set_non_blocking()) and poll this method against a
-    // stop_token instead.
-    [[nodiscard]] std::optional<TcpSocket> accept();
+    // An accepted socket is blocking by default even when this listener is
+    // not: on BSD/macOS, accept() inherits O_NONBLOCK, and this method
+    // clears it so a freshly accepted TcpSocket matches a freshly
+    // constructed one. The gateway then calls set_non_blocking() itself.
+    //
+    // AcceptResult holds an optional<TcpSocket>, so it cannot be defined
+    // until TcpSocket is complete; it is declared here and defined just
+    // below the class. A declaration may return an incomplete type as long
+    // as the definition does not, which is why this compiles.
+    struct AcceptResult;
+    [[nodiscard]] AcceptResult accept();
 
     // Client side. Connects to host:port. `host` must be an IPv4
     // dotted-decimal literal (e.g. "127.0.0.1") -- no DNS resolution, same
@@ -88,51 +103,49 @@ public:
     // until it has a complete frame, never assume one read() equals one
     // message.
     //
-    // Returns 0 if the peer performed an orderly shutdown (end of stream);
-    // returns std::nullopt on error, including EWOULDBLOCK/EAGAIN when this
-    // socket is non-blocking and nothing is currently available to read.
-    [[nodiscard]] std::optional<std::size_t> read(std::span<std::byte> buf);
+    // Ok with n==0 is peer EOF. WouldBlock is EAGAIN/EWOULDBLOCK. EINTR is
+    // retried internally and never surfaces.
+    [[nodiscard]] IoResult read(std::span<std::byte> buf);
 
     // Writes data, up to data.size() bytes. Same partial-transfer caveat as
     // read(): a return value smaller than data.size() is normal (e.g. the
     // kernel's send buffer is momentarily full) -- this method does not
     // loop internally to force a full write, so a caller with more data
     // than fits in one call must retry with the unwritten remainder itself.
-    // Returns std::nullopt on error.
-    [[nodiscard]] std::optional<std::size_t> write(std::span<const std::byte> data);
+    [[nodiscard]] IoResult write(std::span<const std::byte> data);
 
     // Puts the socket into non-blocking mode -- same semantics as
     // UdpSocket::set_non_blocking(). Applies to whichever operation this
     // socket is later used for: accept() on a listening socket, or
-    // read()/write() on a connected one.
-    void set_non_blocking();
+    // read()/write() on a connected one. Returns false if the fd is closed
+    // or fcntl fails.
+    [[nodiscard]] bool set_non_blocking();
 
     // Disables further send and receive on this socket (POSIX shutdown()
     // with SHUT_RDWR). The primary purpose here is unblocking a *different*
     // thread that is currently blocked inside read() on this same,
-    // already-connected socket -- e.g. a connection's reader thread being
+    // already-connected socket -- e.g. OrderEntryClient's reader being
     // asked to stop -- which is a reliable, portable operation for a
     // connected stream socket on both Linux and macOS.
     //
-    // ── Platform caveat: does NOT reliably unblock a blocked accept() ───
-    // On Linux, calling shutdown() on a *listening* socket also reliably
-    // unblocks a thread blocked inside accept() on it. On macOS, it does
-    // not -- a thread already blocked in accept() can remain blocked
-    // indefinitely even after shutdown() returns success on that socket.
-    // Since this project is developed and must behave correctly on both
-    // platforms, nothing here may depend on that Linux-only behavior:
-    // accept() is always driven from a non-blocking poll loop instead (see
-    // accept()'s own doc comment), and shutdown() is used only for its
-    // portable purpose -- unblocking a blocked read() on a connected
-    // socket, not a blocked accept() on a listening one.
+    // The gateway's I/O thread no longer blocks in read() or accept(); it
+    // waits on IoPoller. shutdown() is still used there to fail in-flight
+    // syscalls when tearing a single connection down.
     void shutdown();
 
     [[nodiscard]] int raw_fd() const { return fd_; }
 
 private:
-    explicit TcpSocket(int fd) : fd_(fd) {} // used by accept() to wrap the newly-accepted fd
+    explicit TcpSocket(int fd) : fd_(fd) {}
 
     int fd_ = -1;
 };
+
+struct TcpSocket::AcceptResult {
+    IoStatus status = IoStatus::Error;
+    std::optional<TcpSocket> socket;
+};
+
+using AcceptResult = TcpSocket::AcceptResult;
 
 } // namespace mdh::net

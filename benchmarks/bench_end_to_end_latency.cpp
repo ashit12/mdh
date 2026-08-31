@@ -61,7 +61,7 @@ class LatencyClient {
 public:
     [[nodiscard]] bool connect_to(std::uint16_t port) {
         if (!socket_.connect("127.0.0.1", port)) return false;
-        socket_.set_non_blocking();
+        if (!socket_.set_non_blocking()) return false;
         return true;
     }
 
@@ -71,8 +71,8 @@ public:
         std::size_t written = 0;
         while (written < buf.size()) {
             auto n = socket_.write(std::span(buf).subspan(written));
-            if (n) {
-                written += *n;
+            if (n.ok()) {
+                written += n.n;
             } else {
                 std::this_thread::sleep_for(1ms);
             }
@@ -85,8 +85,8 @@ public:
             if (auto message = try_decode_one()) return message;
             if (std::chrono::steady_clock::now() >= deadline) return std::nullopt;
             std::array<std::byte, 512> chunk{};
-            if (auto n = socket_.read(chunk); n && *n > 0) {
-                buffer_.insert(buffer_.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*n));
+            if (auto n = socket_.read(chunk); n.ok() && n.n > 0) {
+                buffer_.insert(buffer_.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(n.n));
             }
         }
     }
@@ -133,7 +133,7 @@ public:
     [[nodiscard]] bool start(std::span<const std::byte> response) {
         response_.assign(response.begin(), response.end());
         if (!listener_.listen(0)) return false;
-        listener_.set_non_blocking();
+        if (!listener_.set_non_blocking()) return false;
         port_ = listener_.local_port().value_or(0);
         if (port_ == 0) return false;
         thread_ = std::thread([this] { serve(); });
@@ -151,17 +151,23 @@ private:
     void serve() {
         std::optional<TcpSocket> peer;
         while (running_ && !peer.has_value()) {
-            peer = listener_.accept();
-            if (!peer.has_value()) std::this_thread::sleep_for(100us);
+            auto accepted = listener_.accept();
+            if (accepted.status == IoStatus::WouldBlock) {
+                std::this_thread::sleep_for(100us);
+                continue;
+            }
+            if (accepted.status == IoStatus::Ok) {
+                peer = std::move(accepted.socket);
+            }
         }
         if (!peer.has_value()) return;
-        peer->set_non_blocking();
+        if (!peer->set_non_blocking()) return;
 
         std::vector<std::byte> buffer;
         std::array<std::byte, 512> chunk{};
         while (running_) {
-            if (auto n = peer->read(chunk); n && *n > 0) {
-                buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*n));
+            if (auto n = peer->read(chunk); n.ok() && n.n > 0) {
+                buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(n.n));
             }
             // Frame the request the same way the client frames the reply, so
             // the floor pays for a header decode too rather than counting
@@ -176,7 +182,14 @@ private:
 
                 std::size_t written = 0;
                 while (written < response_.size()) {
-                    if (auto n = peer->write(std::span(response_).subspan(written)); n) written += *n;
+                    auto n = peer->write(std::span(response_).subspan(written));
+                    if (n.ok()) {
+                        written += n.n;
+                    } else if (n.status == IoStatus::WouldBlock) {
+                        std::this_thread::sleep_for(100us);
+                    } else {
+                        return;
+                    }
                 }
             }
         }

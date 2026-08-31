@@ -147,6 +147,11 @@ public:
     // inferring from a latency.
     [[nodiscard]] std::size_t out_of_band_levels() const;
 
+    // Live resting orders on this book, and how many slab slots have ever
+    // been allocated (including those on the free list). Matching thread only.
+    [[nodiscard]] std::size_t live_order_count() const { return live_count_; }
+    [[nodiscard]] std::size_t slab_capacity() const { return slab_capacity_; }
+
 private:
     // End-of-chain and empty-level sentinel. Slots are 32-bit, not
     // size_t: a book with four billion resting orders has a bigger problem
@@ -274,6 +279,8 @@ private:
     [[nodiscard]] std::vector<BookOrder> all_of(Side side) const;
 
     std::vector<SlabOrder> slab_;
+    std::size_t live_count_ = 0;
+    std::size_t slab_capacity_ = 0;
     // Freed slots, threaded through SlabOrder::next. A book that cancels as
     // fast as it rests reuses a bounded set of slots forever instead of
     // growing the slab, and reuse is last-in-first-out, so the slot handed

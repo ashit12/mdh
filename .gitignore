@@ -43,6 +43,11 @@ compile_commands.json
 .LSOverride
 ._*
 
+# ── Bench output ──────────────────────────────────────────────────────────────
+# Machine-local captures from bench_capacity / matching memory / workload
+# runs. Durable numbers belong in docs/, not these dumps.
+bench-results/
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 *.log
 *.tmp

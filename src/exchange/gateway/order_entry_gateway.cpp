@@ -2,11 +2,9 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <iterator>
 #include <optional>
 #include <span>
-#include <thread>
 #include <type_traits>
 #include <variant>
 
@@ -15,21 +13,6 @@
 #include "protocol/order_entry/encoder.hpp"
 
 namespace mdh::exchange::gateway {
-
-namespace {
-using namespace std::chrono_literals;
-// How long accept_loop() sleeps between polls when there was nothing to
-// do -- short enough to keep latency low, long enough not to spin a core
-// at 100% doing nothing (same rationale as
-// net::UdpListenOptions::consumer_delay's "deterministic, not incidental"
-// framing, just applied to idle-polling instead of simulated slowness).
-// accept_loop() has no better option (TcpSocket::accept() has no blocking-
-// with-wakeup primitive to offer it -- see tcp_socket.hpp's own
-// shutdown()/accept() caveat), but connection_writer_loop() below now uses
-// this only as a wait_for() safety-net timeout, not its primary wake
-// mechanism -- see Connection::wake_cv's doc comment.
-constexpr auto kPollInterval = 1ms;
-} // namespace
 
 OrderEntryGateway::OrderEntryGateway(std::uint16_t port, const OrderEntryGatewayOptions& options)
     : port_(port), options_(options),
@@ -54,29 +37,25 @@ bool OrderEntryGateway::start() {
     if (!listener_.listen(port_, options_.accept_backlog)) {
         return false;
     }
-    listener_.set_non_blocking(); // accept_loop() must never block in accept() -- see its own doc comment
-    accept_thread_ = std::jthread([this] { accept_loop(); });
+    if (!listener_.set_non_blocking()) {
+        return false;
+    }
+    if (!poller_.is_open()) {
+        return false;
+    }
+    if (!poller_.add(listener_.raw_fd(), net::IoInterest::Read, nullptr)) {
+        return false;
+    }
+    listen_armed_ = true;
+    io_thread_ = std::jthread([this] { io_loop(); });
     return true;
 }
 
 void OrderEntryGateway::stop() {
     stop_source_.request_stop();
-    if (accept_thread_.joinable()) {
-        accept_thread_.join();
-    }
-
-    std::lock_guard<std::mutex> lock(connections_mutex_);
-    for (auto& conn : connections_) {
-        conn->socket.shutdown(); // unblocks a blocked read() on this connection's reader thread
-        conn->wake_cv.notify_all(); // unblocks a writer thread waiting in connection_writer_loop()'s wait_for()
-    }
-    for (auto& conn : connections_) {
-        if (conn->reader_thread.joinable()) {
-            conn->reader_thread.join();
-        }
-        if (conn->writer_thread.joinable()) {
-            conn->writer_thread.join();
-        }
+    poller_.wake();
+    if (io_thread_.joinable()) {
+        io_thread_.join();
     }
     pipeline_.stop();
 }
@@ -104,71 +83,130 @@ bool OrderEntryGateway::submit_command(ExchangeCommand command) {
     return pipeline_.submit(std::move(command));
 }
 
-// ── The six pieces ───────────────────────────────────────────────────────
-
-void OrderEntryGateway::accept_loop() {
+void OrderEntryGateway::io_loop() {
     const auto token = stop_source_.get_token();
+    std::array<net::IoEvent, 64> events{};
     while (!token.stop_requested()) {
-        auto sock = listener_.accept();
-        if (!sock) {
-            std::this_thread::sleep_for(kPollInterval); // nothing pending -- the expected common case, not an error
-            continue;
+        const std::size_t n = poller_.wait(events, std::nullopt);
+        if (token.stop_requested()) {
+            break;
         }
-
-        auto conn =
-            std::make_unique<Connection>(next_session_id_++, std::move(*sock), options_.outbound_queue_capacity);
-        Connection* conn_ptr = conn.get();
-        {
-            std::lock_guard<std::mutex> lock(connections_mutex_);
-            connections_.push_back(std::move(conn));
+        for (std::size_t i = 0; i < n; ++i) {
+            const net::IoEvent& ev = events[i];
+            if (ev.wake) {
+                drain_dirty();
+                continue;
+            }
+            if (ev.user == nullptr && listen_armed_ && (ev.readable || ev.error || ev.hangup)) {
+                accept_ready();
+                continue;
+            }
+            auto* conn = static_cast<Connection*>(ev.user);
+            if (conn == nullptr || conn->closed.load(std::memory_order_acquire)) {
+                continue;
+            }
+            if (ev.error || ev.hangup) {
+                if (ev.readable) {
+                    handle_read(*conn);
+                } else {
+                    close_connection(*conn);
+                }
+                continue;
+            }
+            if (ev.readable) {
+                handle_read(*conn);
+            }
+            if (!conn->closed.load(std::memory_order_acquire) && ev.writable) {
+                handle_write(*conn);
+            }
         }
-
-        conn_ptr->reader_thread = std::jthread([this, conn_ptr] { connection_reader_loop(*conn_ptr); });
-        conn_ptr->writer_thread = std::jthread(
-            [this, conn_ptr] { connection_writer_loop(*conn_ptr, stop_source_.get_token()); });
-        notify_writer(*conn_ptr);
     }
 }
 
-void OrderEntryGateway::connection_reader_loop(Connection& conn) {
+void OrderEntryGateway::pause_listen() {
+    if (!listen_armed_) {
+        return;
+    }
+    poller_.remove(listener_.raw_fd());
+    listen_armed_ = false;
+}
+
+void OrderEntryGateway::maybe_resume_listen() {
+    if (listen_armed_ || stop_source_.get_token().stop_requested()) {
+        return;
+    }
+    if (poller_.add(listener_.raw_fd(), net::IoInterest::Read, nullptr)) {
+        listen_armed_ = true;
+    }
+}
+
+void OrderEntryGateway::accept_ready() {
+    using net::IoStatus;
+    while (!stop_source_.get_token().stop_requested()) {
+        auto accepted = listener_.accept();
+        if (accepted.status == IoStatus::WouldBlock) {
+            return;
+        }
+        if (accepted.status != IoStatus::Ok || !accepted.socket.has_value()) {
+            pause_listen();
+            return;
+        }
+        net::TcpSocket sock = std::move(*accepted.socket);
+        if (!sock.set_non_blocking()) {
+            pause_listen();
+            return;
+        }
+        auto conn = std::make_unique<Connection>(next_session_id_, std::move(sock), options_.outbound_queue_capacity);
+        Connection* ptr = conn.get();
+        if (!poller_.add(ptr->socket.raw_fd(), net::IoInterest::Read, ptr)) {
+            pause_listen();
+            return;
+        }
+        ++next_session_id_;
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        connections_.push_back(std::move(conn));
+    }
+}
+
+void OrderEntryGateway::handle_read(Connection& conn) {
     using namespace protocol::order_entry;
+    using net::IoStatus;
 
     std::array<std::byte, 4096> chunk{};
-    while (true) {
+    while (!conn.closed.load(std::memory_order_acquire)) {
         auto n = conn.socket.read(chunk);
         if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
             read_syscalls_.fetch_add(1, std::memory_order_relaxed);
-            if (n) {
-                bytes_read_.fetch_add(*n, std::memory_order_relaxed);
+            if (n.ok()) {
+                bytes_read_.fetch_add(n.n, std::memory_order_relaxed);
             }
         }
-        if (!n || *n == 0) {
-            break; // error, peer EOF, or this socket was shutdown() by stop() -- connection is done either way
+        if (n.status == IoStatus::WouldBlock) {
+            return;
+        }
+        if (!n.ok() || n.n == 0) {
+            close_connection(conn);
+            return;
         }
         conn.read_buffer.insert(conn.read_buffer.end(), chunk.begin(),
-                                 chunk.begin() + static_cast<std::ptrdiff_t>(*n));
+                                 chunk.begin() + static_cast<std::ptrdiff_t>(n.n));
 
-        // Drain every complete frame currently sitting in read_buffer
-        // before going back to read() for more -- a single read() can
-        // return several small messages concatenated together, not just
-        // one (see tcp_socket.hpp's own doc comment on TCP having no
-        // atomic-message boundary).
         while (true) {
             auto header_result = decode_header(conn.read_buffer);
             if (std::holds_alternative<DecodeError>(header_result)) {
-                break; // not enough bytes yet for a header, or a malformed type byte -- wait for more data either way
+                break;
             }
             const auto& header = std::get<Header>(header_result);
             const std::size_t frame_size = HEADER_SIZE + header.payload_size;
             if (conn.read_buffer.size() < frame_size) {
-                break; // header decoded, but the full payload hasn't arrived yet
+                break;
             }
 
             auto message_result = decode_message(std::span(conn.read_buffer).first(frame_size));
             conn.read_buffer.erase(conn.read_buffer.begin(),
                                     conn.read_buffer.begin() + static_cast<std::ptrdiff_t>(frame_size));
             if (std::holds_alternative<DecodeError>(message_result)) {
-                continue; // malformed payload for an otherwise well-formed header -- drop just this one frame
+                continue;
             }
             const Message& message = std::get<Message>(message_result);
             if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
@@ -178,21 +216,9 @@ void OrderEntryGateway::connection_reader_loop(Connection& conn) {
 
             auto command = to_command(message);
             if (!command) {
-                // Decoded fine but isn't a valid client request (e.g. a
-                // gateway -> client type arriving from a client) -- silently
-                // ignored rather than disconnecting the client, since this
-                // protocol has no NAK/error-response message type (see
-                // messages.hpp) to report it with. It is also not something
-                // this session can bind on: identity comes from real
-                // requests only.
                 continue;
             }
 
-            // Every client request carries account_id (see messages.hpp).
-            // The first one binds this session; every later one must agree
-            // with it. account_id.has_value() is what lets that check stay
-            // on this thread's own field instead of taking sessions_mutex_
-            // for every single message.
             const AccountId account_id = std::visit([](const auto& m) { return m.account_id; }, message);
             if (!conn.account_id.has_value()) {
                 bind_session(conn, account_id);
@@ -205,14 +231,152 @@ void OrderEntryGateway::connection_reader_loop(Connection& conn) {
             (void)submit_command(std::move(*command));
         }
     }
-
-    // Peer EOF, a read error, or stop()'s shutdown() -- either way this
-    // session is over, and nothing should route to it anymore.
-    conn.closed.store(true, std::memory_order_release);
-    unbind_session(conn);
-    conn.socket.shutdown();       // this connection's writer may be blocked mid-write() on a dead socket
-    notify_writer(conn);          // wake the writer if it is waiting on this connection
 }
+
+std::optional<protocol::order_entry::Message> OrderEntryGateway::pop_outbound(Connection& conn) {
+    {
+        std::lock_guard<std::mutex> lock(conn.replay_mutex);
+        if (!conn.replay_backlog.empty()) {
+            auto message = std::move(conn.replay_backlog.front());
+            conn.replay_backlog.erase(conn.replay_backlog.begin());
+            return message;
+        }
+    }
+    if (auto session = conn.session_outbound.try_pop()) {
+        return session;
+    }
+    return conn.outbound.try_pop();
+}
+
+void OrderEntryGateway::handle_write(Connection& conn) {
+    using namespace protocol::order_entry;
+    using net::IoStatus;
+
+    const std::size_t batch_limit = options_.writer_batch == 0 ? 1 : options_.writer_batch;
+
+    while (!conn.closed.load(std::memory_order_acquire)) {
+        if (conn.write_offset < conn.write_buf.size()) {
+            auto n = conn.socket.write(std::span(conn.write_buf).subspan(conn.write_offset));
+            if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
+                write_syscalls_.fetch_add(1, std::memory_order_relaxed);
+                if (n.ok()) {
+                    bytes_written_.fetch_add(n.n, std::memory_order_relaxed);
+                }
+            }
+            if (n.status == IoStatus::WouldBlock) {
+                enable_write(conn);
+                return;
+            }
+            if (!n.ok() || n.n == 0) {
+                if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
+                    write_errors_.fetch_add(1, std::memory_order_relaxed);
+                }
+                close_connection(conn);
+                return;
+            }
+            conn.write_offset += n.n;
+            if (conn.write_offset < conn.write_buf.size()) {
+                enable_write(conn);
+                return;
+            }
+            for (const auto& message : conn.write_pending) {
+                latency::tracer().stamp_socket_written(message);
+            }
+            if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
+                reports_written_.fetch_add(conn.write_pending.size(), std::memory_order_relaxed);
+            }
+            conn.write_buf.clear();
+            conn.write_offset = 0;
+            conn.write_pending.clear();
+            continue;
+        }
+
+        auto first = pop_outbound(conn);
+        if (!first) {
+            disable_write(conn);
+            return;
+        }
+        conn.write_buf.clear();
+        conn.write_offset = 0;
+        conn.write_pending.clear();
+        encode_message(*first, conn.write_buf);
+        conn.write_pending.push_back(std::move(*first));
+        while (conn.write_pending.size() < batch_limit) {
+            auto more = pop_outbound(conn);
+            if (!more) {
+                break;
+            }
+            encode_message(*more, conn.write_buf);
+            conn.write_pending.push_back(std::move(*more));
+        }
+    }
+}
+
+void OrderEntryGateway::close_connection(Connection& conn) {
+    if (conn.closed.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    unbind_session(conn);
+    poller_.remove(conn.socket.raw_fd());
+    conn.socket.shutdown();
+    maybe_resume_listen();
+}
+
+void OrderEntryGateway::enable_write(Connection& conn) {
+    if (conn.closed.load(std::memory_order_acquire) || conn.write_interest) {
+        return;
+    }
+    if (!poller_.mod(conn.socket.raw_fd(), net::IoInterest::Read | net::IoInterest::Write, &conn)) {
+        close_connection(conn);
+        return;
+    }
+    conn.write_interest = true;
+}
+
+void OrderEntryGateway::disable_write(Connection& conn) {
+    if (!conn.write_interest) {
+        return;
+    }
+    if (!poller_.mod(conn.socket.raw_fd(), net::IoInterest::Read, &conn)) {
+        close_connection(conn);
+        return;
+    }
+    conn.write_interest = false;
+}
+
+void OrderEntryGateway::drain_dirty() {
+    while (auto conn = dirty_.try_pop()) {
+        (*conn)->dirty.store(false, std::memory_order_release);
+        if (!(*conn)->closed.load(std::memory_order_acquire)) {
+            enable_write(**conn);
+        }
+    }
+    if (dirty_overflow_.exchange(false, std::memory_order_acq_rel)) {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        for (auto& conn : connections_) {
+            if (conn->dirty.exchange(false, std::memory_order_acq_rel) &&
+                !conn->closed.load(std::memory_order_acquire)) {
+                enable_write(*conn);
+            }
+        }
+    }
+}
+
+void OrderEntryGateway::mark_dirty(Connection& conn) {
+    bool expected = false;
+    if (conn.dirty.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        if (!dirty_.try_push(&conn)) {
+            dirty_overflow_.store(true, std::memory_order_release);
+        }
+    }
+}
+
+void OrderEntryGateway::notify_writer(Connection& conn) {
+    mark_dirty(conn);
+    poller_.wake();
+}
+
+// ── Session routing (matching thread + I/O thread) ───────────────────────
 
 void OrderEntryGateway::bind_session(Connection& conn, AccountId account_id) {
     {
@@ -326,110 +490,6 @@ void OrderEntryGateway::claim_order_ownership(Connection& conn, AccountId accoun
     // private report stream from the live session that originated it. If
     // the origin disconnected, unbind_session() removed its entry and this
     // command's session becomes the new owner.
-}
-
-void OrderEntryGateway::connection_writer_loop(Connection& conn, std::stop_token token) {
-    using namespace protocol::order_entry;
-
-    // Reports retained while this session's account had nobody connected,
-    // handed over by bind_session(). Drained before anything else so a
-    // reconnecting client reads its history before whatever happens next.
-    auto next_backlog_message = [&conn]() -> std::optional<Message> {
-        std::lock_guard<std::mutex> lock(conn.replay_mutex);
-        if (conn.replay_backlog.empty()) {
-            return std::nullopt;
-        }
-        Message message = std::move(conn.replay_backlog.front());
-        conn.replay_backlog.erase(conn.replay_backlog.begin());
-        return message;
-    };
-    auto has_work = [&conn] {
-        std::lock_guard<std::mutex> lock(conn.replay_mutex);
-        return !conn.replay_backlog.empty() || conn.session_outbound.size() > 0 || conn.outbound.size() > 0;
-    };
-
-    // Reused for every outbound frame. encode_message() appends, so this is
-    // cleared rather than reconstructed -- a per-message heap allocation
-    // here used to sit on the writer path of every execution report.
-    std::vector<std::byte> buf;
-    buf.reserve(64);
-    const std::size_t batch_limit = options_.writer_batch == 0 ? 1 : options_.writer_batch;
-    std::vector<Message> extra;
-    extra.reserve(batch_limit > 0 ? batch_limit - 1 : 0);
-
-    auto try_pop_any = [&]() -> std::optional<Message> {
-        if (auto backlog = next_backlog_message()) {
-            return backlog;
-        }
-        if (auto session = conn.session_outbound.try_pop()) {
-            return session;
-        }
-        return conn.outbound.try_pop();
-    };
-
-    auto wait_for_work = [&] {
-        std::unique_lock<std::mutex> lock(conn.wake_mutex);
-        conn.wake_cv.wait_for(lock, kPollInterval, [&] {
-            return token.stop_requested() || conn.closed.load(std::memory_order_acquire) || has_work();
-        });
-    };
-
-    while (!token.stop_requested() && !conn.closed.load(std::memory_order_acquire)) {
-        auto first = try_pop_any();
-        if (!first) {
-            // wait_for()'s predicate is re-checked immediately, before ever
-            // actually sleeping -- so a notify_one() (route_event() below)
-            // or notify_all() (stop(), above) that already happened before
-            // this wait began is never lost, only redundant with this
-            // re-check. kPollInterval is a safety-net timeout only -- see
-            // this class's own kPollInterval doc comment.
-            wait_for_work();
-            continue;
-        }
-
-        Message held = std::move(*first);
-        buf.clear();
-        encode_message(held, buf);
-
-        extra.clear();
-        while (1 + extra.size() < batch_limit) {
-            auto more = try_pop_any();
-            if (!more) {
-                break;
-            }
-            encode_message(*more, buf);
-            extra.push_back(std::move(*more));
-        }
-
-        std::size_t written = 0;
-        while (written < buf.size()) {
-            auto n = conn.socket.write(std::span(buf).subspan(written));
-            if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
-                write_syscalls_.fetch_add(1, std::memory_order_relaxed);
-                if (n) {
-                    bytes_written_.fetch_add(*n, std::memory_order_relaxed);
-                }
-            }
-            if (!n || *n == 0) {
-                if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
-                    write_errors_.fetch_add(1, std::memory_order_relaxed);
-                }
-                return; // write error, or a 0-byte write on a live socket -- either way, this connection is done
-            }
-            written += *n;
-        }
-        latency::tracer().stamp_socket_written(held);
-        for (const auto& message : extra) {
-            latency::tracer().stamp_socket_written(message);
-        }
-        if (io_metrics_enabled_.load(std::memory_order_relaxed)) {
-            reports_written_.fetch_add(1 + extra.size(), std::memory_order_relaxed);
-        }
-    }
-}
-
-void OrderEntryGateway::notify_writer(Connection& conn) {
-    conn.wake_cv.notify_one();
 }
 
 void OrderEntryGateway::route_event(const ExchangeEvent& event) {

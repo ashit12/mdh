@@ -16,7 +16,7 @@ TEST(TcpSocket, DefaultConstructedSocketIsOpen) {
 
 TEST(TcpSocket, ListenOnEphemeralPortReportsANonZeroPort) {
     TcpSocket listener;
-    ASSERT_TRUE(listener.listen(0)); // 0 = let the OS pick a free port
+    ASSERT_TRUE(listener.listen(0));
     auto port = listener.local_port();
     ASSERT_TRUE(port.has_value());
     EXPECT_NE(*port, 0);
@@ -28,36 +28,57 @@ TEST(TcpSocket, LoopbackConnectAcceptReadWriteRoundTrip) {
     const auto port = listener.local_port();
     ASSERT_TRUE(port.has_value());
 
-    // connect() completes the TCP handshake itself; the resulting
-    // connection sits in the listen backlog until accept() is called, so
-    // no separate thread is needed here -- accept() below returns
-    // immediately rather than actually blocking.
     TcpSocket client;
     ASSERT_TRUE(client.connect("127.0.0.1", *port));
 
-    auto server_conn = listener.accept();
-    ASSERT_TRUE(server_conn.has_value());
+    auto accepted = listener.accept();
+    ASSERT_EQ(accepted.status, IoStatus::Ok);
+    ASSERT_TRUE(accepted.socket.has_value());
 
     const std::array<std::byte, 5> payload = {
         std::byte{'h'}, std::byte{'e'}, std::byte{'l'}, std::byte{'l'}, std::byte{'o'}};
     auto written = client.write(payload);
-    ASSERT_TRUE(written.has_value());
-    EXPECT_EQ(*written, payload.size());
+    ASSERT_TRUE(written.ok());
+    EXPECT_EQ(written.n, payload.size());
 
     std::array<std::byte, 64> recv_buf{};
-    auto received = server_conn->read(recv_buf);
-    ASSERT_TRUE(received.has_value());
-    ASSERT_EQ(*received, payload.size());
+    auto received = accepted.socket->read(recv_buf);
+    ASSERT_TRUE(received.ok());
+    ASSERT_EQ(received.n, payload.size());
     EXPECT_TRUE(std::memcmp(recv_buf.data(), payload.data(), payload.size()) == 0);
 }
 
-TEST(TcpSocket, NonBlockingAcceptReturnsNulloptWhenNothingPending) {
+TEST(TcpSocket, NonBlockingAcceptReturnsWouldBlockWhenNothingPending) {
     TcpSocket listener;
     ASSERT_TRUE(listener.listen(0));
-    listener.set_non_blocking();
+    ASSERT_TRUE(listener.set_non_blocking());
 
-    auto conn = listener.accept(); // nobody ever connected
-    EXPECT_FALSE(conn.has_value());
+    auto conn = listener.accept();
+    EXPECT_EQ(conn.status, IoStatus::WouldBlock);
+    EXPECT_FALSE(conn.socket.has_value());
+}
+
+TEST(TcpSocket, NonBlockingReadReturnsWouldBlockWhenEmpty) {
+    TcpSocket listener;
+    ASSERT_TRUE(listener.listen(0));
+    ASSERT_TRUE(listener.set_non_blocking());
+    const auto port = listener.local_port();
+    ASSERT_TRUE(port.has_value());
+    TcpSocket client;
+    ASSERT_TRUE(client.connect("127.0.0.1", *port));
+    AcceptResult accepted{};
+    for (int i = 0; i < 100 && accepted.status != IoStatus::Ok; ++i) {
+        accepted = listener.accept();
+        if (accepted.status == IoStatus::WouldBlock) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    ASSERT_EQ(accepted.status, IoStatus::Ok);
+    ASSERT_TRUE(accepted.socket->set_non_blocking());
+    std::array<std::byte, 16> buf{};
+    const auto n = accepted.socket->read(buf);
+    EXPECT_EQ(n.status, IoStatus::WouldBlock);
+    EXPECT_NE(n.status, IoStatus::Error);
 }
 
 TEST(TcpSocket, ConnectRejectsNonIpv4Literal) {
@@ -66,10 +87,6 @@ TEST(TcpSocket, ConnectRejectsNonIpv4Literal) {
 }
 
 TEST(TcpSocket, ConnectFailsWhenNothingIsListening) {
-    // Connecting to a port that is bound-but-not-listening can be slow to
-    // fail on some platforms (no immediate RST). Using a port that was
-    // *closed* -- listened on, then the socket destroyed -- gets a
-    // consistent, immediate ECONNREFUSED instead.
     std::uint16_t port = 0;
     {
         TcpSocket probe;
@@ -77,17 +94,13 @@ TEST(TcpSocket, ConnectFailsWhenNothingIsListening) {
         auto p = probe.local_port();
         ASSERT_TRUE(p.has_value());
         port = *p;
-    } // probe's destructor closes the fd here.
+    }
 
     TcpSocket client;
     EXPECT_FALSE(client.connect("127.0.0.1", port));
 }
 
 TEST(TcpSocket, ShutdownUnblocksBlockedRead) {
-    // Unlike accept() on a listening socket (see tcp_socket.hpp's own
-    // shutdown() doc comment on the macOS caveat), shutdown() on an
-    // already-connected socket reliably unblocks a thread blocked in
-    // read() on it, on every platform this project targets.
     TcpSocket listener;
     ASSERT_TRUE(listener.listen(0));
     const auto port = listener.local_port();
@@ -95,73 +108,57 @@ TEST(TcpSocket, ShutdownUnblocksBlockedRead) {
 
     TcpSocket client;
     ASSERT_TRUE(client.connect("127.0.0.1", *port));
-    auto server_conn = listener.accept();
-    ASSERT_TRUE(server_conn.has_value());
+    auto accepted = listener.accept();
+    ASSERT_EQ(accepted.status, IoStatus::Ok);
+    ASSERT_TRUE(accepted.socket.has_value());
 
-    std::optional<std::size_t> read_result;
+    IoResult read_result{};
     std::jthread reader([&] {
         std::array<std::byte, 64> buf{};
-        read_result = server_conn->read(buf); // blocks until data, EOF, or shutdown()
+        read_result = accepted.socket->read(buf);
     });
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // let the reader actually reach read()
-    server_conn->shutdown();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    accepted.socket->shutdown();
     reader.join();
 
-    // Either outcome (EOF or an error) is an acceptable, unblocked result;
-    // what this test actually pins down is that reader.join() above
-    // returned at all instead of hanging.
-    if (read_result.has_value()) {
-        EXPECT_EQ(*read_result, 0);
+    if (read_result.ok()) {
+        EXPECT_EQ(read_result.n, std::size_t{0});
     }
 }
 
 TEST(TcpSocket, AcceptedConnectionIsBlockingRegardlessOfListenersMode) {
-    // On BSD-derived kernels (including macOS), a socket returned by
-    // accept() inherits the listening socket's O_NONBLOCK flag rather than
-    // starting fresh -- unlike Linux, where it never does. Callers of
-    // accept() (e.g. the order-entry gateway's accept_loop(), which must
-    // put the *listening* socket in non-blocking mode, see accept()'s own
-    // doc comment) are entitled to assume every accepted connection is
-    // blocking by default regardless of platform, exactly like a freshly
-    // constructed TcpSocket -- this pins that guarantee.
     TcpSocket listener;
     ASSERT_TRUE(listener.listen(0));
-    listener.set_non_blocking();
+    ASSERT_TRUE(listener.set_non_blocking());
     const auto port = listener.local_port();
     ASSERT_TRUE(port.has_value());
 
     TcpSocket client;
     ASSERT_TRUE(client.connect("127.0.0.1", *port));
 
-    std::optional<TcpSocket> server_conn;
-    for (int attempt = 0; attempt < 100 && !server_conn.has_value(); ++attempt) {
-        server_conn = listener.accept();
-        if (!server_conn.has_value()) {
+    AcceptResult accepted{};
+    for (int attempt = 0; attempt < 100 && accepted.status != IoStatus::Ok; ++attempt) {
+        accepted = listener.accept();
+        if (accepted.status == IoStatus::WouldBlock) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
-    ASSERT_TRUE(server_conn.has_value());
+    ASSERT_EQ(accepted.status, IoStatus::Ok);
 
-    // Nothing has been written yet, so a non-blocking accepted socket would
-    // return std::nullopt (EWOULDBLOCK) immediately; a correctly-blocking
-    // one blocks until the write below actually arrives. This thread does
-    // the write concurrently so a wrongly-non-blocking read() failing fast
-    // doesn't hang the test either way -- read_result simply reflects
-    // whichever behavior actually occurred.
-    std::optional<std::size_t> read_result;
+    IoResult read_result{};
     std::jthread reader([&] {
         std::array<std::byte, 64> buf{};
-        read_result = server_conn->read(buf);
+        read_result = accepted.socket->read(buf);
     });
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // give the reader a real chance to block first
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     const std::array<std::byte, 3> payload = {std::byte{'h'}, std::byte{'i'}, std::byte{'!'}};
-    ASSERT_TRUE(client.write(payload).has_value());
+    ASSERT_TRUE(client.write(payload).ok());
     reader.join();
 
-    ASSERT_TRUE(read_result.has_value());
-    EXPECT_EQ(*read_result, payload.size());
+    ASSERT_TRUE(read_result.ok());
+    EXPECT_EQ(read_result.n, payload.size());
 }
 
 TEST(TcpSocket, MoveTransfersOwnership) {
@@ -172,8 +169,4 @@ TEST(TcpSocket, MoveTransfersOwnership) {
     TcpSocket b(std::move(a));
     EXPECT_TRUE(b.is_open());
     EXPECT_EQ(b.local_port(), port);
-    // a is in a moved-from state; is_open() on it is not exercised here to
-    // avoid depending on unspecified moved-from behaviour beyond "safe to
-    // destroy", which the destructor's fd_ >= 0 check guarantees -- same
-    // convention as UdpSocket's own MoveTransfersOwnership test.
 }

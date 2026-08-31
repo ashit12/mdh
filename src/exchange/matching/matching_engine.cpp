@@ -111,6 +111,15 @@ std::size_t MatchingEngine::out_of_band_levels() const {
     return total;
 }
 
+MatchingEngine::BookMemoryStats MatchingEngine::book_memory_stats() const {
+    BookMemoryStats stats;
+    for (const MatchingBook& book : books_) {
+        stats.live_orders += book.live_order_count();
+        stats.slab_capacity += book.slab_capacity();
+    }
+    return stats;
+}
+
 EngineStateSnapshot MatchingEngine::snapshot() const {
     EngineStateSnapshot snap;
     snap.instruments.reserve(by_id_.size());
@@ -249,6 +258,7 @@ void MatchingEngine::match_and_rest(ExchangeRestingOrder& incoming, CommandSeque
         if (contra_remaining_after == 0) {
             book.remove_front(contra_side);
             orders_.erase(LiveKey{contra_account_id, contra_client_order_id});
+            resting_orders_->fetch_sub(1, std::memory_order_relaxed);
             sink(BookOrderRemoved{
                 .event_sequence = next_event_sequence_++,
                 .instrument_id = incoming.instrument_id,
@@ -292,6 +302,7 @@ void MatchingEngine::rest_remainder_if_applicable(const ExchangeRestingOrder& or
                                  .handle = handle,
                                  .instrument_id = order.instrument_id,
                              });
+    resting_orders_->fetch_add(1, std::memory_order_relaxed);
     sink(BookOrderAdded{
         .event_sequence = next_event_sequence_++,
         .instrument_id = order.instrument_id,
@@ -435,6 +446,7 @@ void MatchingEngine::process_cancel(const CancelOrderCommand& cmd, const EventSi
 
     const MatchingBook::Handle handle = it->second.handle;
     orders_.erase(it);
+    resting_orders_->fetch_sub(1, std::memory_order_relaxed);
     const BookOrder removed = book_for(cmd.instrument_id).remove_at(handle);
 
     sink(OrderCancelled{
@@ -545,6 +557,7 @@ void MatchingEngine::process_replace(const ReplaceOrderCommand& cmd, const Event
     // aggressive new order.
     book.remove_at(ref.handle);
     orders_.erase(it);
+    resting_orders_->fetch_sub(1, std::memory_order_relaxed);
 
     const ExchangeOrderId new_exchange_order_id = next_exchange_order_id_++;
     sink(OrderReplaced{

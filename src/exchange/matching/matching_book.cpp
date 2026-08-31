@@ -305,6 +305,7 @@ std::uint32_t MatchingBook::acquire_slot(const BookOrder& order) {
         return slot;
     }
     slab_.push_back(SlabOrder{.order = order, .next = kNil, .prev = kNil});
+    slab_capacity_ = slab_.size();
     return static_cast<std::uint32_t>(slab_.size() - 1);
 }
 
@@ -344,6 +345,7 @@ MatchingBook::Handle MatchingBook::add(const BookOrder& order) {
     // a freshly-inserted empty level behind it.
     const std::uint32_t slot = acquire_slot(order);
     link_back(side_of(order.side).level_for(order.price), slot);
+    live_count_ += 1;
     return Handle{.slot = slot};
 }
 
@@ -358,6 +360,7 @@ BookOrder MatchingBook::remove_at(Handle handle) {
         side.erase_level(removed.price);
     }
     release_slot(handle.slot);
+    live_count_ -= 1;
     return removed;
 }
 
@@ -405,6 +408,7 @@ void MatchingBook::remove_front(Side book_side) {
     const std::uint32_t head = level.head;
     unlink(level, head);
     release_slot(head);
+    live_count_ -= 1;
     if (level.head == kNil) {
         side.erase_level(price);
     }

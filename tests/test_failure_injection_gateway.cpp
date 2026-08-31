@@ -48,7 +48,7 @@ class TestClient {
 public:
     [[nodiscard]] bool connect_to(std::uint16_t port) {
         if (!socket_.connect("127.0.0.1", port)) return false;
-        socket_.set_non_blocking();
+        if (!socket_.set_non_blocking()) return false;
         return true;
     }
 
@@ -62,8 +62,8 @@ public:
         std::size_t written = 0;
         while (written < data.size()) {
             auto n = socket_.write(data.subspan(written));
-            if (n) {
-                written += *n;
+            if (n.ok()) {
+                written += n.n;
             } else {
                 std::this_thread::sleep_for(1ms);
             }
@@ -76,8 +76,9 @@ public:
             if (auto message = try_decode_one()) return message;
             if (std::chrono::steady_clock::now() >= deadline) return std::nullopt;
             std::array<std::byte, 512> chunk{};
-            if (auto n = socket_.read(chunk); n && *n > 0) {
-                buffer_.insert(buffer_.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*n));
+            const auto n = socket_.read(chunk);
+            if (n.ok() && n.n > 0) {
+                buffer_.insert(buffer_.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(n.n));
             } else {
                 std::this_thread::sleep_for(1ms);
             }
