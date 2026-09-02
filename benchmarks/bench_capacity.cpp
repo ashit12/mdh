@@ -39,6 +39,7 @@
 #include "exchange/matching/matching_engine.hpp"
 #include "exchange/market_data/market_data_router.hpp"
 #include "exchange/risk/risk_gated_engine.hpp"
+#include "exchange/sequencing/command_sequencer.hpp"
 #include "exchange/sequencing/matching_pipeline.hpp"
 #include "exchange/testing/hr_timer.hpp"
 #include "exchange/testing/matching_scenarios.hpp"
@@ -63,8 +64,18 @@ using namespace std::chrono_literals;
 
 namespace {
 
-constexpr ledger::Balance kFundCash = 1'000'000'000'000'000LL;
-constexpr Quantity kFundPosition = 1'000'000'000;
+// Existing benchmark funding, retained only for the labeled one-account
+// "before" run so the methodology correction has a reproducible baseline.
+constexpr ledger::Balance kLegacyFundCash = 1'000'000'000'000'000LL;
+constexpr Quantity kLegacyFundPosition = 1'000'000'000;
+
+// Corrected matching-capacity funding. For the default 1M-command stream,
+// these are several orders of magnitude above even assigning every maximum
+// sized command to one account. The benchmark still enforces zero risk
+// rejections rather than trusting that arithmetic as its pass condition.
+constexpr ledger::Balance kMatchingFundCash = 1'000'000'000'000'000'000LL;
+constexpr Quantity kMatchingFundPosition = 1'000'000'000'000ULL;
+constexpr std::uint32_t kMatchingAccounts = 128;
 constexpr std::size_t kProductionIngest = 1024;
 constexpr std::size_t kProductionOutbound = 1024;
 constexpr std::size_t kProductionMdQueue = 8192;
@@ -85,6 +96,7 @@ struct Args {
     double soak_hours = 4.0;
     double soak_seconds = 0.0;
     double soak_offered = 5'000.0;
+    std::uint32_t matching_accounts = kMatchingAccounts;
     std::optional<unsigned> matching_cpu;
 };
 
@@ -101,6 +113,7 @@ void print_usage() {
         "  --connection-seconds S\n"
         "  --flooders N                    fairness flooders (default 16)\n"
         "  --soak-hours H                  default 4; --soak-seconds overrides\n"
+        "  --matching-accounts N           matching-thread accounts (default 128; use 1 for legacy before)\n"
         "  --matching-cpu N                pin matching thread (Linux)\n"
         "\n"
         "  all = matching-thread, e2e-knee, queue-drops, fairness, recovery\n"
@@ -179,6 +192,10 @@ void print_usage() {
             if (const char* v = next()) {
                 args.soak_offered = std::atof(v);
             }
+        } else if (flag == "--matching-accounts") {
+            if (const char* v = next()) {
+                args.matching_accounts = static_cast<std::uint32_t>(std::max(1, std::atoi(v)));
+            }
         } else if (flag == "--matching-cpu") {
             if (const char* v = next()) {
                 args.matching_cpu = static_cast<unsigned>(std::atoi(v));
@@ -228,11 +245,12 @@ void print_usage() {
     return config;
 }
 
-void fund_ledger(ledger::Ledger& ledger, const WorkloadConfig& config) {
+void fund_ledger(ledger::Ledger& ledger, const WorkloadConfig& config,
+                 ledger::Balance cash = kLegacyFundCash, Quantity position = kLegacyFundPosition) {
     for (AccountId account = 1; account <= config.account_count; ++account) {
-        ledger.deposit_cash(account, kFundCash);
+        ledger.deposit_cash(account, cash);
         for (InstrumentId instrument : config.instruments()) {
-            ledger.deposit_position(account, instrument, kFundPosition);
+            ledger.deposit_position(account, instrument, position);
         }
     }
 }
@@ -240,9 +258,9 @@ void fund_ledger(ledger::Ledger& ledger, const WorkloadConfig& config) {
 void fund_gateway(OrderEntryGateway& gateway, AccountId first, int count, std::span<const InstrumentId> instruments) {
     for (int i = 0; i < count; ++i) {
         const AccountId account = first + static_cast<AccountId>(i);
-        gateway.deposit_cash(account, kFundCash);
+        gateway.deposit_cash(account, kLegacyFundCash);
         for (InstrumentId instrument : instruments) {
-            gateway.deposit_position(account, instrument, kFundPosition);
+            gateway.deposit_position(account, instrument, kLegacyFundPosition);
         }
     }
 }
@@ -327,9 +345,113 @@ void drain_submit(sequencing::MatchingPipeline& pipeline, const std::vector<Exch
     }
 }
 
+struct SweepTiming {
+    std::size_t levels = 0;
+    std::size_t operations = 0;
+    double matching_ns_per_op = 0.0;
+    double full_path_ns_per_op = 0.0;
+    std::size_t rejected_events = 0;
+};
+
+[[nodiscard]] std::size_t sweep_operations(std::size_t levels) {
+    constexpr std::size_t kTargetOperations = 65'536;
+    constexpr std::size_t kMaxRestingOrders = 262'144;
+    return std::clamp(kMaxRestingOrders / std::max<std::size_t>(levels, 1), std::size_t{256},
+                      kTargetOperations);
+}
+
+[[nodiscard]] SweepTiming run_full_path_sweep(std::size_t levels) {
+    constexpr InstrumentId kInstrument = 1;
+    constexpr AccountId kMaker = 1;
+    constexpr AccountId kTaker = 2;
+    constexpr Price kBase = 10'000'000;
+    constexpr Quantity kPerLevel = 10;
+
+    const std::size_t cases = sweep_operations(levels);
+    SequentialIds ids;
+    std::vector<ExchangeCommand> seed;
+    std::vector<ExchangeCommand> operations;
+    seed.reserve(cases * levels);
+    operations.reserve(cases);
+    for (std::size_t i = 0; i < cases * levels; ++i) {
+        seed.push_back(ExchangeCommand{new_order(ids.take_command_sequence(), kMaker, ids.take_client_order_id(),
+                                                 kInstrument, Side::Sell, kBase + static_cast<Price>(i),
+                                                 kPerLevel)});
+    }
+    for (std::size_t i = 0; i < cases; ++i) {
+        const Price worst = kBase + static_cast<Price>((i + 1) * levels - 1);
+        operations.push_back(ExchangeCommand{
+            new_order(ids.take_command_sequence(), kTaker, ids.take_client_order_id(), kInstrument, Side::Buy,
+                      worst, kPerLevel * static_cast<Quantity>(levels), TimeInForce::IOC)});
+    }
+
+    MatchingEngine matching_only{kInstrument};
+    for (const auto& command : seed) {
+        matching_only.process(command, discard_events());
+    }
+    const auto matching_start = std::chrono::steady_clock::now();
+    for (const auto& command : operations) {
+        matching_only.process(command, discard_events());
+    }
+    const double matching_elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - matching_start).count();
+
+    MatchingEngine full_engine{kInstrument};
+    ledger::Ledger ledger;
+    ledger.deposit_cash(kMaker, kMatchingFundCash);
+    ledger.deposit_cash(kTaker, kMatchingFundCash);
+    ledger.deposit_position(kMaker, kInstrument, kMatchingFundPosition);
+    ledger.deposit_position(kTaker, kInstrument, kMatchingFundPosition);
+    risk::RiskGatedEngine gated(full_engine, ledger);
+    sequencing::CommandSequencer sequencer;
+    std::size_t rejected_events = 0;
+    const EventSink sink = [&](const ExchangeEvent& event) {
+        if (std::holds_alternative<OrderRejected>(event)) {
+            ++rejected_events;
+        }
+    };
+    for (const auto& command : seed) {
+        gated.process(sequencer.sequence(command), sink);
+    }
+    const auto full_start = std::chrono::steady_clock::now();
+    for (const auto& command : operations) {
+        gated.process(sequencer.sequence(command), sink);
+    }
+    const double full_elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - full_start).count();
+
+    return SweepTiming{
+        .levels = levels,
+        .operations = cases,
+        .matching_ns_per_op = matching_elapsed * 1e9 / static_cast<double>(cases),
+        .full_path_ns_per_op = full_elapsed * 1e9 / static_cast<double>(cases),
+        .rejected_events = rejected_events,
+    };
+}
+
+void print_full_path_sweeps() {
+    std::printf("\n== MultiLevelSweep through RiskGatedEngine + CommandSequencer ==\n");
+    std::printf("| levels | operations | matching-only ns/op | full-path ns/op | ratio | rejects |\n");
+    std::printf("| ------:| ----------:| ------------------:| ----------------:| ------:| -------:|\n");
+    for (const std::size_t levels : {std::size_t{1}, std::size_t{4}, std::size_t{16}, std::size_t{64},
+                                     std::size_t{256}}) {
+        const auto result = run_full_path_sweep(levels);
+        const double ratio = result.matching_ns_per_op > 0.0
+                                 ? result.full_path_ns_per_op / result.matching_ns_per_op
+                                 : 0.0;
+        std::printf("| %7zu | %10zu | %19.1f | %15.1f | %6.2fx | %7zu |\n", result.levels,
+                    result.operations, result.matching_ns_per_op, result.full_path_ns_per_op, ratio,
+                    result.rejected_events);
+    }
+}
+
 int run_matching_thread(const Args& args) {
-    const auto config = mixed_config(args.operations);
+    const auto config = mixed_config(args.operations, args.matching_accounts);
     const auto workload = generate_workload(config);
+    const bool legacy_before = config.account_count == 1;
+    std::printf("methodology=%s  configured_accounts=%u\n",
+                legacy_before ? "before-single-account-legacy-funding" : "after-multi-account-fully-funded",
+                config.account_count);
     print_counts(workload);
 
     MatchingEngine engine_only(config.instruments(), 200'000);
@@ -349,12 +471,16 @@ int run_matching_thread(const Args& args) {
 
     MatchingEngine engine(config.instruments(), 200'000);
     ledger::Ledger ledger;
-    fund_ledger(ledger, config);
+    fund_ledger(ledger, config, legacy_before ? kLegacyFundCash : kMatchingFundCash,
+                legacy_before ? kLegacyFundPosition : kMatchingFundPosition);
     risk::RiskGatedEngine gated(engine, ledger);
     std::atomic<std::size_t> rejected_events{0};
+    std::array<std::atomic<std::size_t>, static_cast<std::size_t>(RejectReason::AccountMismatch) + 1>
+        rejects_by_reason{};
     const EventSink sink = [&](const ExchangeEvent& event) {
-        if (std::holds_alternative<OrderRejected>(event)) {
+        if (const auto* rejected = std::get_if<OrderRejected>(&event); rejected != nullptr) {
             rejected_events.fetch_add(1, std::memory_order_relaxed);
+            rejects_by_reason[static_cast<std::size_t>(rejected->reason)].fetch_add(1, std::memory_order_relaxed);
         }
     };
 
@@ -377,27 +503,17 @@ int run_matching_thread(const Args& args) {
 
     const std::size_t baseline = pipeline.commands_processed();
     const std::size_t rejects_before = pipeline.commands_rejected();
-    std::atomic<bool> go{false};
-    const unsigned producers = 2;
-    std::vector<std::thread> workers;
     const auto& ops = workload.operations;
-    for (unsigned p = 0; p < producers; ++p) {
-        workers.emplace_back([&, p] {
-            while (!go.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-            for (std::size_t i = p; i < ops.size(); i += producers) {
-                while (!pipeline.submit(ops[i])) {
-                    std::this_thread::yield();
-                }
-            }
-        });
-    }
-
     const auto start = std::chrono::steady_clock::now();
-    go.store(true, std::memory_order_release);
-    for (auto& worker : workers) {
-        worker.join();
+    // The generated stream contains dependent cancel/replace operations and
+    // is valid only in vector order. Striped producers race those dependencies
+    // in the MPSC admission order and turn the benchmark into an
+    // UnknownOrderId test. One producer preserves the generated workload;
+    // producer scalability is measured separately by queue-drops/fairness.
+    for (const auto& command : ops) {
+        while (!pipeline.submit(command)) {
+            std::this_thread::yield();
+        }
     }
     if (!wait_processed(pipeline, baseline + ops.size(), 120s)) {
         std::fprintf(stderr, "matching-thread: operations did not drain (%zu/%zu)\n", pipeline.commands_processed(),
@@ -409,16 +525,41 @@ int run_matching_thread(const Args& args) {
     const std::size_t processed = pipeline.commands_processed() - baseline;
     const double commands_per_sec = elapsed > 0.0 ? static_cast<double>(processed) / elapsed : 0.0;
     const auto mem = engine.book_memory_stats();
+    const std::size_t insufficient_funds =
+        rejects_by_reason[static_cast<std::size_t>(RejectReason::InsufficientFunds)].load();
+    const std::size_t insufficient_position =
+        rejects_by_reason[static_cast<std::size_t>(RejectReason::InsufficientPosition)].load();
+    const std::size_t too_large = rejects_by_reason[static_cast<std::size_t>(RejectReason::OrderTooLarge)].load();
+    const std::size_t risk_rejects = insufficient_funds + insufficient_position + too_large;
     std::printf("\n== matching-thread ceiling (sequencer + risk + ledger + MatchingEngine, no sockets) ==\n");
-    std::printf("HEADLINE  %.0f commands/s\n", commands_per_sec);
+    const std::size_t order_rejects = rejected_events.load();
+    if (legacy_before) {
+        std::printf("BEFORE_FLAWED  %.0f commands/s\n", commands_per_sec);
+    } else if (risk_rejects == 0) {
+        std::printf("HEADLINE_CORRECTED  %.0f commands/s\n", commands_per_sec);
+    } else {
+        std::printf("INVALID_CORRECTED_RUN  %.0f commands/s (funding gate failed)\n", commands_per_sec);
+    }
     std::printf("processed=%zu  wall=%.4fs  ns/op=%.1f  queue_hwm=%zu/%zu  submit_rejects=%zu  "
                 "order_rejected_events=%zu  resting=%zu  slab_live=%zu  slab_cap=%zu  ledger_accounts=%zu  "
                 "holds=%zu\n",
                 processed, elapsed, commands_per_sec > 0.0 ? 1e9 / commands_per_sec : 0.0,
                 pipeline.queue_high_water_mark(), kProductionIngest, pipeline.commands_rejected() - rejects_before,
-                rejected_events.load(), engine.resting_order_count(), mem.live_orders, mem.slab_capacity,
+                order_rejects, engine.resting_order_count(), mem.live_orders, mem.slab_capacity,
                 ledger.account_count(), ledger.hold_count());
-    return EXIT_SUCCESS;
+    std::printf("risk_rejected_events=%zu  insufficient_funds=%zu  insufficient_position=%zu  "
+                "order_too_large=%zu\n",
+                risk_rejects, insufficient_funds, insufficient_position, too_large);
+    for (std::size_t reason = 1; reason < rejects_by_reason.size(); ++reason) {
+        const std::size_t count = rejects_by_reason[reason].load(std::memory_order_relaxed);
+        if (count != 0) {
+            std::printf("reject_reason[%.*s]=%zu\n",
+                        static_cast<int>(to_string(static_cast<RejectReason>(reason)).size()),
+                        to_string(static_cast<RejectReason>(reason)).data(), count);
+        }
+    }
+    print_full_path_sweeps();
+    return !legacy_before && risk_rejects != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
 class WireClient {

@@ -1319,6 +1319,8 @@ The harness is `bench_capacity`.
 ```bash
 cmake --build build-release -j --target bench_capacity
 ./build-release/bench_capacity --scenario matching-thread
+# Legacy A/B arm only:
+./build-release/bench_capacity --scenario matching-thread --matching-accounts 1
 ./build-release/bench_capacity --scenario e2e-knee
 ./build-release/bench_capacity --scenario connections
 ./build-release/bench_capacity --scenario queue-drops
@@ -1331,16 +1333,69 @@ cmake --build build-release -j --target bench_capacity
 
 Shared mix: 40% rest / 25% cross / 20% cancel / 10% replace / 5% IOC-FOK,
 1000 orders/side seed, 64-tick band (`WorkloadMix::realistic()`).
+The matching-thread headline uses 128 uniformly selected, fully funded
+accounts. Its validity gate is `risk_rejected_events=0`; the separately
+reported `InsufficientLiquidity` count is the workload's intentional FOK
+book-depth outcome, not an account-funding failure. The generated stream is
+submitted in vector order because its cancels and replaces depend on earlier
+operations. MPSC producer contention is measured by the queue/fairness
+scenarios rather than by invalidating this stream through striped admission.
+
+The same scenario also prints `MultiLevelSweep/{1,4,16,64,256}` through both
+bare `MatchingEngine::process()` and
+`CommandSequencer` → `RiskGatedEngine`, including ns/op and the full/bare
+ratio. This exposes whether per-event ledger work grows with fill fan-out.
 
 | Scenario | Question | Headline |
 |---|---|---|
-| `matching-thread` | How many commands/s can the **production matching thread** do with zero sockets? | `CommandSequencer` → `RiskGatedEngine` (risk + ledger) → `MatchingEngine::process`. Empty-book IOC `process()` is a footnote, not this number. |
+| `matching-thread` | How many commands/s can the **production matching thread** do with zero sockets? | 128 funded accounts; `CommandSequencer` → `RiskGatedEngine` (risk + ledger) → `MatchingEngine::process`; zero risk rejects required. Also prints five full-path sweep-depth ratios. |
 | `e2e-knee` | At what offered TCP rate does achieved stop tracking and p99.9 blow up? | Geometric sweep from 5k/s; last tracking rate, first failure, achieved plateau. Mixed GTC, not a 100k token target. |
 | `connections` | Does 2 server threads stay healthy as N grows with **low** rate per connection? | 1, 10, 100, 1k, 2k, 5k, 10k. Spawn/connect failure is a result, not a harness bug. This process also has N client readers. |
 | `queue-drops` | When does each bounded queue actually drop, and what does a client see? | Ingest MPSC: `submit()` false; gateway currently **silent** (no Rejected). Outbound SPSC: engine committed, missing reports. MD `DroppingQueue`: detectable sequence gap. If TCP never fills ingest, that is reported; in-process flood is the matching-thread backpressure point. |
 | `fairness` | Does a polite client's p99 stay near isolation when others flood? | One 1k/s client vs N flooders; polite-only percentiles. |
 | `recovery` | How long is a subscriber blind after a gap? | `read_snapshot` + book rebuild vs depth. Lost sequences are **not** replayed (no retransmission). Second clock: UDP listen drain during delayed recovery. |
 | `soak` | Do RSS / resting orders / ledger maps / queue HWMs stay flat for hours? | Default 4h below the e2e knee. Latency tracing is off so the tracer ring cannot look like a leak. Sample interval 30s (`--quick` is 2s). |
+
+### Corrected matching-thread methodology (2026-09-02)
+
+Release build on the Apple M3 Pro, five alternating A/B process pairs,
+1,000,000 measured commands each:
+
+- Legacy before: one account, legacy funding.
+- Corrected after: 128 uniformly selected accounts, each funded with
+  \(10^{18}\) cash ticks and \(10^{12}\) units.
+- Both arms replay the identical deterministic mixed stream in vector order.
+- The corrected funding gate passed in all five runs:
+  `risk_rejected_events=0`.
+- Each run also emitted 15,772 `InsufficientLiquidity` rejections. Those are
+  intentional FOK book-depth outcomes. They are not risk/funding failures,
+  which is why the benchmark now prints rejection reasons separately.
+
+| Method | Commands/s runs | Median | Delta |
+|---|---|---:|---:|
+| Before: 1 account | 3,895,821; 3,043,372; 3,957,524; 3,940,830; 3,932,743 | 3,932,743/s | — |
+| After: 128 funded accounts | 3,740,197; 3,748,659; 3,758,637; 3,748,385; 3,538,405 | **3,748,385/s** | **−4.69%** |
+
+The one-account setup overstated full matching-thread capacity by about
+4.9% relative to the corrected median. The earlier undifferentiated
+`order_rejected_events` total was not a valid funding diagnostic: it mixed
+intentional FOK liquidity outcomes with risk failures. The new
+`risk_rejected_events` field is the funding gate.
+
+Five-run medians for the sweep-depth comparison:
+
+| Levels swept | Matching-only ns/op | Full-path ns/op | Full / matching |
+|---:|---:|---:|---:|
+| 1 | 118.6 | 202.0 | **1.70×** |
+| 4 | 793.0 | 1,177.5 | **1.49×** |
+| 16 | 3,089.8 | 4,481.0 | **1.45×** |
+| 64 | 12,206.8 | 17,697.6 | **1.45×** |
+| 256 | 47,739.2 | 70,324.5 | **1.47×** |
+
+The ratio does not grow with fill fan-out. The absolute risk/ledger cost
+does grow because `Ledger::apply()` runs per event, but matching work grows
+at least proportionally; the full/bare ratio settles near 1.45–1.49× from
+4 through 256 levels.
 
 Do not rewrite the historical IOC tables in the sections above. They remain
 valid for that command shape. Do not mix them with the matching-thread mixed
