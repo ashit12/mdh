@@ -111,6 +111,14 @@ std::size_t MatchingEngine::out_of_band_levels() const {
     return total;
 }
 
+std::size_t MatchingEngine::out_of_band_orders() const {
+    std::size_t total = 0;
+    for (const MatchingBook& book : books_) {
+        total += book.out_of_band_orders();
+    }
+    return total;
+}
+
 MatchingEngine::BookMemoryStats MatchingEngine::book_memory_stats() const {
     BookMemoryStats stats;
     for (const MatchingBook& book : books_) {

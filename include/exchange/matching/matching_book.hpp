@@ -147,6 +147,14 @@ public:
     // inferring from a latency.
     [[nodiscard]] std::size_t out_of_band_levels() const;
 
+    // Resting orders held at those levels. out_of_band_levels() counts map
+    // nodes, which says how much of the *index* has spilled; this counts
+    // orders, which says how much of the book has. A drifting price separates
+    // the two -- a few wide levels and most of the book out of band is a
+    // different story from many thin ones. Walks the fallback map, so it is
+    // for diagnostics between measured regions, not for a hot path.
+    [[nodiscard]] std::size_t out_of_band_orders() const;
+
     // Live resting orders on this book, and how many slab slots have ever
     // been allocated (including those on the free list). Matching thread only.
     [[nodiscard]] std::size_t live_order_count() const { return live_count_; }
@@ -220,6 +228,11 @@ private:
         [[nodiscard]] const LevelSlot& level_at(Price price) const;
 
         [[nodiscard]] std::size_t overflow_levels() const { return overflow_.size(); }
+
+        // The fallback map itself, so MatchingBook -- which owns the slab the
+        // levels link into -- can count the orders sitting out of band. This
+        // class is private to MatchingBook, so this is not public API.
+        [[nodiscard]] const std::pmr::map<Price, LevelSlot>& overflow() const { return overflow_; }
 
     private:
         // The bitmap has three levels: one bit per tick at the bottom, one

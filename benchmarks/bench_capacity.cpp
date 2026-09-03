@@ -15,9 +15,11 @@
 #include <exception>
 #include <filesystem>
 #include <future>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
+#include <sys/utsname.h>
 #include <thread>
 #include <type_traits>
 #include <unistd.h>
@@ -26,7 +28,9 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 #else
+// RSS, the CPU model and the thread count all come out of /proc on Linux.
 #include <fstream>
 #endif
 
@@ -98,13 +102,31 @@ struct Args {
     double soak_offered = 5'000.0;
     std::uint32_t matching_accounts = kMatchingAccounts;
     std::optional<unsigned> matching_cpu;
+
+    // Repeated-run discipline, shared by every scenario added for the
+    // post-epoll report: no single run is reported as final.
+    std::size_t repeats = 5;
+
+    // fok-latency
+    std::size_t fok_operations = 20'000;
+    std::size_t fok_levels = 4;
+
+    // price-drift
+    std::size_t drift_operations = 1'000'000;
+    std::size_t drift_window = 100'000;
+    // How far the reference mid travels over the whole run, in ticks. The
+    // default is three times MatchingBook::kMaxBandTicks, so the run ends
+    // with the touch far outside the band the ladder anchored on.
+    std::size_t drift_ticks = 3 * 8192;
+    std::size_t drift_noise_ticks = 8;
 };
 
 void print_usage() {
     std::printf(
         "bench_capacity — capacity and failure-path measurements (Release only)\n"
         "\n"
-        "  --scenario matching-thread|e2e-knee|connections|queue-drops|fairness|recovery|soak|all\n"
+        "  --scenario matching-thread|e2e-knee|connections|queue-drops|fairness|recovery|soak|\n"
+        "             fok-latency|md-realistic|price-drift|all\n"
         "  --quick                         smaller ops / skip 2k+ connections / 2s soak\n"
         "  --operations N                 mixed-stream length (default 1000000)\n"
         "  --e2e-samples N                  samples per offered rate (default 4000)\n"
@@ -115,9 +137,15 @@ void print_usage() {
         "  --soak-hours H                  default 4; --soak-seconds overrides\n"
         "  --matching-accounts N           matching-thread accounts (default 128; use 1 for legacy before)\n"
         "  --matching-cpu N                pin matching thread (Linux)\n"
+        "  --repeats N                     repeated runs for the scenarios that take a median (default 5)\n"
+        "  --fok-operations N              FOK commands in fok-latency (default 20000, half of each outcome)\n"
+        "  --fok-levels N                  price levels each FOK reaches (default 4)\n"
+        "  --drift-operations N            price-drift stream length (default 1000000)\n"
+        "  --drift-window N                price-drift sampling window (default 100000)\n"
+        "  --drift-ticks N                 total upward drift over the run (default 24576 = 3 x band)\n"
         "\n"
         "  all = matching-thread, e2e-knee, queue-drops, fairness, recovery\n"
-        "        (not connections or soak)\n");
+        "        (not connections, soak, fok-latency, md-realistic or price-drift)\n");
 }
 
 [[nodiscard]] std::vector<int> parse_int_list(const char* text) {
@@ -200,6 +228,35 @@ void print_usage() {
             if (const char* v = next()) {
                 args.matching_cpu = static_cast<unsigned>(std::atoi(v));
             }
+        } else if (flag == "--repeats") {
+            if (const char* v = next()) {
+                args.repeats = static_cast<std::size_t>(std::max(1, std::atoi(v)));
+            }
+        } else if (flag == "--fok-operations") {
+            if (const char* v = next()) {
+                args.fok_operations = static_cast<std::size_t>(std::max(2LL, std::atoll(v)));
+            }
+        } else if (flag == "--fok-levels") {
+            if (const char* v = next()) {
+                args.fok_levels = static_cast<std::size_t>(std::max(1, std::atoi(v)));
+            }
+        } else if (flag == "--drift-operations") {
+            if (const char* v = next()) {
+                args.drift_operations = static_cast<std::size_t>(std::max(1LL, std::atoll(v)));
+            }
+        } else if (flag == "--drift-window") {
+            if (const char* v = next()) {
+                args.drift_window = static_cast<std::size_t>(std::max(1LL, std::atoll(v)));
+            }
+        } else if (flag == "--drift-ticks") {
+            // Zero is allowed and is the control: the same generator, the
+            // same buy-heavy flow, a book that grows the same way, but a mid
+            // that never moves -- so the ladder is never left behind. It is
+            // what separates "the book got bigger" from "the book left its
+            // band" in the windowed numbers.
+            if (const char* v = next()) {
+                args.drift_ticks = static_cast<std::size_t>(std::max(0LL, std::atoll(v)));
+            }
         }
     }
     if (args.quick) {
@@ -211,6 +268,10 @@ void print_usage() {
         if (args.soak_seconds <= 0.0) {
             args.soak_seconds = 2.0;
         }
+        args.repeats = std::min(args.repeats, static_cast<std::size_t>(2));
+        args.fok_operations = std::min(args.fok_operations, static_cast<std::size_t>(2'000));
+        args.drift_operations = std::min(args.drift_operations, static_cast<std::size_t>(100'000));
+        args.drift_window = std::min(args.drift_window, static_cast<std::size_t>(10'000));
     }
     return args;
 }
@@ -233,6 +294,208 @@ void print_usage() {
     const long page = sysconf(_SC_PAGESIZE);
     return resident_pages * static_cast<std::size_t>(page > 0 ? page : 4096);
 #endif
+}
+
+// ── Reproducibility header: machine, build, exact command ─────────────────
+//
+// Every scenario that writes a bench-results file prints this, because a
+// capacity number without the machine under it is not comparable to
+// anything. The command line is echoed from argv rather than described in
+// prose so that re-running is copy-paste rather than reconstruction.
+
+std::string g_command_line;
+
+[[nodiscard]] std::string sysctl_string(const char* name) {
+#if defined(__APPLE__)
+    std::size_t len = 0;
+    if (sysctlbyname(name, nullptr, &len, nullptr, 0) != 0 || len == 0) {
+        return {};
+    }
+    std::string value(len, '\0');
+    if (sysctlbyname(name, value.data(), &len, nullptr, 0) != 0) {
+        return {};
+    }
+    value.resize(len > 0 ? len - 1 : 0);
+    return value;
+#else
+    (void)name;
+    return {};
+#endif
+}
+
+[[nodiscard]] std::string cpu_model() {
+#if defined(__APPLE__)
+    return sysctl_string("machdep.cpu.brand_string");
+#else
+    std::ifstream in("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        const std::string key = line.substr(0, line.find_first_of(" \t"));
+        if (key == "model" || key == "Model") {
+            if (line.find("model name") != std::string::npos || line.find("model") == 0) {
+                return line.substr(colon + 2);
+            }
+        }
+        if (line.rfind("model name", 0) == 0 || line.rfind("Model", 0) == 0) {
+            return line.substr(colon + 2);
+        }
+    }
+    return {};
+#endif
+}
+
+[[nodiscard]] std::string os_description() {
+    struct utsname info {};
+    if (uname(&info) != 0) {
+        return "unknown";
+    }
+    std::string text = std::string(info.sysname) + " " + info.release + " " + info.machine;
+#if defined(__APPLE__)
+    const std::string product = sysctl_string("kern.osproductversion");
+    if (!product.empty()) {
+        text += " (macOS " + product + ")";
+    }
+#endif
+    return text;
+}
+
+[[nodiscard]] std::size_t total_memory_bytes() {
+#if defined(__APPLE__)
+    std::uint64_t bytes = 0;
+    std::size_t len = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &len, nullptr, 0) != 0) {
+        return 0;
+    }
+    return static_cast<std::size_t>(bytes);
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long page = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page > 0 ? static_cast<std::size_t>(pages) * static_cast<std::size_t>(page) : 0;
+#endif
+}
+
+// Threads this process actually has, according to the OS rather than
+// according to what the architecture diagram claims. Native APIs, because a
+// benchmark asserting "fewer threads now" has to measure the number, and
+// because the equivalent shell command (printed by
+// thread_count_cross_check() so a reader can verify by hand) cannot be run
+// from inside a timed region.
+[[nodiscard]] std::size_t os_thread_count() {
+#if defined(__APPLE__)
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t count = 0;
+    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    for (mach_msg_type_number_t i = 0; i < count; ++i) {
+        (void)mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    (void)vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads),
+                        count * sizeof(thread_t));
+    return static_cast<std::size_t>(count);
+#else
+    std::ifstream in("/proc/self/status");
+    std::string key;
+    while (in >> key) {
+        if (key == "Threads:") {
+            std::size_t value = 0;
+            if (in >> value) {
+                return value;
+            }
+            return 0;
+        }
+        std::string rest;
+        std::getline(in, rest);
+    }
+    return 0;
+#endif
+}
+
+// The same count, taken the way the request asked for it: by asking the
+// system tools about this pid from outside the process. Reported next to the
+// native figure so the two can be seen to agree.
+[[nodiscard]] std::string thread_count_cross_check_command() {
+#if defined(__APPLE__)
+    return "ps -M " + std::to_string(static_cast<int>(getpid())) + " | tail -n +2 | wc -l";
+#else
+    return "grep '^Threads:' /proc/" + std::to_string(static_cast<int>(getpid())) + "/status";
+#endif
+}
+
+// Returns nullopt rather than a number when the tools could not be asked.
+// That happens for real at the top of the sweep: popen() has to fork, and
+// the whole reason the highest N fails is that the process can no longer
+// create threads, so this is exactly where a "0" would be mistaken for a
+// measurement. Every own-stdio buffer is flushed first so the child's output
+// cannot land ahead of ours in a redirected log.
+[[nodiscard]] std::optional<std::size_t> external_thread_count() {
+    const std::string command =
+#if defined(__APPLE__)
+        "ps -M " + std::to_string(static_cast<int>(getpid())) + " 2>/dev/null | tail -n +2 | wc -l 2>/dev/null";
+#else
+        "ps -L -p " + std::to_string(static_cast<int>(getpid())) + " --no-headers 2>/dev/null | wc -l 2>/dev/null";
+#endif
+    std::fflush(stdout);
+    std::fflush(stderr);
+    FILE* pipe = ::popen(command.c_str(), "r");
+    if (pipe == nullptr) {
+        return std::nullopt;
+    }
+    char line[64] = {};
+    const bool read_ok = std::fgets(line, sizeof(line), pipe) != nullptr;
+    const int status = ::pclose(pipe);
+    if (!read_ok || status != 0) {
+        return std::nullopt;
+    }
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(line, &end, 10);
+    if (end == line || value == 0) {
+        return std::nullopt;
+    }
+    return static_cast<std::size_t>(value);
+}
+
+void print_run_header(const char* scenario, std::size_t repeats, const char* statistic) {
+    std::printf("=== reproducibility ===\n");
+    std::printf("scenario=%s\n", scenario);
+    std::printf("command=%s\n", g_command_line.c_str());
+    std::printf("build=%s\n",
+#if defined(NDEBUG)
+                "Release (-O3 -DNDEBUG)"
+#else
+                "NOT-RELEASE (numbers are not representative)"
+#endif
+    );
+    std::printf("os=%s\n", os_description().c_str());
+    std::printf("cpu=%s  logical_cpus=%ld  memory=%.1f GiB\n", cpu_model().c_str(),
+                sysconf(_SC_NPROCESSORS_ONLN), static_cast<double>(total_memory_bytes()) / (1024.0 * 1024 * 1024));
+    std::printf("repeated_runs=%zu  reported_statistic=%s\n", repeats, statistic);
+    std::printf("thread_count_cross_check=%s\n", thread_count_cross_check_command().c_str());
+    std::printf("=======================\n");
+}
+
+// ── Repeated runs ─────────────────────────────────────────────────────────
+//
+// Same discipline as the corrected matching-thread ceiling: no single run is
+// reported as final. Each scenario below runs its measurement `repeats`
+// times and reports the median of each statistic across runs, with the
+// per-run values printed above it so a reader can see the spread rather than
+// take the median on trust.
+
+[[nodiscard]] double median_of(std::vector<double> values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    const std::size_t mid = values.size() / 2;
+    if (values.size() % 2 == 1) {
+        return values[mid];
+    }
+    return (values[mid - 1] + values[mid]) / 2.0;
 }
 
 [[nodiscard]] WorkloadConfig mixed_config(std::size_t operations, std::uint32_t accounts = 1) {
@@ -790,15 +1053,61 @@ int run_e2e_knee(const Args& args, double ticks_per_second) {
     return EXIT_SUCCESS;
 }
 
+// Where the process's threads came from at one N. The gateway runs in this
+// same process as the load generator, so "server threads" cannot be read off
+// a single total -- it is the delta across gateway construction and start(),
+// with the client reader and sender threads accounted separately. Measuring
+// it this way is what lets the post-epoll figure be compared against the
+// pre-epoll 2N+2 model rather than asserted against it.
+struct ThreadPhases {
+    std::size_t before_gateway = 0;
+    std::size_t after_gateway = 0;
+    std::size_t after_connect = 0;
+    std::optional<std::size_t> external_after_connect;
+};
+
+// `senders` is how many sender threads were actually created, which is not
+// always N: at the top of the sweep the spawn loop is the thing that fails.
+void print_thread_report(int n, const ThreadPhases& phases, std::size_t peak, int senders) {
+    const std::size_t server = phases.after_gateway >= phases.before_gateway
+                                    ? phases.after_gateway - phases.before_gateway
+                                    : 0;
+    const std::size_t readers = phases.after_connect >= phases.after_gateway
+                                     ? phases.after_connect - phases.after_gateway
+                                     : 0;
+    std::printf("THREADS N=%d  server_threads=%zu  pre_epoll_model_2N+2=%d  client_reader_threads=%zu  "
+                "sender_threads=%d\n",
+                n, server, 2 * n + 2, readers, senders);
+    std::printf("THREADS N=%d  process_total before_gateway=%zu  after_gateway=%zu  after_connect=%zu  peak=%zu  ",
+                n, phases.before_gateway, phases.after_gateway, phases.after_connect, peak);
+    if (phases.external_after_connect.has_value()) {
+        std::printf("ps_after_connect=%zu\n", *phases.external_after_connect);
+    } else {
+        std::printf("ps_after_connect=unavailable (could not fork the cross-check at this N)\n");
+    }
+}
+
 int run_connections(const Args& args, double ticks_per_second) {
+    print_run_header("connections", 1,
+                     "single sweep per N (one process per N); thread counts are exact OS counts, not estimates");
     std::printf("\n== connection scaling (low per-connection rate, IoPoller I/O thread) ==\n");
     std::printf("expected server threads = 2 (I/O + matching); this process also has N client reader threads.\n");
+    std::printf("server_threads below is measured as the process thread-count delta across gateway "
+                "construction+start,\n"
+                "because the gateway and the load generator share this process. Cross-check command is in the "
+                "header above.\n");
 
     latency::ScopedEnable tracing(1 << 20);
     for (int n : args.connections) {
         const double aggregate = args.per_connection_rate * static_cast<double>(n);
         std::printf("\n-- N=%d  per-conn=%.0f/s  aggregate_offered=%.0f/s  rss_before=%zu --\n", n,
                     args.per_connection_rate, aggregate, rss_bytes());
+
+        ThreadPhases phases;
+        std::size_t peak_threads = 0;
+        phases.before_gateway = os_thread_count();
+        peak_threads = phases.before_gateway;
+
         auto gateway =
             make_capacity_gateway(args, std::vector<InstrumentId>{1}, kProductionIngest, kProductionOutbound, {},
                                    std::max(128, n));
@@ -806,6 +1115,8 @@ int run_connections(const Args& args, double ticks_per_second) {
             std::printf("RESULT  N=%d  listen failed\n", n);
             return EXIT_SUCCESS;
         }
+        phases.after_gateway = os_thread_count();
+        peak_threads = std::max(peak_threads, phases.after_gateway);
         fund_gateway(*gateway, 1, n, std::vector<InstrumentId>{1});
 
         std::vector<std::unique_ptr<WireClient>> clients;
@@ -817,6 +1128,9 @@ int run_connections(const Args& args, double ticks_per_second) {
                 if (!client->connect(*gateway->local_port())) {
                     std::printf("RESULT  N=%d  connect failed at client %d  connected=%d  rss=%zu\n", n, i, connected,
                                 rss_bytes());
+                    phases.after_connect = os_thread_count();
+                    phases.external_after_connect = external_thread_count();
+                    print_thread_report(n, phases, std::max(peak_threads, phases.after_connect), 0);
                     gateway->stop();
                     return EXIT_SUCCESS;
                 }
@@ -826,9 +1140,28 @@ int run_connections(const Args& args, double ticks_per_second) {
         } catch (const std::exception& ex) {
             std::printf("RESULT  N=%d  thread/create failed after %d connects: %s  rss=%zu\n", n, connected, ex.what(),
                         rss_bytes());
+            phases.after_connect = os_thread_count();
+            phases.external_after_connect = external_thread_count();
+            print_thread_report(n, phases, std::max(peak_threads, phases.after_connect), 0);
+            // Worth stating plainly, because the obvious reading of this row
+            // is the wrong one: what ran out of threads is this process's own
+            // client population -- one reader thread per WireClient -- not
+            // the gateway, which is still sitting on the two threads reported
+            // above and had accepted every one of those connections.
+            std::printf("NOTE    N=%d  the thread that could not be created is a *client* reader thread in this "
+                        "harness.\n"
+                        "NOTE    N=%d  the gateway accepted %d connections on %zu threads and did not fail; the "
+                        "limit reached is the load generator's.\n",
+                        n, n, connected,
+                        phases.after_gateway >= phases.before_gateway
+                            ? phases.after_gateway - phases.before_gateway
+                            : 0);
             gateway->stop();
             return EXIT_SUCCESS;
         }
+        phases.after_connect = os_thread_count();
+        phases.external_after_connect = external_thread_count();
+        peak_threads = std::max(peak_threads, phases.after_connect);
 
         const auto interval = std::chrono::duration<double>(args.per_connection_rate > 0.0
                                                                    ? 1.0 / args.per_connection_rate
@@ -838,35 +1171,60 @@ int run_connections(const Args& args, double ticks_per_second) {
         std::atomic<std::size_t> sent{0};
         std::vector<std::thread> senders;
         std::atomic<bool> failed{false};
-        for (int i = 0; i < n; ++i) {
-            senders.emplace_back([&, i] {
-                ClientOrderId id = 1;
-                auto next = std::chrono::steady_clock::now();
-                while (std::chrono::steady_clock::now() < deadline && !failed.load(std::memory_order_relaxed)) {
-                    while (std::chrono::steady_clock::now() < next) {
-                        std::this_thread::sleep_for(50us);
+        // Spawning is guarded for the same reason the connect loop above is:
+        // at high N the thread that fails to start is a std::system_error out
+        // of the std::thread constructor, and letting it escape aborts the
+        // whole process -- taking with it every N still to be measured, and
+        // leaving the already-spawned senders unjoined while they hold
+        // references to these locals. So the catch stops the senders already
+        // running, joins them, and reports this N as a clean failure row.
+        int spawned = 0;
+        std::string spawn_error;
+        try {
+            for (int i = 0; i < n; ++i) {
+                senders.emplace_back([&, i] {
+                    ClientOrderId id = 1;
+                    auto next = std::chrono::steady_clock::now();
+                    while (std::chrono::steady_clock::now() < deadline && !failed.load(std::memory_order_relaxed)) {
+                        while (std::chrono::steady_clock::now() < next) {
+                            std::this_thread::sleep_for(50us);
+                        }
+                        const Message message{NewOrder{
+                            .account_id = static_cast<AccountId>(1 + i),
+                            .client_order_id = id++,
+                            .instrument_id = 1,
+                            .side = Side::Buy,
+                            .price = 1,
+                            .quantity = 1,
+                            .order_type = OrderType::Limit,
+                            .time_in_force = TimeInForce::IOC,
+                        }};
+                        if (!clients[static_cast<std::size_t>(i)]->send_message(message)) {
+                            failed.store(true, std::memory_order_relaxed);
+                            return;
+                        }
+                        sent.fetch_add(1, std::memory_order_relaxed);
+                        next += std::chrono::duration_cast<std::chrono::steady_clock::duration>(interval);
                     }
-                    const Message message{NewOrder{
-                        .account_id = static_cast<AccountId>(1 + i),
-                        .client_order_id = id++,
-                        .instrument_id = 1,
-                        .side = Side::Buy,
-                        .price = 1,
-                        .quantity = 1,
-                        .order_type = OrderType::Limit,
-                        .time_in_force = TimeInForce::IOC,
-                    }};
-                    if (!clients[static_cast<std::size_t>(i)]->send_message(message)) {
-                        failed.store(true, std::memory_order_relaxed);
-                        return;
-                    }
-                    sent.fetch_add(1, std::memory_order_relaxed);
-                    next += std::chrono::duration_cast<std::chrono::steady_clock::duration>(interval);
-                }
-            });
+                });
+                ++spawned;
+            }
+        } catch (const std::exception& ex) {
+            spawn_error = ex.what();
+            failed.store(true, std::memory_order_relaxed);
         }
+        peak_threads = std::max(peak_threads, os_thread_count());
         for (auto& sender : senders) {
             sender.join();
+        }
+        if (!spawn_error.empty()) {
+            std::printf("RESULT  N=%d  sender thread/create failed after %d of %d spawns: %s  connected=%d  "
+                        "sent=%zu  rss=%zu\n",
+                        n, spawned, n, spawn_error.c_str(), connected, sent.load(), rss_bytes());
+            print_thread_report(n, phases, peak_threads, spawned);
+            gateway->stop();
+            std::printf("stopping the connection sweep after a sender spawn failure\n");
+            return EXIT_SUCCESS;
         }
 
         std::vector<std::uint64_t> polite_e2e;
@@ -886,6 +1244,7 @@ int run_connections(const Args& args, double ticks_per_second) {
                     n, connected, sent.load(), summary.count, summary.p50_ns / 1000.0, summary.p99_ns / 1000.0,
                     summary.p999_ns / 1000.0, rss_bytes(), gateway->matching_queue_high_water_mark(),
                     static_cast<int>(failed.load()));
+        print_thread_report(n, phases, peak_threads, n);
         gateway->stop();
         if (failed) {
             std::printf("stopping the connection sweep after a send failure\n");
@@ -1320,6 +1679,900 @@ int run_recovery(const Args& args) {
     return EXIT_SUCCESS;
 }
 
+// ── FOK isolated latency ──────────────────────────────────────────────────
+//
+// The mixed 40/25/20/10/5 stream puts FOK at 5% and splits even that between
+// filling and rejecting, so FOK's cost is buried twice over: once in the
+// mix, once in the two outcomes averaging into one figure. FOK is the only
+// order type that walks the book *before* it decides anything
+// (MatchingBook::crossable_quantity, the all-or-nothing preflight), which
+// makes its two outcomes structurally different operations:
+//
+//   fill    the preflight walks K levels and succeeds, then the matching
+//           walk consumes exactly those levels -- a trade, a book removal
+//           and a ledger settlement for every resting order on them.
+//   reject  the preflight walks the same K levels, comes up one unit short,
+//           and nothing is matched, mutated or settled.
+//
+// So this scenario sizes every FOK against the book's real depth, which is
+// what makes each outcome guaranteed rather than hoped for, and keeps the
+// two buckets apart. Both go through the full RiskGatedEngine path --
+// sequencer, risk, ledger, engine -- on funded, distinct accounts, with zero
+// risk rejections as the pass condition: the same methodology as the
+// corrected matching-thread ceiling.
+
+// One side's price-time queue, maintained from the engine's own public event
+// stream. The same technique generate_workload uses, and for the same
+// reason: sizing a FOK needs current depth, and MatchingEngine::snapshot()
+// copies the whole book, so it cannot be consulted per operation.
+class LevelQueueModel {
+public:
+    struct Resting {
+        ExchangeOrderId exchange_order_id;
+        Quantity quantity;
+    };
+
+    explicit LevelQueueModel(Side side) : side_(side) {}
+
+    void add(Price price, ExchangeOrderId exchange_order_id, Quantity quantity) {
+        levels_[price].push_back(Resting{exchange_order_id, quantity});
+    }
+
+    void reduce(Price price, ExchangeOrderId exchange_order_id, Quantity remaining) {
+        auto level = levels_.find(price);
+        if (level == levels_.end()) {
+            return;
+        }
+        for (auto& resting : level->second) {
+            if (resting.exchange_order_id == exchange_order_id) {
+                resting.quantity = remaining;
+                return;
+            }
+        }
+    }
+
+    void remove(Price price, ExchangeOrderId exchange_order_id) {
+        auto level = levels_.find(price);
+        if (level == levels_.end()) {
+            return;
+        }
+        auto& queue = level->second;
+        for (auto it = queue.begin(); it != queue.end(); ++it) {
+            if (it->exchange_order_id == exchange_order_id) {
+                queue.erase(it);
+                break;
+            }
+        }
+        if (queue.empty()) {
+            levels_.erase(level);
+        }
+    }
+
+    // The best `count` prices in this side's own priority order, best first.
+    // Bids read the map backwards; asks forwards.
+    [[nodiscard]] std::vector<Price> best_prices(std::size_t count) const {
+        std::vector<Price> prices;
+        prices.reserve(count);
+        if (side_ == Side::Buy) {
+            for (auto it = levels_.rbegin(); it != levels_.rend() && prices.size() < count; ++it) {
+                prices.push_back(it->first);
+            }
+        } else {
+            for (auto it = levels_.begin(); it != levels_.end() && prices.size() < count; ++it) {
+                prices.push_back(it->first);
+            }
+        }
+        return prices;
+    }
+
+    [[nodiscard]] const std::vector<Resting>& at(Price price) const { return levels_.find(price)->second; }
+    void erase_level(Price price) { levels_.erase(price); }
+    [[nodiscard]] std::size_t level_count() const { return levels_.size(); }
+
+private:
+    Side side_;
+    std::map<Price, std::vector<Resting>> levels_;
+};
+
+struct FokRunResult {
+    LatencySummary fill;
+    LatencySummary reject;
+    std::size_t liquidity_rejects = 0;
+    std::size_t risk_rejects = 0;
+    std::size_t other_rejects = 0;
+    std::size_t skipped_thin_book = 0;
+    double mean_orders_per_fill = 0.0;
+    std::size_t levels_per_fok = 0;
+    std::size_t resting_after_seed = 0;
+    std::size_t resting_at_end = 0;
+    bool outcomes_confirmed = false;
+};
+
+[[nodiscard]] FokRunResult run_fok_once(const Args& args, double ticks_per_second) {
+    FokRunResult out;
+    out.levels_per_fok = args.fok_levels;
+
+    // operation_count 0: this takes the mixed generator's *seed* phase only,
+    // which is the whole point -- the same 1000 orders per side over the same
+    // 64-tick band the mixed workload starts from, and then nothing but FOK.
+    const WorkloadConfig config = mixed_config(0, args.matching_accounts);
+    const auto workload = generate_workload(config);
+    constexpr InstrumentId kInstrument = 1;
+
+    MatchingEngine engine(config.instruments(), 200'000);
+    ledger::Ledger ledger;
+    fund_ledger(ledger, config, kMatchingFundCash, kMatchingFundPosition);
+    risk::RiskGatedEngine gated(engine, ledger);
+    sequencing::CommandSequencer sequencer;
+
+    std::array<std::size_t, static_cast<std::size_t>(RejectReason::AccountMismatch) + 1> rejects{};
+    LevelQueueModel bids(Side::Buy);
+    LevelQueueModel asks(Side::Sell);
+    const auto side_model = [&](Side side) -> LevelQueueModel& { return side == Side::Buy ? bids : asks; };
+
+    // Untimed sink. The seed and replenishment phases run through this so the
+    // model learns the exchange order ids and quantities that the measured
+    // FOKs are then sized against.
+    const EventSink learn = [&](const ExchangeEvent& event) {
+        std::visit(
+            [&](const auto& ev) {
+                using T = std::decay_t<decltype(ev)>;
+                if constexpr (std::is_same_v<T, BookOrderAdded>) {
+                    side_model(ev.side).add(ev.price, ev.exchange_order_id, ev.quantity);
+                } else if constexpr (std::is_same_v<T, BookOrderReduced>) {
+                    side_model(ev.side).reduce(ev.price, ev.exchange_order_id, ev.new_remaining_quantity);
+                } else if constexpr (std::is_same_v<T, BookOrderRemoved>) {
+                    side_model(ev.side).remove(ev.price, ev.exchange_order_id);
+                } else if constexpr (std::is_same_v<T, OrderRejected>) {
+                    ++rejects[static_cast<std::size_t>(ev.reason)];
+                }
+            },
+            event);
+    };
+
+    // Timed sink. Deliberately the same shape as the one the corrected
+    // matching-thread ceiling times through -- one get_if per event, no
+    // bookkeeping -- so these ns/op are comparable with that figure. The
+    // book model is brought up to date afterwards, outside the timed region,
+    // from what a *guaranteed* outcome implies: a fill consumes exactly the
+    // levels it was sized to consume, and a reject changes nothing at all.
+    const EventSink measured = [&](const ExchangeEvent& event) {
+        if (const auto* rejected = std::get_if<OrderRejected>(&event); rejected != nullptr) {
+            ++rejects[static_cast<std::size_t>(rejected->reason)];
+        }
+    };
+
+    for (const auto& command : workload.seed) {
+        gated.process(sequencer.sequence(command), learn);
+    }
+    out.resting_after_seed = engine.resting_order_count();
+
+    // Clear of every id the seed used, so nothing here is a duplicate.
+    SequentialIds ids;
+    ids.next_client_order_id = 1'000'000;
+
+    std::vector<std::uint64_t> fill_samples;
+    std::vector<std::uint64_t> reject_samples;
+    fill_samples.reserve(args.fok_operations / 2 + 1);
+    reject_samples.reserve(args.fok_operations / 2 + 1);
+    std::size_t orders_consumed = 0;
+    std::vector<std::pair<Price, Quantity>> consumed;
+
+    for (std::size_t op = 0; op < args.fok_operations; ++op) {
+        // Exactly half of each outcome, and the taker side alternates every
+        // pair so both sides of the book see the same treatment.
+        const bool want_fill = (op % 2) == 0;
+        const Side taker_side = ((op / 2) % 2) == 0 ? Side::Buy : Side::Sell;
+        LevelQueueModel& contra = side_model(taker_side == Side::Buy ? Side::Sell : Side::Buy);
+
+        const auto prices = contra.best_prices(args.fok_levels);
+        if (prices.size() < args.fok_levels) {
+            ++out.skipped_thin_book;
+            continue;
+        }
+
+        // Everything reachable at the K-th best price, which is exactly what
+        // the preflight will find: the levels past it are worse than the
+        // limit, so they break its walk.
+        Quantity reachable = 0;
+        consumed.clear();
+        for (const Price price : prices) {
+            for (const auto& resting : contra.at(price)) {
+                reachable += resting.quantity;
+                consumed.emplace_back(price, resting.quantity);
+            }
+        }
+        if (reachable == 0) {
+            ++out.skipped_thin_book;
+            continue;
+        }
+
+        const Price limit = prices.back();
+        const Quantity quantity = want_fill ? reachable : reachable + 1;
+        const AccountId taker = static_cast<AccountId>(1 + (op % config.account_count));
+        const ExchangeCommand command = sequencer.sequence(ExchangeCommand{
+            new_order(0, taker, ids.take_client_order_id(), kInstrument, taker_side, limit, quantity,
+                      TimeInForce::FOK)});
+
+        const std::uint64_t t0 = timer_ticks();
+        gated.process(command, measured);
+        const std::uint64_t t1 = timer_ticks();
+
+        if (!want_fill) {
+            reject_samples.push_back(t1 - t0);
+            continue;
+        }
+        fill_samples.push_back(t1 - t0);
+        orders_consumed += consumed.size();
+        for (const Price price : prices) {
+            contra.erase_level(price);
+        }
+        // Put the same multiset of (price, quantity) back, untimed, so the
+        // next measured FOK meets the book shape this one did rather than a
+        // progressively thinner one. Ids and queue positions differ; depth
+        // per level does not, which is what the measurement depends on.
+        const Side maker_side = taker_side == Side::Buy ? Side::Sell : Side::Buy;
+        for (const auto& [price, replenish_quantity] : consumed) {
+            const AccountId maker = static_cast<AccountId>(1 + (ids.next_client_order_id % config.account_count));
+            gated.process(sequencer.sequence(ExchangeCommand{new_order(0, maker, ids.take_client_order_id(),
+                                                                        kInstrument, maker_side, price,
+                                                                        replenish_quantity)}),
+                          learn);
+        }
+    }
+
+    out.resting_at_end = engine.resting_order_count();
+    out.mean_orders_per_fill =
+        fill_samples.empty() ? 0.0 : static_cast<double>(orders_consumed) / static_cast<double>(fill_samples.size());
+    out.liquidity_rejects = rejects[static_cast<std::size_t>(RejectReason::InsufficientLiquidity)];
+    out.risk_rejects = rejects[static_cast<std::size_t>(RejectReason::InsufficientFunds)] +
+                        rejects[static_cast<std::size_t>(RejectReason::InsufficientPosition)] +
+                        rejects[static_cast<std::size_t>(RejectReason::OrderTooLarge)];
+    for (std::size_t reason = 1; reason < rejects.size(); ++reason) {
+        if (reason != static_cast<std::size_t>(RejectReason::InsufficientLiquidity) &&
+            reason != static_cast<std::size_t>(RejectReason::InsufficientFunds) &&
+            reason != static_cast<std::size_t>(RejectReason::InsufficientPosition) &&
+            reason != static_cast<std::size_t>(RejectReason::OrderTooLarge)) {
+            out.other_rejects += rejects[reason];
+        }
+    }
+    // Every reject-bucket FOK must have produced exactly one
+    // InsufficientLiquidity, and no fill-bucket FOK may have produced any.
+    out.outcomes_confirmed = out.liquidity_rejects == reject_samples.size() && out.risk_rejects == 0 &&
+                              out.other_rejects == 0 && !fill_samples.empty();
+    out.fill = summarise_latency(fill_samples, ticks_per_second);
+    out.reject = summarise_latency(reject_samples, ticks_per_second);
+    return out;
+}
+
+int run_fok_latency(const Args& args, const TimerCalibration& cal) {
+    print_run_header("fok-latency", args.repeats, "median across runs of each per-bucket statistic");
+    std::printf("\n== FOK isolated latency (full RiskGatedEngine path, no sockets) ==\n");
+    std::printf("book seeded at the mixed generator's own depth: %zu orders/side, %lld-tick band, "
+                "instrument 1\n",
+                static_cast<std::size_t>(1'000), static_cast<long long>(64));
+    std::printf("each FOK reaches K=%zu price levels; fill is sized to exactly the reachable quantity, "
+                "reject to that plus one\n",
+                args.fok_levels);
+    std::printf("fok_operations=%zu (50%% fill / 50%% InsufficientLiquidity, alternating; taker side alternates "
+                "every pair)\n",
+                args.fok_operations);
+    std::printf("accounts=%u distinct and funded; pass condition is risk_rejected_events == 0\n",
+                args.matching_accounts);
+    std::printf("timer: effective resolution %.1f ns, zero-work interval p50 %.1f ns -- every per-operation "
+                "sample below carries that floor\n",
+                cal.effective_resolution_ns, cal.empty_interval_p50_ns);
+
+    std::vector<FokRunResult> runs;
+    runs.reserve(args.repeats);
+    std::printf("\n| run | bucket | samples | p50 ns | p90 ns | p99 ns | p99.9 ns | mean ns/op | "
+                "orders/fill | liq_rejects | risk_rejects | confirmed |\n");
+    for (std::size_t r = 0; r < args.repeats; ++r) {
+        auto result = run_fok_once(args, cal.measured_ticks_per_second);
+        for (int bucket = 0; bucket < 2; ++bucket) {
+            const LatencySummary& s = bucket == 0 ? result.fill : result.reject;
+            std::printf("| %3zu | %-6s | %7zu | %6.0f | %6.0f | %6.0f | %8.0f | %10.0f | %11.1f | %11zu | %12zu | "
+                        "%9d |\n",
+                        r + 1, bucket == 0 ? "fill" : "reject", s.count, s.p50_ns, s.p90_ns, s.p99_ns, s.p999_ns,
+                        s.sampled_mean_ns, bucket == 0 ? result.mean_orders_per_fill : 0.0, result.liquidity_rejects,
+                        result.risk_rejects, static_cast<int>(result.outcomes_confirmed));
+        }
+        runs.push_back(std::move(result));
+    }
+
+    const auto pick = [&](bool fill, double LatencySummary::* field) {
+        std::vector<double> values;
+        values.reserve(runs.size());
+        for (const auto& run : runs) {
+            values.push_back((fill ? run.fill : run.reject).*field);
+        }
+        return median_of(std::move(values));
+    };
+
+    std::printf("\n-- median of %zu runs --\n", args.repeats);
+    std::printf("| bucket | p50 ns | p90 ns | p99 ns | p99.9 ns | mean ns/op |\n");
+    for (int bucket = 0; bucket < 2; ++bucket) {
+        const bool fill = bucket == 0;
+        std::printf("| %-6s | %6.0f | %6.0f | %6.0f | %8.0f | %10.0f |\n", fill ? "fill" : "reject",
+                    pick(fill, &LatencySummary::p50_ns), pick(fill, &LatencySummary::p90_ns),
+                    pick(fill, &LatencySummary::p99_ns), pick(fill, &LatencySummary::p999_ns),
+                    pick(fill, &LatencySummary::sampled_mean_ns));
+    }
+
+    const double fill_median = pick(true, &LatencySummary::p50_ns);
+    const double reject_median = pick(false, &LatencySummary::p50_ns);
+    std::printf("\nFOK_FILL_MEDIAN_P50 %.0f ns  FOK_REJECT_MEDIAN_P50 %.0f ns  ratio %.2fx\n", fill_median,
+                reject_median, reject_median > 0.0 ? fill_median / reject_median : 0.0);
+    std::printf("orders consumed per fill (median run): %.1f  -- that is the trade/removal/settlement work the\n"
+                "reject bucket does not do, and it is what the gap between the two buckets buys.\n",
+                runs.empty() ? 0.0 : runs[runs.size() / 2].mean_orders_per_fill);
+
+    bool all_confirmed = true;
+    for (const auto& run : runs) {
+        all_confirmed = all_confirmed && run.outcomes_confirmed;
+    }
+    std::printf("outcomes_confirmed_every_run=%d  resting_after_seed=%zu  resting_at_end=%zu  "
+                "skipped_thin_book=%zu\n",
+                static_cast<int>(all_confirmed), runs.empty() ? 0 : runs.front().resting_after_seed,
+                runs.empty() ? 0 : runs.front().resting_at_end, runs.empty() ? 0 : runs.front().skipped_thin_book);
+    if (!all_confirmed) {
+        std::printf("INVALID_RUN: an outcome was not what it was sized to be, or a risk rejection fired.\n");
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+// ── Market-data drop rate at a realistic offered rate ─────────────────────
+//
+// The existing MarketDataRouter row in queue-drops is driven by the
+// matching-thread flood: commands pushed in as fast as one thread can push
+// them, which is several times any rate a client population actually
+// offers. It answers "what happens when the feed is overrun", and it is
+// worth keeping, but it says nothing about whether the feed keeps up under
+// normal load -- and those are different questions with, it turns out,
+// different answers.
+//
+// So this runs the router behind the *e2e-knee* traffic instead: the same
+// mixed GTC stream, over real TCP, paced at the same offered rates, with the
+// router wired in where production wires it (extra_event_sink) and a real
+// UDP subscriber on the other end.
+
+class UdpFrameSink {
+public:
+    explicit UdpFrameSink(std::uint16_t port) : port_(port) {}
+
+    void send(const protocol::Event& event) {
+        const std::array<protocol::Event, 1> frames{event};
+        auto datagram = net::pack_frames(packet_++, std::span<const protocol::Event>(frames));
+        (void)socket_.send_to(datagram, "127.0.0.1", port_);
+    }
+
+private:
+    net::UdpSocket socket_;
+    std::uint16_t port_;
+    std::uint64_t packet_{1};
+};
+
+struct MdRateRow {
+    double offered = 0.0;
+    double achieved = 0.0;
+    std::size_t dropped = 0;
+    std::size_t hwm = 0;
+    std::uint64_t routed = 0;
+    double p50_us = 0.0;
+    double p99_us = 0.0;
+    double p999_us = 0.0;
+    std::uint64_t sequence_failures = 0;
+    bool tracked = false;
+};
+
+[[nodiscard]] std::vector<MdRateRow> run_md_realistic_once(const Args& args, double ticks_per_second) {
+    std::vector<MdRateRow> rows;
+    const auto config = mixed_config(std::max(args.operations, args.e2e_samples * 8 + 4'000));
+    const auto workload = generate_workload(config);
+
+    latency::ScopedEnable tracing(1 << 22);
+
+    trader::strategies::StrategyRuntime runtime;
+    trader::market_data::FeedSubscriberOptions sub_opts;
+    sub_opts.replay_options.stop_on_sequence_error = false;
+    trader::market_data::FeedSubscriber subscriber(0, runtime, sub_opts);
+    if (!subscriber.start()) {
+        return rows;
+    }
+    UdpFrameSink udp(*subscriber.local_port());
+    exchange::market_data::MarketDataRouter router(
+        [&](const protocol::Event& event) { udp.send(event); },
+        exchange::market_data::MarketDataRouterOptions{.queue_capacity = kProductionMdQueue, .idle_timeout = 1ms});
+    router.start();
+
+    auto gateway = make_capacity_gateway(args, config.instruments(), kProductionIngest, kProductionOutbound,
+                                          router.sink());
+    if (!gateway->start()) {
+        router.stop();
+        subscriber.stop();
+        return rows;
+    }
+    fund_gateway(*gateway, 1, static_cast<int>(config.account_count), config.instruments());
+    WireClient client(1);
+    if (!client.connect(*gateway->local_port())) {
+        gateway->stop();
+        router.stop();
+        subscriber.stop();
+        return rows;
+    }
+    for (const auto& command : workload.seed) {
+        (void)client.send_command(command);
+    }
+    (void)client.wait_received(workload.seed.size(), 30s);
+
+    // The same rate ladder e2e-knee walks, so these rows sit directly
+    // alongside its own.
+    double rate = args.e2e_start_rate;
+    std::size_t offset = 0;
+    const std::size_t steps = args.quick ? 2 : 4;
+    for (std::size_t step = 0; step < steps; ++step) {
+        if (offset + args.e2e_samples > workload.operations.size()) {
+            break;
+        }
+        std::vector<ExchangeCommand> slice(workload.operations.begin() + static_cast<std::ptrdiff_t>(offset),
+                                            workload.operations.begin() +
+                                                static_cast<std::ptrdiff_t>(offset + args.e2e_samples));
+        offset += args.e2e_samples;
+
+        const std::size_t dropped_before = router.dropped_count();
+        const std::uint64_t routed_before = router.routed_count();
+        const std::uint64_t failures_before = subscriber.stats().sequence_failures;
+        const auto pace = run_paced_mixed(*gateway, client, slice, rate, args.e2e_samples, ticks_per_second);
+        // The routing thread is asynchronous, so give it the chance to drain
+        // what the matching thread queued before reading its counters.
+        std::this_thread::sleep_for(200ms);
+
+        MdRateRow row;
+        row.offered = pace.offered;
+        row.achieved = pace.achieved;
+        row.p50_us = pace.p50_us;
+        row.p99_us = pace.p99_us;
+        row.p999_us = pace.p999_us;
+        row.dropped = router.dropped_count() - dropped_before;
+        row.hwm = router.queue_high_water_mark();
+        row.routed = router.routed_count() - routed_before;
+        row.sequence_failures = subscriber.stats().sequence_failures - failures_before;
+        row.tracked = pace.achieved >= args.knee_track * pace.offered;
+        rows.push_back(row);
+        rate *= 2.0;
+    }
+
+    gateway->stop();
+    std::this_thread::sleep_for(200ms);
+    router.stop();
+    subscriber.stop();
+    return rows;
+}
+
+int run_md_realistic(const Args& args, double ticks_per_second) {
+    print_run_header("md-realistic", args.repeats, "median across runs, per offered rate");
+    std::printf("\n== MarketDataRouter drop rate at REALISTIC offered rates (e2e-knee traffic) ==\n");
+    std::printf("mixed GTC over TCP, production queues ingest=%zu outbound=%zu, router cap=%zu, real UDP "
+                "subscriber\n",
+                kProductionIngest, kProductionOutbound, kProductionMdQueue);
+    std::printf("THIS IS NOT THE ESCALATED FLOOD. The 'MarketDataRouter DroppingQueue' row in --scenario "
+                "queue-drops\n"
+                "drives the router from an in-process matching-thread flood; that measures overrun behaviour.\n"
+                "These rows are the client-paced rates e2e-knee sweeps, which is what normal load looks like.\n");
+
+    std::vector<std::vector<MdRateRow>> runs;
+    runs.reserve(args.repeats);
+    std::printf("\n| run | offered/s | achieved/s | tracks | md_dropped | md_hwm | md_routed | feed_seq_fail | "
+                "p50 us | p99 us | p99.9 us |\n");
+    for (std::size_t r = 0; r < args.repeats; ++r) {
+        auto rows = run_md_realistic_once(args, ticks_per_second);
+        if (rows.empty()) {
+            std::fprintf(stderr, "md-realistic: setup failed on run %zu\n", r + 1);
+            return EXIT_FAILURE;
+        }
+        for (const auto& row : rows) {
+            std::printf("| %3zu | %9.0f | %10.0f | %6d | %10zu | %6zu | %9llu | %13llu | %6.1f | %6.1f | %8.1f |\n",
+                        r + 1, row.offered, row.achieved, static_cast<int>(row.tracked), row.dropped, row.hwm,
+                        static_cast<unsigned long long>(row.routed),
+                        static_cast<unsigned long long>(row.sequence_failures), row.p50_us, row.p99_us,
+                        row.p999_us);
+        }
+        runs.push_back(std::move(rows));
+    }
+
+    std::size_t rate_count = 0;
+    for (const auto& rows : runs) {
+        rate_count = std::max(rate_count, rows.size());
+    }
+    std::printf("\n-- median of %zu runs --\n", args.repeats);
+    std::printf("| offered/s | achieved/s | md_dropped | md_hwm | md_routed | drop_pct_of_routed | feed_seq_fail |\n");
+    std::size_t total_dropped_median = 0;
+    for (std::size_t i = 0; i < rate_count; ++i) {
+        std::vector<double> offered;
+        std::vector<double> achieved;
+        std::vector<double> dropped;
+        std::vector<double> hwm;
+        std::vector<double> routed;
+        std::vector<double> failures;
+        for (const auto& rows : runs) {
+            if (i >= rows.size()) {
+                continue;
+            }
+            offered.push_back(rows[i].offered);
+            achieved.push_back(rows[i].achieved);
+            dropped.push_back(static_cast<double>(rows[i].dropped));
+            hwm.push_back(static_cast<double>(rows[i].hwm));
+            routed.push_back(static_cast<double>(rows[i].routed));
+            failures.push_back(static_cast<double>(rows[i].sequence_failures));
+        }
+        const double dropped_median = median_of(dropped);
+        const double routed_median = median_of(routed);
+        total_dropped_median += static_cast<std::size_t>(dropped_median);
+        std::printf("| %9.0f | %10.0f | %10.0f | %6.0f | %9.0f | %17.3f%% | %13.0f |\n", median_of(offered),
+                    median_of(achieved), dropped_median, median_of(hwm), routed_median,
+                    routed_median > 0.0 ? 100.0 * dropped_median / routed_median : 0.0, median_of(failures));
+    }
+
+    std::printf("\nVERDICT  ");
+    if (total_dropped_median == 0) {
+        std::printf("drops are ZERO at every realistic offered rate in this sweep. The feed keeps up under\n"
+                    "normal load; the large drop count in queue-drops is an overrun-only behaviour and should "
+                    "not be\n"
+                    "read as a production feed-loss rate.\n");
+    } else {
+        std::printf("drops are NON-TRIVIAL at realistic offered rates (median total %zu across the sweep).\n"
+                    "This is a real problem, separate from the known extreme-flood behaviour: a client at a "
+                    "normal\n"
+                    "rate is already losing feed events and seeing sequence gaps.\n",
+                    total_dropped_median);
+    }
+    return EXIT_SUCCESS;
+}
+
+// ── Price drift / ladder overflow ─────────────────────────────────────────
+//
+// Every price index in this book is anchored once, at the first price its
+// side ever sees, and covers a band of kMaxBandTicks around it
+// (MatchingBook::SideIndex). A side only re-anchors when it empties, and a
+// side carrying resting orders never does. So a market that trends in one
+// direction for long enough walks out of its own ladder and into the
+// std::pmr::map fallback, one level at a time, with no mechanism to follow
+// it.
+//
+// generate_workload cannot show this: its prices are drawn around a fixed
+// reference mid, so its book is roughly stationary and stays in band for as
+// long as you care to run it. This generator drifts the mid instead, far
+// enough past the band that the run ends with most of the touch outside it,
+// and the replay is timed in windows rather than as one aggregate -- an
+// average over a run that starts in-band and ends out of it is precisely the
+// number that would hide the effect.
+
+// Share of operations that cancel a live order, and the buy share of the
+// rest. See the pricing comment in generate_drift_workload for why the flow
+// is skewed rather than even.
+constexpr unsigned kDriftCancelPct = 15;
+constexpr unsigned kDriftBuyPct = 70;
+
+struct DriftWorkload {
+    std::vector<ExchangeCommand> seed;
+    std::vector<ExchangeCommand> operations;
+    std::size_t resting_after_seed = 0;
+    std::size_t restings = 0;
+    std::size_t crossings = 0;
+    std::size_t cancels = 0;
+    Price first_mid = 0;
+    Price last_mid = 0;
+    // The reference mid at the end of each window, for the table below.
+    std::vector<Price> window_mid;
+};
+
+[[nodiscard]] DriftWorkload generate_drift_workload(const Args& args) {
+    DriftWorkload out;
+    const WorkloadConfig config = mixed_config(0, args.matching_accounts);
+    constexpr InstrumentId kInstrument = 1;
+
+    // The starting book is the ordinary one: same seed phase as every other
+    // mixed-workload scenario, so what follows is the only difference.
+    const auto seeded = generate_workload(config);
+    out.seed = seeded.seed;
+    out.resting_after_seed = seeded.resting_orders_after_seed;
+
+    // Own engine, for the reason generate_workload has one: a cancel has to
+    // target an order that genuinely rests, and classifying an order as
+    // passive or aggressive needs the current touch.
+    MatchingEngine engine(config.instruments(), 500'000);
+    SplitMix64 rng(config.seed ^ 0x5D1F7ULL);
+    SequentialIds ids;
+    ids.next_client_order_id = 1'000'000;
+    LiveOrderIndex live;
+    DepthTracker depth(config.instrument_count);
+
+    std::vector<ExchangeEvent> events;
+    const EventSink sink = [&events](const ExchangeEvent& event) { events.push_back(event); };
+
+    AccountId owner_account = 0;
+    ClientOrderId owner_client_order_id = 0;
+    const auto apply = [&](const ExchangeCommand& command) {
+        events.clear();
+        engine.process(command, sink);
+        for (const auto& event : events) {
+            std::visit(
+                [&](const auto& ev) {
+                    using T = std::decay_t<decltype(ev)>;
+                    if constexpr (std::is_same_v<T, BookOrderAdded>) {
+                        depth.on_added(ev.instrument_id, ev.side, ev.price);
+                        live.insert(LiveOrderRecord{
+                            .exchange_order_id = ev.exchange_order_id,
+                            .client_order_id = owner_client_order_id,
+                            .account_id = owner_account,
+                            .instrument_id = ev.instrument_id,
+                            .side = ev.side,
+                            .price = ev.price,
+                            .remaining_quantity = ev.quantity,
+                        });
+                    } else if constexpr (std::is_same_v<T, BookOrderReduced>) {
+                        live.set_remaining_quantity(ev.exchange_order_id, ev.new_remaining_quantity);
+                    } else if constexpr (std::is_same_v<T, BookOrderRemoved>) {
+                        depth.on_removed(ev.instrument_id, ev.side, ev.price);
+                        live.erase(ev.exchange_order_id);
+                    }
+                },
+                event);
+        }
+    };
+
+    for (const auto& command : out.seed) {
+        std::visit(
+            [&](const auto& cmd) {
+                using T = std::decay_t<decltype(cmd)>;
+                owner_account = cmd.account_id;
+                if constexpr (std::is_same_v<T, NewOrderCommand>) {
+                    owner_client_order_id = cmd.client_order_id;
+                }
+            },
+            command);
+        apply(command);
+    }
+
+    // A mid that climbs `drift_ticks` over the run, with small symmetric
+    // noise so consecutive orders are not all at one price.
+    //
+    // Each order is priced passive relative to the mid *at its own moment*:
+    // bids strictly below it, asks strictly above, so nothing crosses within
+    // a single operation. Crossing comes from the drift alone -- an ask
+    // placed above the mid ten thousand operations ago is below it now, and
+    // the bid that reaches up to the current mid takes it. That is how a
+    // trending market consumes the liquidity it left behind, and it is why
+    // this generator does *not* clamp prices away from the opposing touch
+    // the way generate_workload does: that clamp would peg the bid under the
+    // stalest resting ask and the mid could never move at all.
+    //
+    // Order flow is deliberately buy-heavy (kDriftBuyPct of the new-order
+    // bucket), because that is the thing that *causes* a sustained upward
+    // drift rather than merely accompanying it -- and because a balanced
+    // stream does not accumulate a book at all. With one bid per ask, each
+    // new bid reaches down and takes exactly one stale ask as the mid passes
+    // it, the two sides consume each other one for one, and the book stays a
+    // few hundred orders deep no matter how far the price travels. Skewing
+    // the flow leaves the surplus bids resting, so the book grows across the
+    // whole drift range and the share of it living outside the band climbs
+    // steadily instead of arriving all at once.
+    const double per_op = static_cast<double>(args.drift_ticks) /
+                           static_cast<double>(std::max<std::size_t>(args.drift_operations, 1));
+    const auto mid_at = [&](std::size_t op) {
+        return config.base_price + static_cast<Price>(per_op * static_cast<double>(op));
+    };
+    out.first_mid = mid_at(0);
+    out.last_mid = mid_at(args.drift_operations);
+
+    out.operations.reserve(args.drift_operations);
+    for (std::size_t op = 0; op < args.drift_operations; ++op) {
+        const Price mid = mid_at(op);
+        const auto roll = static_cast<unsigned>(rng.below(100));
+
+        if (roll >= 100 - kDriftCancelPct && !live.empty()) {
+            const auto& record = live.at(rng.below(live.size()));
+            ExchangeCommand command{cancel_order(ids.take_command_sequence(), record.account_id,
+                                                  record.client_order_id, record.instrument_id)};
+            owner_account = record.account_id;
+            owner_client_order_id = record.client_order_id;
+            out.operations.push_back(command);
+            apply(command);
+            ++out.cancels;
+        } else {
+            const Side side = rng.below(100) < kDriftBuyPct ? Side::Buy : Side::Sell;
+            const auto noise =
+                static_cast<Price>(rng.below(static_cast<std::uint64_t>(args.drift_noise_ticks) * 2 + 1)) -
+                static_cast<Price>(args.drift_noise_ticks);
+            const Price local_mid = mid + noise;
+            const auto offset = static_cast<Price>(rng.below(static_cast<std::uint64_t>(config.price_band_ticks)));
+            Price price = side == Side::Buy ? local_mid - 1 - offset : local_mid + 1 + offset;
+            if (price <= 0) {
+                price = 1;
+            }
+            const auto contra = depth.best(kInstrument, opposite_of(side));
+            const bool crosses = contra.has_value() && (side == Side::Buy ? price >= *contra : price <= *contra);
+            const Quantity quantity = rng.between(config.min_quantity, config.max_quantity);
+            const AccountId account = static_cast<AccountId>(1 + rng.below(config.account_count));
+            const ClientOrderId client_order_id = ids.take_client_order_id();
+            ExchangeCommand command{new_order(ids.take_command_sequence(), account, client_order_id, kInstrument,
+                                               side, price, quantity)};
+            owner_account = account;
+            owner_client_order_id = client_order_id;
+            out.operations.push_back(command);
+            apply(command);
+            if (crosses) {
+                ++out.crossings;
+            } else {
+                ++out.restings;
+            }
+        }
+
+        if ((op + 1) % args.drift_window == 0) {
+            out.window_mid.push_back(mid);
+        }
+    }
+    return out;
+}
+
+struct DriftWindowSample {
+    std::size_t index = 0;
+    std::size_t operations = 0;
+    double ns_per_op = 0.0;
+    std::size_t resting = 0;
+    std::size_t oob_levels = 0;
+    std::size_t oob_orders = 0;
+};
+
+struct DriftRunResult {
+    std::vector<DriftWindowSample> windows;
+    std::size_t risk_rejects = 0;
+    std::size_t order_rejects = 0;
+    std::uint32_t band_ticks = 0;
+};
+
+// `full_path` selects what the window is timed through: the whole
+// RiskGatedEngine path (what every other capacity number in this file
+// measures) or MatchingEngine::process alone (which isolates the book's own
+// structure, and so the ladder-versus-map question, from risk and ledger
+// work).
+[[nodiscard]] DriftRunResult run_drift_once(const Args& args, const DriftWorkload& workload, bool full_path) {
+    DriftRunResult out;
+    const WorkloadConfig config = mixed_config(0, args.matching_accounts);
+    MatchingEngine engine(config.instruments(), 500'000);
+    out.band_ticks = engine.ladder_band_ticks();
+
+    ledger::Ledger ledger;
+    fund_ledger(ledger, config, kMatchingFundCash, kMatchingFundPosition);
+    risk::RiskGatedEngine gated(engine, ledger);
+    sequencing::CommandSequencer sequencer;
+
+    std::array<std::size_t, static_cast<std::size_t>(RejectReason::AccountMismatch) + 1> rejects{};
+    const EventSink sink = [&](const ExchangeEvent& event) {
+        if (const auto* rejected = std::get_if<OrderRejected>(&event); rejected != nullptr) {
+            ++rejects[static_cast<std::size_t>(rejected->reason)];
+        }
+    };
+
+    const auto run_one = [&](const ExchangeCommand& command) {
+        if (full_path) {
+            gated.process(sequencer.sequence(command), sink);
+        } else {
+            engine.process(command, sink);
+        }
+    };
+
+    for (const auto& command : workload.seed) {
+        run_one(command);
+    }
+
+    const std::size_t total = workload.operations.size();
+    for (std::size_t first = 0; first < total; first += args.drift_window) {
+        const std::size_t last = std::min(first + args.drift_window, total);
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t i = first; i < last; ++i) {
+            run_one(workload.operations[i]);
+        }
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        const std::size_t count = last - first;
+        out.windows.push_back(DriftWindowSample{
+            .index = out.windows.size(),
+            .operations = count,
+            .ns_per_op = count > 0 ? elapsed * 1e9 / static_cast<double>(count) : 0.0,
+            .resting = engine.resting_order_count(),
+            .oob_levels = engine.out_of_band_levels(),
+            .oob_orders = engine.out_of_band_orders(),
+        });
+    }
+
+    out.risk_rejects = rejects[static_cast<std::size_t>(RejectReason::InsufficientFunds)] +
+                        rejects[static_cast<std::size_t>(RejectReason::InsufficientPosition)] +
+                        rejects[static_cast<std::size_t>(RejectReason::OrderTooLarge)];
+    for (std::size_t reason = 1; reason < rejects.size(); ++reason) {
+        out.order_rejects += rejects[reason];
+    }
+    return out;
+}
+
+int run_price_drift(const Args& args) {
+    print_run_header("price-drift", args.repeats, "median ns/op per window across runs");
+    std::printf("\n== price drift / ladder overflow (sustained one-directional price movement) ==\n");
+    std::printf("There is no re-anchoring mechanism: SideIndex anchors on the first price its side sees and only\n"
+                "re-anchors if that side empties, which a side holding resting orders never does. This measures\n"
+                "what that costs when the market walks out of the band.\n");
+
+    const auto workload = generate_drift_workload(args);
+    std::printf("\nseed: %zu commands, %zu resting after seed (1000 orders/side, 64-tick band, base %lld)\n",
+                workload.seed.size(), workload.resting_after_seed, static_cast<long long>(100'000));
+    std::printf("stream: %zu operations  resting=%zu crossing=%zu cancel=%zu\n", workload.operations.size(),
+                workload.restings, workload.crossings, workload.cancels);
+    std::printf("drift: mid %lld -> %lld (%zu ticks up, noise +/-%zu), window=%zu operations\n",
+                static_cast<long long>(workload.first_mid), static_cast<long long>(workload.last_mid),
+                args.drift_ticks, args.drift_noise_ticks, args.drift_window);
+
+    for (int path = 0; path < 2; ++path) {
+        const bool full_path = path == 0;
+        std::vector<DriftRunResult> runs;
+        runs.reserve(args.repeats);
+        for (std::size_t r = 0; r < args.repeats; ++r) {
+            runs.push_back(run_drift_once(args, workload, full_path));
+        }
+        const auto& structure = runs.back();
+
+        std::printf("\n-- %s: ns/op per window, median of %zu runs (ladder band = %u ticks) --\n",
+                    full_path ? "full RiskGatedEngine path" : "MatchingEngine::process only", args.repeats,
+                    structure.band_ticks);
+        std::printf("| window |  ops range  | mid at end | ns/op median |");
+        for (std::size_t r = 0; r < args.repeats; ++r) {
+            std::printf(" run%zu |", r + 1);
+        }
+        std::printf(" resting | oob_levels | oob_orders | oob_share |\n");
+
+        double first_median = 0.0;
+        double last_median = 0.0;
+        for (std::size_t w = 0; w < structure.windows.size(); ++w) {
+            std::vector<double> per_run;
+            per_run.reserve(runs.size());
+            for (const auto& run : runs) {
+                if (w < run.windows.size()) {
+                    per_run.push_back(run.windows[w].ns_per_op);
+                }
+            }
+            const double median = median_of(per_run);
+            if (w == 0) {
+                first_median = median;
+            }
+            last_median = median;
+            const auto& s = structure.windows[w];
+            const double share =
+                s.resting > 0 ? 100.0 * static_cast<double>(s.oob_orders) / static_cast<double>(s.resting) : 0.0;
+            std::printf("| %6zu | %5zu-%5zu | %10lld | %12.1f |", s.index, w * args.drift_window,
+                        w * args.drift_window + s.operations - 1,
+                        static_cast<long long>(w < workload.window_mid.size() ? workload.window_mid[w] : 0),
+                        median);
+            for (const auto& run : runs) {
+                std::printf(" %5.0f |", w < run.windows.size() ? run.windows[w].ns_per_op : 0.0);
+            }
+            std::printf(" %7zu | %10zu | %10zu | %8.1f%% |\n", s.resting, s.oob_levels, s.oob_orders, share);
+        }
+
+        const auto& final_window = structure.windows.empty() ? DriftWindowSample{} : structure.windows.back();
+        std::printf("%s  first window %.1f ns/op -> last window %.1f ns/op  = %.2fx\n",
+                    full_path ? "DRIFT_FULL_PATH" : "DRIFT_MATCHING_ONLY", first_median, last_median,
+                    first_median > 0.0 ? last_median / first_median : 0.0);
+        std::printf("end of run: overflow map holds %zu levels and %zu resting orders out of %zu resting "
+                    "(%.1f%%)\n",
+                    final_window.oob_levels, final_window.oob_orders, final_window.resting,
+                    final_window.resting > 0
+                        ? 100.0 * static_cast<double>(final_window.oob_orders) / static_cast<double>(final_window.resting)
+                        : 0.0);
+        std::printf("risk_rejected_events=%zu  order_rejected_events=%zu\n", structure.risk_rejects,
+                    structure.order_rejects);
+    }
+    return EXIT_SUCCESS;
+}
+
 int run_soak(const Args& args) {
     double seconds = args.soak_seconds > 0.0 ? args.soak_seconds : args.soak_hours * 3600.0;
     if (seconds <= 0.0) {
@@ -1386,6 +2639,10 @@ int run_soak(const Args& args) {
 } // namespace
 
 int main(int argc, char** argv) {
+    for (int i = 0; i < argc; ++i) {
+        g_command_line += (i == 0 ? "" : " ");
+        g_command_line += argv[i];
+    }
     const Args args = parse_args(argc, argv);
     if (args.scenario == "help") {
         print_usage();
@@ -1419,6 +2676,15 @@ int main(int argc, char** argv) {
         }
         if (name == "soak") {
             return run_soak(args);
+        }
+        if (name == "fok-latency") {
+            return run_fok_latency(args, cal);
+        }
+        if (name == "md-realistic") {
+            return run_md_realistic(args, cal.measured_ticks_per_second);
+        }
+        if (name == "price-drift") {
+            return run_price_drift(args);
         }
         std::fprintf(stderr, "unknown scenario: %s\n", name.c_str());
         print_usage();

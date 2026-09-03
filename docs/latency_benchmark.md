@@ -1331,6 +1331,29 @@ cmake --build build-release -j --target bench_capacity
 ./build-release/bench_capacity --quick --scenario all   # shorter streams for a smoke run
 ```
 
+Three later additions sit outside `all` because each takes a median over
+repeated runs and so is slower than a smoke run wants to be. Each writes a
+result file carrying its own command line and machine specs:
+
+```bash
+# FOK cost split by outcome, which the 5%-FOK mixed stream averages away.
+./build-release/bench_capacity --scenario fok-latency --repeats 5
+# Feed drops at the offered rates e2e-knee sweeps, not at the flood rate
+# queue-drops uses — different question, different answer.
+./build-release/bench_capacity --scenario md-realistic --repeats 5
+# Sustained one-directional drift, which walks the tick ladder's band and
+# leaves the book in the overflow map. --drift-ticks 0 is the control.
+./build-release/bench_capacity --scenario price-drift --repeats 5
+./build-release/bench_capacity --scenario price-drift --repeats 5 --drift-ticks 0
+```
+
+| scenario | result file |
+| --- | --- |
+| `connections` (post-epoll) | `bench-results/capacity-connections-post-epoll.txt` |
+| `fok-latency` | `bench-results/capacity-fok-latency.txt` |
+| `md-realistic` | `bench-results/capacity-md-drops-realistic.txt` |
+| `price-drift` | `bench-results/capacity-price-drift.txt` |
+
 Shared mix: 40% rest / 25% cross / 20% cancel / 10% replace / 5% IOC-FOK,
 1000 orders/side seed, 64-tick band (`WorkloadMix::realistic()`).
 The matching-thread headline uses 128 uniformly selected, fully funded

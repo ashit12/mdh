@@ -28,6 +28,7 @@ enum class IoInterest : std::uint32_t {
     return (mask & bit) != IoInterest::None;
 }
 
+// One wait() slot: ready fd, add()/mod() user pointer, and which conditions fired (wake = poller.wake()).
 struct IoEvent {
     int fd = -1;
     void* user = nullptr;

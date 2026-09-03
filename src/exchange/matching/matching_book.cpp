@@ -459,4 +459,16 @@ std::size_t MatchingBook::out_of_band_levels() const {
     return bids_.overflow_levels() + asks_.overflow_levels();
 }
 
+std::size_t MatchingBook::out_of_band_orders() const {
+    std::size_t total = 0;
+    for (const SideIndex* side : {&bids_, &asks_}) {
+        for (const auto& [price, level] : side->overflow()) {
+            for (std::uint32_t slot = level.head; slot != kNil; slot = slab_[slot].next) {
+                ++total;
+            }
+        }
+    }
+    return total;
+}
+
 } // namespace mdh::exchange

@@ -124,6 +124,11 @@ public:
     // off a benchmark rather than inferring from a latency.
     [[nodiscard]] std::size_t out_of_band_levels() const;
 
+    // Resting orders at those levels, summed across instruments. See
+    // MatchingBook::out_of_band_orders() for why the two counts differ and
+    // why this one is a diagnostic rather than a hot-path query.
+    [[nodiscard]] std::size_t out_of_band_orders() const;
+
     void process(const ExchangeCommand& command, const EventSink& sink);
 
     // Emits an OrderRejected for `command` using this engine's own
