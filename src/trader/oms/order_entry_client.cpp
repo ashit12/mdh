@@ -5,6 +5,7 @@
 #include <utility>
 #include <variant>
 
+#include "common/thread_affinity.hpp"
 #include "exchange/latency/latency_tracer.hpp"
 #include "protocol/order_entry/decoder.hpp"
 #include "protocol/order_entry/encoder.hpp"
@@ -20,7 +21,10 @@ bool OrderEntryClient::connect(const std::string& host, std::uint16_t port) {
         return false;
     }
     connected_.store(true, std::memory_order_relaxed);
-    reader_thread_ = std::jthread([this] { reader_loop(); });
+    reader_thread_ = std::jthread([this] {
+        set_calling_thread_name("mdh-oe-reader");
+        reader_loop();
+    });
     return true;
 }
 

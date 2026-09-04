@@ -1341,6 +1341,9 @@ result file carrying its own command line and machine specs:
 # Feed drops at the offered rates e2e-knee sweeps, not at the flood rate
 # queue-drops uses — different question, different answer.
 ./build-release/bench_capacity --scenario md-realistic --repeats 5
+# Where the router's latency cost actually goes, at the one rate that
+# regressed. Five arms; see below for why four of them are controls.
+./build-release/bench_capacity --scenario md-cpu --repeats 5 --md-cpu-seconds 4
 # Sustained one-directional drift, which walks the tick ladder's band and
 # leaves the book in the overflow map. --drift-ticks 0 is the control.
 ./build-release/bench_capacity --scenario price-drift --repeats 5
@@ -1352,6 +1355,7 @@ result file carrying its own command line and machine specs:
 | `connections` (post-epoll) | `bench-results/capacity-connections-post-epoll.txt` |
 | `fok-latency` | `bench-results/capacity-fok-latency.txt` |
 | `md-realistic` | `bench-results/capacity-md-drops-realistic.txt` |
+| `md-cpu` | `bench-results/md_router_cpu_attribution.txt` |
 | `price-drift` | `bench-results/capacity-price-drift.txt` |
 
 Shared mix: 40% rest / 25% cross / 20% cancel / 10% replace / 5% IOC-FOK,
@@ -1378,6 +1382,37 @@ ratio. This exposes whether per-event ledger work grows with fill fan-out.
 | `fairness` | Does a polite client's p99 stay near isolation when others flood? | One 1k/s client vs N flooders; polite-only percentiles. |
 | `recovery` | How long is a subscriber blind after a gap? | `read_snapshot` + book rebuild vs depth. Lost sequences are **not** replayed (no retransmission). Second clock: UDP listen drain during delayed recovery. |
 | `soak` | Do RSS / resting orders / ledger maps / queue HWMs stay flat for hours? | Default 4h below the e2e knee. Latency tracing is off so the tracer ring cannot look like a leak. Sample interval 30s (`--quick` is 2s). |
+| `md-cpu` | `md-realistic` shows p50 collapsing when the router is attached. Which part of attaching it is responsible? | One offered rate held long enough to sample, five arms: **A** no router, **B** router + UDP subscriber, **C** B with `publish()` timed per step, **D** router with a discarding sink, **E** D instrumented. Reports the order path split at the tracer's stamps, per-thread CPU, and the `try_push` cost distribution. |
+
+#### Why `md-cpu` has five arms (2026-09-04)
+
+Attaching the router changes three things at once — work on the matching
+thread, an extra thread, and a loopback UDP datagram per event — so the B-vs-A
+comparison that `md-realistic` makes cannot say which one costs anything.
+
+- **D** keeps the translation, the `DroppingQueue` push, the `notify_one` and
+  the routing thread, and drops only the datagram. `D/A = 1.0x`, so none of
+  the router's own machinery is responsible.
+- **E** is D instrumented, and exists as the control for **C**: C and E push
+  into the same queue from the same thread with the same code, differing only
+  in whether the consumer is hammering the loopback stack or nearly idle.
+  Since the producer reads the consumer-owned `tail_` on every push, that is
+  the variable that decides whether a slow push is contention or preemption.
+- **C** and **E** cost the matching thread two tick reads per step, so they
+  are not the reproduction. Quote **B**.
+
+`--md-cpu-arms` narrows the run to chosen arms, which is what makes an
+external per-thread capture (`ps -M`, `sample`, Instruments) possible: the
+sweep runs its arms back to back in one process, so a capture aimed at the
+process would otherwise span all of them. The long-lived threads name
+themselves (`mdh-matching`, `mdh-gateway-io`, `mdh-md-router`, …) via
+`mdh::set_calling_thread_name`, so those tools can attribute CPU by name
+instead of by reading stacks.
+
+Result: the regression is the unbatched loopback UDP hop, not the router's
+queue. `MarketDataRouterOptions::measure_publish_cost` is the opt-in counter
+set behind arms C and E; it is off by default because its tick reads land on
+the matching thread.
 
 ### Corrected matching-thread methodology (2026-09-02)
 

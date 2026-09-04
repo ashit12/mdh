@@ -4,6 +4,7 @@
 #include <variant>
 
 #include "common/sequence_validator.hpp"
+#include "common/thread_affinity.hpp"
 #include "net/packet.hpp"
 
 namespace mdh::trader::market_data {
@@ -52,6 +53,7 @@ void FeedSubscriber::stop() {
 }
 
 void FeedSubscriber::receive_loop(std::stop_token token, net::UdpReceiver receiver) {
+    set_calling_thread_name("mdh-feed-sub");
     SequenceValidator validator;
 
     while (!token.stop_requested()) {

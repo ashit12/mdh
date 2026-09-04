@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <future>
 #include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -48,6 +49,7 @@
 #include "exchange/testing/hr_timer.hpp"
 #include "exchange/testing/matching_scenarios.hpp"
 #include "exchange/testing/matching_workload.hpp"
+#include "exchange/testing/thread_cpu_sampler.hpp"
 #include "net/packet.hpp"
 #include "net/tcp_socket.hpp"
 #include "net/udp_listener.hpp"
@@ -111,6 +113,18 @@ struct Args {
     std::size_t fok_operations = 20'000;
     std::size_t fok_levels = 4;
 
+    // md-cpu. One rate, held long enough that a per-thread CPU sampler has
+    // something to average over -- 4000 samples at 20000/s is 0.2 s, which
+    // is fewer than a handful of sampler ticks.
+    double md_cpu_rate = 20'000.0;
+    double md_cpu_seconds = 5.0;
+    std::size_t md_cpu_sample_ms = 20;
+    // Which arms to run, by letter. Narrowing to one arm is what makes an
+    // external per-thread CPU capture (`ps -M`, `sample`, Instruments)
+    // possible: the whole sweep runs its arms back to back in one process, so
+    // a capture aimed at the process cannot be aimed at an arm.
+    std::string md_cpu_arms = "ABCDE";
+
     // price-drift
     std::size_t drift_operations = 1'000'000;
     std::size_t drift_window = 100'000;
@@ -126,7 +140,7 @@ void print_usage() {
         "bench_capacity — capacity and failure-path measurements (Release only)\n"
         "\n"
         "  --scenario matching-thread|e2e-knee|connections|queue-drops|fairness|recovery|soak|\n"
-        "             fok-latency|md-realistic|price-drift|all\n"
+        "             fok-latency|md-realistic|md-cpu|price-drift|all\n"
         "  --quick                         smaller ops / skip 2k+ connections / 2s soak\n"
         "  --operations N                 mixed-stream length (default 1000000)\n"
         "  --e2e-samples N                  samples per offered rate (default 4000)\n"
@@ -140,12 +154,16 @@ void print_usage() {
         "  --repeats N                     repeated runs for the scenarios that take a median (default 5)\n"
         "  --fok-operations N              FOK commands in fok-latency (default 20000, half of each outcome)\n"
         "  --fok-levels N                  price levels each FOK reaches (default 4)\n"
+        "  --md-cpu-rate R                 md-cpu offered rate (default 20000, the rate that regressed)\n"
+        "  --md-cpu-seconds S              md-cpu hold time per arm (default 5)\n"
+        "  --md-cpu-sample-ms N            md-cpu per-thread CPU sampling interval (default 20)\n"
+        "  --md-cpu-arms ABCDE             md-cpu arms to run (default all; use one for an external capture)\n"
         "  --drift-operations N            price-drift stream length (default 1000000)\n"
         "  --drift-window N                price-drift sampling window (default 100000)\n"
         "  --drift-ticks N                 total upward drift over the run (default 24576 = 3 x band)\n"
         "\n"
         "  all = matching-thread, e2e-knee, queue-drops, fairness, recovery\n"
-        "        (not connections, soak, fok-latency, md-realistic or price-drift)\n");
+        "        (not connections, soak, fok-latency, md-realistic, md-cpu or price-drift)\n");
 }
 
 [[nodiscard]] std::vector<int> parse_int_list(const char* text) {
@@ -240,6 +258,22 @@ void print_usage() {
             if (const char* v = next()) {
                 args.fok_levels = static_cast<std::size_t>(std::max(1, std::atoi(v)));
             }
+        } else if (flag == "--md-cpu-rate") {
+            if (const char* v = next()) {
+                args.md_cpu_rate = std::atof(v);
+            }
+        } else if (flag == "--md-cpu-seconds") {
+            if (const char* v = next()) {
+                args.md_cpu_seconds = std::atof(v);
+            }
+        } else if (flag == "--md-cpu-sample-ms") {
+            if (const char* v = next()) {
+                args.md_cpu_sample_ms = static_cast<std::size_t>(std::max(1, std::atoi(v)));
+            }
+        } else if (flag == "--md-cpu-arms") {
+            if (const char* v = next()) {
+                args.md_cpu_arms = v;
+            }
         } else if (flag == "--drift-operations") {
             if (const char* v = next()) {
                 args.drift_operations = static_cast<std::size_t>(std::max(1LL, std::atoll(v)));
@@ -270,6 +304,7 @@ void print_usage() {
         }
         args.repeats = std::min(args.repeats, static_cast<std::size_t>(2));
         args.fok_operations = std::min(args.fok_operations, static_cast<std::size_t>(2'000));
+        args.md_cpu_seconds = std::min(args.md_cpu_seconds, 1.0);
         args.drift_operations = std::min(args.drift_operations, static_cast<std::size_t>(100'000));
         args.drift_window = std::min(args.drift_window, static_cast<std::size_t>(10'000));
     }
@@ -869,6 +904,29 @@ private:
     OrderEntryClient client_;
 };
 
+// The order path split at the tracer's stamps, so an end-to-end number that
+// moved can be attributed to the stage that moved it. Harvested from the same
+// snapshots the end-to-end percentiles come from, since walking them twice
+// would be walking a table the matching thread is still writing.
+//
+// ingest_queue_wait is the one worth naming: t1 is stamped when the gateway
+// I/O thread finishes decoding, t2 when the matching thread picks the command
+// up, so the gap between them is time spent sitting in the matching ingest
+// queue. That is where a matching thread that has become too slow for the
+// offered rate shows up, and it is invisible in the total.
+struct StageIntervals {
+    std::vector<std::uint64_t> client_to_server;    // t0 -> t1
+    std::vector<std::uint64_t> ingest_queue_wait;   // t1 -> t2
+    std::vector<std::uint64_t> exchange_processing; // t2 -> t3 end
+    // Based on t3_first_event, not t3_exchange_end: the first report is
+    // produced during processing and can reach the writer before the
+    // processor returns, so measuring from exchange_end discards almost every
+    // sample as a negative interval.
+    std::vector<std::uint64_t> writer_handoff;      // t3 first event -> t4 queued
+    std::vector<std::uint64_t> socket_write;        // t4 queued -> t4 written
+    std::vector<std::uint64_t> server_to_client;    // t4 written -> t5
+};
+
 struct PaceResult {
     double offered = 0.0;
     double achieved = 0.0;
@@ -882,6 +940,7 @@ struct PaceResult {
     std::size_t commands_rejected = 0;
     bool tracked = false;
     bool p999_blew = false;
+    StageIntervals stages;
 };
 
 [[nodiscard]] PaceResult run_paced_mixed(OrderEntryGateway& gateway, WireClient& client,
@@ -925,6 +984,12 @@ struct PaceResult {
 
     std::vector<std::uint64_t> e2e;
     e2e.reserve(keys.size());
+    const auto add_stage = [](std::vector<std::uint64_t>& out, std::uint64_t start, std::uint64_t end) {
+        if (start == 0 || end == 0 || end < start) {
+            return; // a stamp that never landed says nothing about its stage
+        }
+        out.push_back(end - start);
+    };
     for (const auto& [account, id] : keys) {
         const auto snap = latency::tracer().snapshot(account, id);
         if (!snap || snap->t0_client_submit == 0 || snap->t5_client_first == 0 ||
@@ -932,6 +997,12 @@ struct PaceResult {
             continue;
         }
         e2e.push_back(snap->t5_client_first - snap->t0_client_submit);
+        add_stage(result.stages.client_to_server, snap->t0_client_submit, snap->t1_server_decoded);
+        add_stage(result.stages.ingest_queue_wait, snap->t1_server_decoded, snap->t2_exchange_begin);
+        add_stage(result.stages.exchange_processing, snap->t2_exchange_begin, snap->t3_exchange_end);
+        add_stage(result.stages.writer_handoff, snap->t3_first_event, snap->t4_writer_queued);
+        add_stage(result.stages.socket_write, snap->t4_writer_queued, snap->t4_socket_written);
+        add_stage(result.stages.server_to_client, snap->t4_socket_written, snap->t5_client_first);
     }
     result.harvested = e2e.size();
     const auto summary = summarise_latency(e2e, ticks_per_second);
@@ -2230,6 +2301,591 @@ int run_md_realistic(const Args& args, double ticks_per_second) {
     return EXIT_SUCCESS;
 }
 
+// ── Attributing the router's latency cost ─────────────────────────────────
+//
+// md-realistic shows the p50 at 20000/s jumping from tens of microseconds to
+// milliseconds once the router is attached, but it cannot say why, for two
+// reasons. It never runs the same rate without the router in the same
+// process, so the comparison crosses a process boundary; and it reports only
+// end-to-end latency, which is the sum of every possible cause.
+//
+// This scenario holds one offered rate long enough to sample, and runs it
+// five ways back to back:
+//
+//   A  no router           -- the baseline, same binary, same process
+//   B  router + UDP        -- the regression, uninstrumented so it is honest
+//   C  B instrumented      -- publish() timed step by step
+//   D  router, null sink   -- the router's own machinery with no UDP hop
+//   E  D instrumented      -- publish() timed with an idle consumer
+//
+// B is the number to quote. C exists because the interesting hypotheses are
+// about steps inside publish(), and timing them costs the matching thread
+// two tick reads per step -- so the attribution and the reproduction cannot
+// come from the same run.
+//
+// D is what makes the result causal rather than correlational. Attaching the
+// router adds three things at once: a translation and a queue push on the
+// matching thread, a routing thread, and one loopback UDP datagram per event
+// sent by that thread and received by a subscriber. B cannot tell those
+// apart. D keeps the first two and drops the third, so whatever B has that D
+// does not is the UDP hop -- which shares the loopback stack with the TCP
+// order path being measured.
+//
+// E is the control for the push cost itself. C and E push into the same queue
+// from the same thread with the same code; the only difference is what the
+// consumer is doing on the other core -- hammering the loopback stack in C,
+// nearly idle in E. Since the producer must read the consumer's `tail_` on
+// every push, that is exactly the variable that decides whether a slow push
+// is the queue waiting (it cannot) or the memory system stalling (it can).
+//
+// Per-thread CPU is sampled across all five, and the order path is split at
+// the tracer's stamps, because "the matching thread got slower" and "the
+// machine ran out of cores" and "the wire got slower" are three different
+// answers and the end-to-end number is the sum of all of them.
+
+struct MdCpuArm {
+    const char* label = "";
+    bool router = false;
+    bool instrumented = false;
+    bool udp = false;
+
+    double offered = 0.0;
+    double achieved = 0.0;
+    double p50_us = 0.0;
+    double p99_us = 0.0;
+    double p999_us = 0.0;
+    std::size_t harvested = 0;
+    std::size_t matching_queue_hwm = 0;
+    std::uint64_t outbound_drops = 0;
+    StageIntervals stages;
+
+    // Router-only.
+    std::size_t md_dropped = 0;
+    std::size_t md_hwm = 0;
+    std::uint64_t md_routed = 0;
+    std::uint64_t cv_waits = 0;
+    exchange::market_data::PublishCostStats cost;
+
+    testing::ThreadCpuReport cpu;
+};
+
+// One arm. `with_router` decides whether a MarketDataRouter is wired into
+// extra_event_sink at all; `with_udp` decides whether its downstream sink
+// actually sends a datagram or discards the event.
+[[nodiscard]] std::optional<MdCpuArm> run_md_cpu_arm(const Args& args, double ticks_per_second, const char* label,
+                                                       bool with_router, bool with_udp, bool instrumented,
+                                                       double rate, std::size_t samples) {
+    MdCpuArm arm;
+    arm.label = label;
+    arm.router = with_router;
+    arm.instrumented = instrumented;
+    arm.udp = with_udp;
+
+    const auto config = mixed_config(samples + 8'000);
+    const auto workload = generate_workload(config);
+    if (workload.operations.size() < samples) {
+        return std::nullopt;
+    }
+
+    latency::ScopedEnable tracing(1 << 22);
+
+    // The subscriber and the UDP hop exist in both arms' *intent* but only
+    // the router arm has anything to send them; they are constructed only
+    // when used, so arm A carries no threads the production no-router
+    // configuration would not have.
+    trader::strategies::StrategyRuntime runtime;
+    trader::market_data::FeedSubscriberOptions sub_opts;
+    sub_opts.replay_options.stop_on_sequence_error = false;
+    std::unique_ptr<trader::market_data::FeedSubscriber> subscriber;
+    std::unique_ptr<UdpFrameSink> udp;
+    std::unique_ptr<exchange::market_data::MarketDataRouter> router;
+
+    if (with_router) {
+        exchange::market_data::MarketDataSink downstream = [](const protocol::Event&) {};
+        if (with_udp) {
+            subscriber = std::make_unique<trader::market_data::FeedSubscriber>(0, runtime, sub_opts);
+            if (!subscriber->start()) {
+                return std::nullopt;
+            }
+            udp = std::make_unique<UdpFrameSink>(*subscriber->local_port());
+            downstream = [&](const protocol::Event& event) { udp->send(event); };
+        }
+        router = std::make_unique<exchange::market_data::MarketDataRouter>(
+            std::move(downstream), exchange::market_data::MarketDataRouterOptions{
+                                        .queue_capacity = kProductionMdQueue,
+                                        .idle_timeout = 1ms,
+                                        .measure_publish_cost = instrumented,
+                                    });
+        router->start();
+    }
+
+    auto gateway = make_capacity_gateway(args, config.instruments(), kProductionIngest, kProductionOutbound,
+                                          router ? router->sink() : EventSink{});
+    const auto teardown = [&] {
+        gateway->stop();
+        std::this_thread::sleep_for(200ms);
+        if (router) {
+            router->stop();
+        }
+        if (subscriber) {
+            subscriber->stop();
+        }
+    };
+    if (!gateway->start()) {
+        if (router) {
+            router->stop();
+        }
+        if (subscriber) {
+            subscriber->stop();
+        }
+        return std::nullopt;
+    }
+    fund_gateway(*gateway, 1, static_cast<int>(config.account_count), config.instruments());
+    WireClient client(1);
+    if (!client.connect(*gateway->local_port())) {
+        teardown();
+        return std::nullopt;
+    }
+    for (const auto& command : workload.seed) {
+        (void)client.send_command(command);
+    }
+    (void)client.wait_received(workload.seed.size(), 30s);
+
+    std::vector<ExchangeCommand> slice(workload.operations.begin(),
+                                        workload.operations.begin() + static_cast<std::ptrdiff_t>(samples));
+
+    // Sampling starts after the seed and after the connect, so the window
+    // holds the paced load and nothing else.
+    testing::ThreadCpuSampler sampler(std::chrono::milliseconds(args.md_cpu_sample_ms));
+    sampler.start();
+    const auto pace = run_paced_mixed(*gateway, client, slice, rate, samples, ticks_per_second);
+    arm.cpu = sampler.stop();
+
+    arm.offered = pace.offered;
+    arm.achieved = pace.achieved;
+    arm.p50_us = pace.p50_us;
+    arm.p99_us = pace.p99_us;
+    arm.p999_us = pace.p999_us;
+    arm.harvested = pace.harvested;
+    arm.matching_queue_hwm = pace.queue_hwm;
+    arm.outbound_drops = pace.outbound_drops;
+    arm.stages = std::move(pace.stages);
+
+    if (router) {
+        std::this_thread::sleep_for(200ms); // let the routing thread drain before reading its counters
+        arm.md_dropped = router->dropped_count();
+        arm.md_hwm = router->queue_high_water_mark();
+        arm.md_routed = router->routed_count();
+        arm.cv_waits = router->cv_wait_count();
+        arm.cost = router->publish_cost();
+    }
+
+    teardown();
+    return arm;
+}
+
+void print_cpu_table(const testing::ThreadCpuReport& report, long physical_cores) {
+    if (!report.supported) {
+        std::printf("  per-thread CPU unavailable: %s\n", report.unsupported_reason.c_str());
+        return;
+    }
+    // The window covers the paced send plus the drain that follows it, so
+    // "mean core" is diluted by however long the drain took -- which is
+    // itself longer in the arms that are slower. "peak core" is the number to
+    // read for saturation; the mean is for total work done.
+    std::printf("  window %.3f s, %llu samples\n", static_cast<double>(report.window_ns) / 1e9,
+                static_cast<unsigned long long>(report.ticks));
+    std::printf("  %-18s | %10s | %9s | %9s | %8s | %s\n", "thread", "cpu ms", "mean core", "peak core", "threads",
+                "runnable ticks");
+    for (const auto& thread : report.threads) {
+        if (thread.cpu_ns < 1'000'000 && thread.name != "(unnamed)") {
+            continue; // under a millisecond over the whole window: not a participant
+        }
+        std::printf("  %-18s | %10.1f | %8.2f%% | %8.2f%% | %8llu | %llu/%llu\n", thread.name.c_str(),
+                    static_cast<double>(thread.cpu_ns) / 1e6, thread.mean_core_fraction * 100.0,
+                    thread.peak_core_fraction * 100.0, static_cast<unsigned long long>(thread.distinct_threads),
+                    static_cast<unsigned long long>(thread.runnable_observations),
+                    static_cast<unsigned long long>(thread.observations));
+    }
+    std::printf("  runnable threads: peak %llu, mean %.2f, against %ld physical cores -> %s\n",
+                static_cast<unsigned long long>(report.peak_runnable_threads), report.mean_runnable_threads,
+                physical_cores,
+                static_cast<long>(report.peak_runnable_threads) > physical_cores ? "OVERSUBSCRIBED at peak"
+                                                                                  : "within core count");
+}
+
+void print_stage_table(const StageIntervals& stages, double ticks_per_second) {
+    std::printf("  %-20s | %8s | %9s | %9s | %9s\n", "stage", "n", "p50 us", "p99 us", "max us");
+    const auto row = [&](const char* name, std::vector<std::uint64_t> samples) { // summarise_latency sorts in place
+        const auto summary = summarise_latency(samples, ticks_per_second);
+        if (summary.count == 0) {
+            std::printf("  %-20s | %8s | %9s | %9s | %9s\n", name, "-", "-", "-", "-");
+            return;
+        }
+        std::printf("  %-20s | %8zu | %9.1f | %9.1f | %9.1f\n", name, summary.count, summary.p50_ns / 1000.0,
+                    summary.p99_ns / 1000.0, summary.max_ns / 1000.0);
+    };
+    row("t0->t1 client->srv", stages.client_to_server);
+    row("t1->t2 ingest queue", stages.ingest_queue_wait);
+    row("t2->t3 matching", stages.exchange_processing);
+    row("t3a->t4a writer hand", stages.writer_handoff);
+    row("t4a->t4 socket write", stages.socket_write);
+    row("t4->t5 srv->client", stages.server_to_client);
+}
+
+void print_publish_cost(const exchange::market_data::PublishCostStats& cost, double ticks_per_second) {
+    const double ns_per_tick = ticks_per_second > 0.0 ? 1e9 / ticks_per_second : 0.0;
+    const auto mean_ns = [&](std::uint64_t total, std::uint64_t count) {
+        return count == 0 ? 0.0 : static_cast<double>(total) * ns_per_tick / static_cast<double>(count);
+    };
+
+    std::printf("  publish() on the matching thread: %llu events in, %llu became wire events\n",
+                static_cast<unsigned long long>(cost.events_seen), static_cast<unsigned long long>(cost.wire_events));
+    std::printf("  %-22s | %12s | %12s | %14s\n", "step", "mean ns", "max ns", "calls");
+    std::printf("  %-22s | %12.1f | %12.1f | %14llu\n", "translate to wire",
+                mean_ns(cost.translate_ticks_total, cost.events_seen),
+                static_cast<double>(cost.translate_ticks_max) * ns_per_tick,
+                static_cast<unsigned long long>(cost.events_seen));
+    std::printf("  %-22s | %12.1f | %12.1f | %14llu\n", "DroppingQueue::push",
+                mean_ns(cost.push_ticks_total, cost.wire_events),
+                static_cast<double>(cost.push_ticks_max) * ns_per_tick,
+                static_cast<unsigned long long>(cost.wire_events));
+    std::printf("  %-22s | %12.1f | %12.1f | %14llu\n", "wake_cv_.notify_one",
+                mean_ns(cost.notify_ticks_total, cost.notify_calls),
+                static_cast<double>(cost.notify_ticks_max) * ns_per_tick,
+                static_cast<unsigned long long>(cost.notify_calls));
+    std::printf("  %-22s | %12.1f | %12.1f | %14llu\n", "(control: empty pair)",
+                mean_ns(cost.control_ticks_total, cost.events_seen),
+                static_cast<double>(cost.control_ticks_max) * ns_per_tick,
+                static_cast<unsigned long long>(cost.events_seen));
+    std::printf("  pushes accepted %llu, refused (queue full, event dropped) %llu\n",
+                static_cast<unsigned long long>(cost.push_ok), static_cast<unsigned long long>(cost.push_full));
+    std::printf("  the control row is two adjacent tick reads with no work between them, on the same thread:\n"
+                "  its maximum is what a preemption costs, and it bounds what any single maximum above proves.\n");
+
+    std::printf("\n  push cost distribution (tick source resolution %.1f ns, so bucket 0 is a sub-tick push):\n",
+                ns_per_tick);
+    std::uint64_t at_or_over_micro = 0;
+    for (std::size_t bucket = 0; bucket < exchange::market_data::kPushBucketCount; ++bucket) {
+        if (cost.push_buckets[bucket] == 0) {
+            continue;
+        }
+        const double lower_ns =
+            static_cast<double>(exchange::market_data::push_bucket_lower_edge_ticks(bucket)) * ns_per_tick;
+        const bool last = bucket + 1 == exchange::market_data::kPushBucketCount;
+        const double upper_ns =
+            static_cast<double>(exchange::market_data::push_bucket_lower_edge_ticks(bucket + 1)) * ns_per_tick;
+        const double share =
+            cost.wire_events == 0
+                ? 0.0
+                : 100.0 * static_cast<double>(cost.push_buckets[bucket]) / static_cast<double>(cost.wire_events);
+        if (last) {
+            std::printf("    >= %9.0f ns           | %12llu | %7.4f%%\n", lower_ns,
+                        static_cast<unsigned long long>(cost.push_buckets[bucket]), share);
+        } else {
+            std::printf("    %9.0f .. %9.0f ns | %12llu | %7.4f%%\n", lower_ns, upper_ns,
+                        static_cast<unsigned long long>(cost.push_buckets[bucket]), share);
+        }
+        if (lower_ns >= 1000.0) {
+            at_or_over_micro += cost.push_buckets[bucket];
+        }
+    }
+    std::printf("  pushes landing in a bucket whose floor is >= 1 us: %llu of %llu\n",
+                static_cast<unsigned long long>(at_or_over_micro),
+                static_cast<unsigned long long>(cost.wire_events));
+}
+
+// Outliers in the push distribution, next to outliers in the control
+// distribution, both normalised by how long each step left the thread exposed
+// to being descheduled.
+//
+// The raw counts are not comparable on their own. A push costs ~80 ns and a
+// control interval ~12 ns, so the push is exposed to preemption for several
+// times longer per call and will collect several times as many outliers with
+// no wait involved anywhere. Dividing each count by that step's total
+// occupancy removes the difference, and what is left is the question worth
+// asking: does the push suffer outliers at a materially higher rate than a
+// step that provably cannot block?
+struct OutlierComparison {
+    double threshold_ns = 0.0;
+    std::uint64_t push_outliers = 0;
+    std::uint64_t control_outliers = 0;
+    double push_exposure_ms = 0.0;
+    double control_exposure_ms = 0.0;
+    double push_rate_per_ms = 0.0;    // outliers per millisecond spent in the step
+    double control_rate_per_ms = 0.0;
+};
+
+[[nodiscard]] OutlierComparison compare_outliers(const exchange::market_data::PublishCostStats& cost,
+                                                   double ticks_per_second) {
+    const double ns_per_tick = ticks_per_second > 0.0 ? 1e9 / ticks_per_second : 0.0;
+    OutlierComparison out;
+    for (std::size_t bucket = 0; bucket < exchange::market_data::kPushBucketCount; ++bucket) {
+        const double lower_ns =
+            static_cast<double>(exchange::market_data::push_bucket_lower_edge_ticks(bucket)) * ns_per_tick;
+        if (lower_ns < 1000.0) {
+            continue;
+        }
+        if (out.threshold_ns == 0.0) {
+            out.threshold_ns = lower_ns;
+        }
+        out.push_outliers += cost.push_buckets[bucket];
+        out.control_outliers += cost.control_buckets[bucket];
+    }
+    out.push_exposure_ms = static_cast<double>(cost.push_ticks_total) * ns_per_tick / 1e6;
+    out.control_exposure_ms = static_cast<double>(cost.control_ticks_total) * ns_per_tick / 1e6;
+    out.push_rate_per_ms =
+        out.push_exposure_ms > 0.0 ? static_cast<double>(out.push_outliers) / out.push_exposure_ms : 0.0;
+    out.control_rate_per_ms =
+        out.control_exposure_ms > 0.0 ? static_cast<double>(out.control_outliers) / out.control_exposure_ms : 0.0;
+    return out;
+}
+
+void print_outlier_table(const OutlierComparison& outliers) {
+    std::printf("\n  outliers >= %.0f ns, next to the step that cannot block:\n", outliers.threshold_ns);
+    std::printf("  %-22s | %10s | %12s | %14s\n", "step", "outliers", "exposure ms", "per exposure ms");
+    std::printf("  %-22s | %10llu | %12.2f | %14.2f\n", "DroppingQueue::push",
+                static_cast<unsigned long long>(outliers.push_outliers), outliers.push_exposure_ms,
+                outliers.push_rate_per_ms);
+    std::printf("  %-22s | %10llu | %12.2f | %14.2f\n", "(control: empty pair)",
+                static_cast<unsigned long long>(outliers.control_outliers), outliers.control_exposure_ms,
+                outliers.control_rate_per_ms);
+}
+
+int run_md_cpu(const Args& args, double ticks_per_second) {
+    const double rate = args.md_cpu_rate;
+    const auto samples =
+        static_cast<std::size_t>(std::max(1.0, rate * args.md_cpu_seconds));
+
+    print_run_header("md-cpu", args.repeats, "median across runs, per arm");
+    std::printf("\n== Where the MarketDataRouter's latency cost goes, at %.0f/s ==\n", rate);
+    std::printf("mixed GTC over TCP, production queues ingest=%zu outbound=%zu, router cap=%zu, real UDP "
+                "subscriber\n",
+                kProductionIngest, kProductionOutbound, kProductionMdQueue);
+    std::printf("one rate held for %.1f s (%zu samples) so per-thread CPU has a window to sample; "
+                "sampling every %zu ms\n",
+                args.md_cpu_seconds, samples, args.md_cpu_sample_ms);
+    std::printf("arms: A no router | B router attached | C router with publish() instrumented\n");
+    std::printf("Quote B for the regression. C's own tick reads land on the matching thread, so its latency is\n"
+                "not the reproduction -- its counters are.\n");
+
+    long physical_cores = sysconf(_SC_NPROCESSORS_ONLN);
+#if defined(__APPLE__)
+    {
+        int value = 0;
+        std::size_t len = sizeof(value);
+        if (sysctlbyname("hw.physicalcpu", &value, &len, nullptr, 0) == 0 && value > 0) {
+            physical_cores = value;
+        }
+    }
+#endif
+    std::printf("\nphysical cores %ld, logical cpus %ld", physical_cores, sysconf(_SC_NPROCESSORS_ONLN));
+#if defined(__APPLE__)
+    {
+        int performance = 0;
+        int efficiency = 0;
+        std::size_t len = sizeof(performance);
+        if (sysctlbyname("hw.perflevel0.physicalcpu", &performance, &len, nullptr, 0) == 0) {
+            len = sizeof(efficiency);
+            if (sysctlbyname("hw.perflevel1.physicalcpu", &efficiency, &len, nullptr, 0) == 0) {
+                std::printf(" (%d performance + %d efficiency)", performance, efficiency);
+            }
+        }
+    }
+#endif
+    std::printf("\n");
+
+    struct ArmSpec {
+        const char* label;
+        bool router;
+        bool udp;
+        bool instrumented;
+    };
+    static constexpr std::size_t kArmCount = 5;
+    const std::array<ArmSpec, kArmCount> specs{
+        ArmSpec{"A no-router", false, false, false},
+        ArmSpec{"B router+udp", true, true, false},
+        ArmSpec{"C B+instrumented", true, true, true},
+        ArmSpec{"D router,null", true, false, false},
+        ArmSpec{"E D+instrumented", true, false, true},
+    };
+
+    const auto arm_enabled = [&](std::size_t index) {
+        return args.md_cpu_arms.find(static_cast<char>('A' + index)) != std::string::npos;
+    };
+
+    std::array<std::vector<MdCpuArm>, kArmCount> results;
+    std::printf("\n| run | arm              | offered/s | achieved/s | p50 us | p99 us | p99.9 us | harvested | "
+                "ingest_hwm | out_drops | md_dropped | md_hwm |\n");
+    for (std::size_t r = 0; r < args.repeats; ++r) {
+        for (std::size_t a = 0; a < specs.size(); ++a) {
+            if (!arm_enabled(a)) {
+                continue;
+            }
+            auto arm = run_md_cpu_arm(args, ticks_per_second, specs[a].label, specs[a].router, specs[a].udp,
+                                        specs[a].instrumented, rate, samples);
+            if (!arm) {
+                std::fprintf(stderr, "md-cpu: setup failed on run %zu arm %s\n", r + 1, specs[a].label);
+                return EXIT_FAILURE;
+            }
+            std::printf("| %3zu | %-16s | %9.0f | %10.0f | %6.1f | %6.1f | %8.1f | %9zu | %10zu | %9llu | %10zu | "
+                        "%6zu |\n",
+                        r + 1, arm->label, arm->offered, arm->achieved, arm->p50_us, arm->p99_us, arm->p999_us,
+                        arm->harvested, arm->matching_queue_hwm,
+                        static_cast<unsigned long long>(arm->outbound_drops), arm->md_dropped, arm->md_hwm);
+            std::fflush(stdout);
+            results[a].push_back(std::move(*arm));
+        }
+    }
+
+    std::printf("\n-- median of %zu runs --\n", args.repeats);
+    std::printf("| arm              | offered/s | achieved/s | p50 us | p99 us | p99.9 us | md_dropped |\n");
+    std::array<double, kArmCount> p50_medians{};
+    for (std::size_t a = 0; a < specs.size(); ++a) {
+        if (results[a].empty()) {
+            continue;
+        }
+        std::vector<double> offered;
+        std::vector<double> achieved;
+        std::vector<double> p50;
+        std::vector<double> p99;
+        std::vector<double> p999;
+        std::vector<double> dropped;
+        for (const auto& arm : results[a]) {
+            offered.push_back(arm.offered);
+            achieved.push_back(arm.achieved);
+            p50.push_back(arm.p50_us);
+            p99.push_back(arm.p99_us);
+            p999.push_back(arm.p999_us);
+            dropped.push_back(static_cast<double>(arm.md_dropped));
+        }
+        p50_medians[a] = median_of(p50);
+        std::printf("| %-16s | %9.0f | %10.0f | %6.1f | %6.1f | %8.1f | %10.0f |\n", specs[a].label,
+                    median_of(offered), median_of(achieved), p50_medians[a], median_of(p99), median_of(p999),
+                    median_of(dropped));
+    }
+    if (p50_medians[0] > 0.0 && p50_medians[1] > 0.0 && p50_medians[3] > 0.0) {
+        std::printf("\nB/A = %.1fx  (router with the UDP hop, against no router)\n", p50_medians[1] / p50_medians[0]);
+        std::printf("D/A = %.1fx  (router machinery only: translate, push, notify, routing thread)\n",
+                    p50_medians[3] / p50_medians[0]);
+        std::printf("B/D = %.1fx  (what the loopback UDP hop itself costs)\n", p50_medians[1] / p50_medians[3]);
+    }
+
+    // The CPU table and the publish counters are per-run facts, not
+    // medianable ones -- a median of a distribution is not a distribution.
+    // The last run is printed in full, which is the run whose numbers a
+    // reader can line up against a concurrent `ps -M` capture.
+    for (std::size_t a = 0; a < specs.size(); ++a) {
+        if (results[a].empty()) {
+            continue;
+        }
+        const auto& arm = results[a].back();
+        std::printf("\n-- arm %s, order path by stage (run %zu) --\n", specs[a].label, args.repeats);
+        print_stage_table(arm.stages, ticks_per_second);
+        std::printf("\n-- arm %s, per-thread CPU over the paced window (run %zu) --\n", specs[a].label, args.repeats);
+        print_cpu_table(arm.cpu, physical_cores);
+        if (arm.router) {
+            std::printf("  routing thread slept on the condition variable %llu times, and routed %llu events:\n"
+                        "  a notify_one() per event with the consumer asleep is a kernel wakeup, not a no-op.\n",
+                        static_cast<unsigned long long>(arm.cv_waits),
+                        static_cast<unsigned long long>(arm.md_routed));
+        }
+    }
+
+    const double ns_per_tick = ticks_per_second > 0.0 ? 1e9 / ticks_per_second : 0.0;
+    for (const std::size_t a : {std::size_t{2}, std::size_t{4}}) {
+        if (results[a].empty()) {
+            continue;
+        }
+        std::printf("\n-- arm %s, publish() cost breakdown (run %zu) --\n", specs[a].label, args.repeats);
+        print_publish_cost(results[a].back().cost, ticks_per_second);
+        print_outlier_table(compare_outliers(results[a].back().cost, ticks_per_second));
+    }
+
+    if (!results[2].empty()) {
+        const auto& busy = results[2].back();  // C: consumer hammering the loopback stack
+        const auto& cost = busy.cost;
+        const auto outliers = compare_outliers(cost, ticks_per_second);
+
+        // Claim 1 is structural and does not depend on any timing at all.
+        // try_push has exactly one conditional -- the full check -- and a
+        // queue that never filled took its false branch on every call. So
+        // every push in the run ran the same straight-line instructions, and
+        // none of them can have waited for a slot: there is no code path on
+        // which they could.
+        std::printf("\nVERDICT on DroppingQueue::try_push  ");
+        if (cost.push_full != 0) {
+            std::printf("INCONCLUSIVE for this arm.\n"
+                        "The queue refused %llu pushes, so it did reach capacity. try_push still never waits --\n"
+                        "it returns false -- but the drop policy was live, so this is not a clean comparison.\n",
+                        static_cast<unsigned long long>(cost.push_full));
+            return EXIT_SUCCESS;
+        }
+
+        std::printf("NOT blocking and NOT spinning under this load.\n");
+        std::printf("  1. Structural, independent of any timing: %llu pushes, %llu refusals, queue high-water\n"
+                    "     mark %zu of %zu. try_push's only conditional is the full check, and it was false on\n"
+                    "     every call -- so all %llu pushes ran identical straight-line code, and there is no\n"
+                    "     path on which any of them could have waited for a slot or retried.\n",
+                    static_cast<unsigned long long>(cost.push_ok), static_cast<unsigned long long>(cost.push_full),
+                    busy.md_hwm, kProductionMdQueue, static_cast<unsigned long long>(cost.wire_events));
+        std::printf("  2. Typical cost is %.1f ns, against %.1f ns to translate the event and %.1f ns to wake\n"
+                    "     the routing thread. The push is the cheapest of the three steps.\n",
+                    cost.wire_events == 0 ? 0.0
+                                          : static_cast<double>(cost.push_ticks_total) * ns_per_tick /
+                                                static_cast<double>(cost.wire_events),
+                    cost.events_seen == 0 ? 0.0
+                                          : static_cast<double>(cost.translate_ticks_total) * ns_per_tick /
+                                                static_cast<double>(cost.events_seen),
+                    cost.notify_calls == 0 ? 0.0
+                                           : static_cast<double>(cost.notify_ticks_total) * ns_per_tick /
+                                                 static_cast<double>(cost.notify_calls));
+
+        // The tail is real and deserves its own sentence rather than being
+        // rounded away by the verdict. What it is *not* is a wait, per claim
+        // 1; arm E is what says what it is instead.
+        std::printf("  3. It does have a tail: %llu of %llu pushes (%.2f%%) took >= %.0f ns, worst %.1f us.\n",
+                    static_cast<unsigned long long>(outliers.push_outliers),
+                    static_cast<unsigned long long>(cost.wire_events),
+                    cost.wire_events == 0 ? 0.0
+                                          : 100.0 * static_cast<double>(outliers.push_outliers) /
+                                                static_cast<double>(cost.wire_events),
+                    outliers.threshold_ns, static_cast<double>(cost.push_ticks_max) * ns_per_tick / 1000.0);
+
+        if (!results[4].empty()) {
+            const auto& idle = results[4].back(); // E: same code, consumer nearly idle
+            const auto idle_outliers = compare_outliers(idle.cost, ticks_per_second);
+            const double idle_share =
+                idle.cost.wire_events == 0 ? 0.0
+                                           : 100.0 * static_cast<double>(idle_outliers.push_outliers) /
+                                                 static_cast<double>(idle.cost.wire_events);
+            const double busy_share =
+                cost.wire_events == 0 ? 0.0
+                                      : 100.0 * static_cast<double>(outliers.push_outliers) /
+                                            static_cast<double>(cost.wire_events);
+            std::printf("     Arm E pushes into the same queue with the same code, differing only in what the\n"
+                        "     consumer does on the other core: %.2f%% of its pushes reach that threshold,\n"
+                        "     against %.2f%% here, and its worst is %.1f us against %.1f us.\n",
+                        idle_share, busy_share,
+                        static_cast<double>(idle.cost.push_ticks_max) * ns_per_tick / 1000.0,
+                        static_cast<double>(cost.push_ticks_max) * ns_per_tick / 1000.0);
+            if (busy_share > idle_share * 1.5) {
+                std::printf("     The tail therefore tracks the consumer's activity, not the queue's state. Every\n"
+                            "     push must read the consumer-owned `tail_` cache line, so a consumer busy in the\n"
+                            "     loopback stack on another core turns that read into a coherence miss -- a\n"
+                            "     memory stall, which is not the same thing as the queue waiting, and which\n"
+                            "     claim 1 has already ruled out as a wait.\n");
+            } else {
+                std::printf("     The tail is comparable with an idle consumer, so it is not consumer-induced\n"
+                            "     contention: on this evidence it is preemption of the matching thread, whose\n"
+                            "     own control interval reached %.1f us.\n",
+                            static_cast<double>(cost.control_ticks_max) * ns_per_tick / 1000.0);
+            }
+        }
+    }
+    return EXIT_SUCCESS;
+}
+
 // ── Price drift / ladder overflow ─────────────────────────────────────────
 //
 // Every price index in this book is anchored once, at the first price its
@@ -2639,6 +3295,9 @@ int run_soak(const Args& args) {
 } // namespace
 
 int main(int argc, char** argv) {
+    // So the load generator shows up as itself in md-cpu's per-thread CPU
+    // table rather than as an anonymous row.
+    set_calling_thread_name("mdh-bench-main");
     for (int i = 0; i < argc; ++i) {
         g_command_line += (i == 0 ? "" : " ");
         g_command_line += argv[i];
@@ -2682,6 +3341,9 @@ int main(int argc, char** argv) {
         }
         if (name == "md-realistic") {
             return run_md_realistic(args, cal.measured_ticks_per_second);
+        }
+        if (name == "md-cpu") {
+            return run_md_cpu(args, cal.measured_ticks_per_second);
         }
         if (name == "price-drift") {
             return run_price_drift(args);

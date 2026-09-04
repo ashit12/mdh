@@ -8,6 +8,7 @@
 #include <type_traits>
 #include <variant>
 
+#include "common/thread_affinity.hpp"
 #include "exchange/latency/latency_tracer.hpp"
 #include "protocol/order_entry/decoder.hpp"
 #include "protocol/order_entry/encoder.hpp"
@@ -47,7 +48,10 @@ bool OrderEntryGateway::start() {
         return false;
     }
     listen_armed_ = true;
-    io_thread_ = std::jthread([this] { io_loop(); });
+    io_thread_ = std::jthread([this] {
+        set_calling_thread_name("mdh-gateway-io");
+        io_loop();
+    });
     return true;
 }
 

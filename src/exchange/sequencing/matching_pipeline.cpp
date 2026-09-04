@@ -17,6 +17,7 @@ MatchingPipeline::MatchingPipeline(EventSink sink, const MatchingPipelineOptions
                               })),
       options_(options) {
     matching_thread_ = std::jthread([this] {
+        set_calling_thread_name("mdh-matching");
         matching_thread_id_.store(calling_thread_id(), std::memory_order_release);
         if (options_.matching_cpu.has_value()) {
             if (auto error = pin_calling_thread_to_cpu(*options_.matching_cpu)) {

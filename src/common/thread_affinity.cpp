@@ -13,6 +13,8 @@
 #include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
 #endif
 
 namespace mdh {
@@ -41,6 +43,18 @@ std::uint64_t calling_thread_id() noexcept {
     return static_cast<std::uint64_t>(syscall(SYS_gettid));
 #else
     return 0;
+#endif
+}
+
+void set_calling_thread_name(const char* name) noexcept {
+#if defined(__linux__)
+    // Linux takes a thread handle; passing self is the same "calling thread
+    // only" contract the macOS form enforces by signature.
+    static_cast<void>(pthread_setname_np(pthread_self(), name));
+#elif defined(__APPLE__)
+    static_cast<void>(pthread_setname_np(name));
+#else
+    static_cast<void>(name);
 #endif
 }
 
