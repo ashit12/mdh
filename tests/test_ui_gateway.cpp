@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -49,9 +48,8 @@ class RunningStack {
 public:
     explicit RunningStack(ui_gateway::UiGatewayOptions ui_options = {}) : market_data_port_(pick_ephemeral_udp_port()) {
         market_data_router_ = std::make_unique<market_data::MarketDataRouter>(
-            [this](const protocol::Event& wire_event) {
-                const std::array<protocol::Event, 1> frames{wire_event};
-                auto datagram = net::pack_frames(next_packet_sequence_++, std::span<const protocol::Event>(frames));
+            [this](std::span<const protocol::Event> wire_events) {
+                const auto datagram = net::pack_frames(next_packet_sequence_++, wire_events);
                 (void)market_data_socket_.send_to(datagram, "127.0.0.1", market_data_port_);
             });
         market_data_router_->start();

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <variant>
 
@@ -92,5 +94,29 @@ using Event = std::variant<AddOrder, CancelOrder, ModifyOrder, Trade, ClearBook>
     }
     return 0;
 }
+
+// Every message type, so that a bound over all of them can be computed
+// rather than written down. `payload_size_for` above has no default case, so
+// a new enumerator makes that switch a compiler warning; this array is the
+// other half of the pair that has to be kept in step with the enum.
+inline constexpr std::array<MessageType, 5> ALL_MESSAGE_TYPES{
+    MessageType::AddOrder, MessageType::CancelOrder, MessageType::ModifyOrder, MessageType::Trade,
+    MessageType::ClearBook,
+};
+
+// Upper bound on a single encoded event frame, for any message type.
+// Derived rather than written down, so that adding a larger message type
+// cannot silently leave a batching or buffer-size limit stale -- see
+// net::MAX_FRAMES_PER_DATAGRAM, which is computed from this.
+[[nodiscard]] constexpr std::size_t max_payload_size() {
+    std::size_t largest = 0;
+    for (const MessageType type : ALL_MESSAGE_TYPES) {
+        const std::size_t size = payload_size_for(type);
+        largest = size > largest ? size : largest;
+    }
+    return largest;
+}
+
+inline constexpr std::size_t MAX_FRAME_SIZE = HEADER_SIZE + max_payload_size();
 
 } // namespace mdh::protocol

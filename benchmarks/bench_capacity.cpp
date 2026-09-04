@@ -1494,9 +1494,8 @@ int run_queue_drops(const Args& args) {
         class UdpSink {
         public:
             explicit UdpSink(std::uint16_t port) : port_(port) {}
-            void send(const protocol::Event& event) {
-                const std::array<protocol::Event, 1> frames{event};
-                auto datagram = net::pack_frames(packet_++, std::span<const protocol::Event>(frames));
+            void send(std::span<const protocol::Event> events) {
+                const auto datagram = net::pack_frames(packet_++, events);
                 (void)socket_.send_to(datagram, "127.0.0.1", port_);
             }
 
@@ -1507,7 +1506,7 @@ int run_queue_drops(const Args& args) {
         };
         UdpSink udp(md_port);
         exchange::market_data::MarketDataRouter router(
-            [&](const protocol::Event& event) { udp.send(event); },
+            [&](std::span<const protocol::Event> events) { udp.send(events); },
             exchange::market_data::MarketDataRouterOptions{.queue_capacity = kProductionMdQueue, .idle_timeout = 1ms});
         router.start();
 
@@ -2112,16 +2111,24 @@ class UdpFrameSink {
 public:
     explicit UdpFrameSink(std::uint16_t port) : port_(port) {}
 
-    void send(const protocol::Event& event) {
-        const std::array<protocol::Event, 1> frames{event};
-        auto datagram = net::pack_frames(packet_++, std::span<const protocol::Event>(frames));
+    // One datagram per batch the router drained, which is what makes the
+    // send syscall proportional to datagrams rather than to events.
+    void send(std::span<const protocol::Event> events) {
+        const auto datagram = net::pack_frames(packet_++, events);
         (void)socket_.send_to(datagram, "127.0.0.1", port_);
+        datagrams_ += 1;
+        events_ += events.size();
     }
+
+    [[nodiscard]] std::uint64_t datagrams() const { return datagrams_; }
+    [[nodiscard]] std::uint64_t events() const { return events_; }
 
 private:
     net::UdpSocket socket_;
     std::uint16_t port_;
     std::uint64_t packet_{1};
+    std::uint64_t datagrams_{0};
+    std::uint64_t events_{0};
 };
 
 struct MdRateRow {
@@ -2153,7 +2160,7 @@ struct MdRateRow {
     }
     UdpFrameSink udp(*subscriber.local_port());
     exchange::market_data::MarketDataRouter router(
-        [&](const protocol::Event& event) { udp.send(event); },
+        [&](std::span<const protocol::Event> events) { udp.send(events); },
         exchange::market_data::MarketDataRouterOptions{.queue_capacity = kProductionMdQueue, .idle_timeout = 1ms});
     router.start();
 
@@ -2401,14 +2408,14 @@ struct MdCpuArm {
     std::unique_ptr<exchange::market_data::MarketDataRouter> router;
 
     if (with_router) {
-        exchange::market_data::MarketDataSink downstream = [](const protocol::Event&) {};
+        exchange::market_data::MarketDataBatchSink downstream = [](std::span<const protocol::Event>) {};
         if (with_udp) {
             subscriber = std::make_unique<trader::market_data::FeedSubscriber>(0, runtime, sub_opts);
             if (!subscriber->start()) {
                 return std::nullopt;
             }
             udp = std::make_unique<UdpFrameSink>(*subscriber->local_port());
-            downstream = [&](const protocol::Event& event) { udp->send(event); };
+            downstream = [&](std::span<const protocol::Event> events) { udp->send(events); };
         }
         router = std::make_unique<exchange::market_data::MarketDataRouter>(
             std::move(downstream), exchange::market_data::MarketDataRouterOptions{

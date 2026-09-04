@@ -130,3 +130,36 @@ TEST(PacketFraming, TruncatedFinalFrameIsRejected) {
     ASSERT_TRUE(std::holds_alternative<PacketError>(result));
     EXPECT_EQ(std::get<PacketError>(result), PacketError::PayloadLengthMismatch);
 }
+
+// MAX_FRAMES_PER_DATAGRAM is derived arithmetic (a datagram budget divided by
+// the worst-case frame size), so it is worth checking against the encoder
+// rather than trusting the division. AddOrder is the largest message type, so
+// a full batch of them is the worst case a producer can hand pack_frames
+// while still respecting the cap.
+TEST(PacketFraming, AFullBatchOfTheLargestMessageTypeFitsOneUnfragmentedDatagram) {
+    std::vector<Event> events;
+    events.reserve(MAX_FRAMES_PER_DATAGRAM);
+    for (std::size_t i = 0; i < MAX_FRAMES_PER_DATAGRAM; ++i) {
+        events.push_back(make_add(static_cast<Sequence>(i + 1), static_cast<OrderId>(i + 1)));
+    }
+
+    const auto datagram = pack_frames(1, events);
+    EXPECT_LE(datagram.size(), MAX_DATAGRAM_PAYLOAD);
+
+    // And it still round-trips: a bound that fit by truncating something
+    // would be no bound at all.
+    auto result = unpack_frames(datagram);
+    ASSERT_TRUE(std::holds_alternative<UnpackedPacket>(result));
+    const auto& unpacked = std::get<UnpackedPacket>(result);
+    EXPECT_EQ(unpacked.header.frame_count, MAX_FRAMES_PER_DATAGRAM);
+    ASSERT_EQ(unpacked.frames.size(), MAX_FRAMES_PER_DATAGRAM);
+    for (std::size_t i = 0; i < unpacked.frames.size(); ++i) {
+        ASSERT_TRUE(std::holds_alternative<Event>(unpacked.frames[i]));
+        EXPECT_EQ(std::get<AddOrder>(std::get<Event>(unpacked.frames[i])).order_id, i + 1);
+    }
+
+    // One more frame than the cap would cross the budget -- which is what
+    // makes the cap the right number rather than merely a safe one.
+    events.push_back(make_add(0, 0));
+    EXPECT_GT(pack_frames(1, events).size(), MAX_DATAGRAM_PAYLOAD);
+}

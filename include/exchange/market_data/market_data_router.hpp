@@ -7,19 +7,39 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
+#include <span>
 #include <stop_token>
 #include <thread>
+#include <vector>
 
 #include "common/dropping_queue.hpp"
 #include "exchange/core/event_sink.hpp"
 #include "exchange/market_data/market_data_publisher.hpp"
+#include "net/packet.hpp"
 
 namespace mdh::exchange::market_data {
+
+// The routing thread hands its consumer a batch of wire events, not one
+// event at a time, so that the consumer can put several of them in a single
+// datagram (net::pack_frames already takes a span). A span of one is an
+// ordinary call, so a sink that has no use for batching can ignore the
+// distinction and loop.
+//
+// The span is valid for the duration of the call only: it views a buffer the
+// routing thread reuses for the next batch. A sink that needs to keep the
+// events must copy them.
+using MarketDataBatchSink = std::function<void(std::span<const protocol::Event>)>;
 
 struct MarketDataRouterOptions {
     std::size_t queue_capacity = 8192;
     std::chrono::milliseconds idle_timeout{1};
+
+    // Most events the routing thread will hand downstream in one call.
+    // Defaults to as many frames as fit in one unfragmented datagram, since
+    // that is the limit that matters to the only consumer this exists for.
+    std::size_t max_batch = net::MAX_FRAMES_PER_DATAGRAM;
 
     // Times each step of publish() separately -- see PublishCostStats. Off by
     // default because the extra tick reads land on the matching thread, the
@@ -126,9 +146,24 @@ struct PublishCostStats {
 // Translation happens before enqueue so a full-queue drop consumes a feed
 // sequence number. The next delivered event therefore exposes a detectable
 // sequence gap instead of silently leaving subscribers with a stale book.
+//
+// ── Batching ──────────────────────────────────────────────────────────────
+// The routing thread drains as many queued events as it can, up to
+// MarketDataRouterOptions::max_batch, and hands them downstream in one call,
+// so that one datagram carries many events instead of one each. At a few tens
+// of thousands of events a second the send syscall is the routing thread's
+// dominant cost, and batching divides the number of them by the batch size.
+//
+// It never waits for a batch to fill. The drain takes whatever is already
+// queued and stops at the first empty pop, which is the same rule the
+// gateway's outbound writer follows: under light load a batch is one event
+// and latency is unchanged, and batches only grow when events are already
+// arriving faster than they can be sent -- exactly when the syscalls hurt.
+// Waiting for a fixed batch size instead would add latency at low rates,
+// where there is nothing to gain.
 class MarketDataRouter {
 public:
-    explicit MarketDataRouter(MarketDataSink downstream, MarketDataRouterOptions options = {},
+    explicit MarketDataRouter(MarketDataBatchSink downstream, MarketDataRouterOptions options = {},
                               MarketDataPublisherOptions publisher_options = {});
     ~MarketDataRouter();
 
@@ -161,6 +196,16 @@ public:
     // belongs next to the publish cost it explains.
     [[nodiscard]] std::uint64_t cv_wait_count() const { return cv_waits_.load(std::memory_order_relaxed); }
 
+    // Batches handed downstream. One call to the sink is one datagram for the
+    // sinks this exists for, so routed_count() / batch_count() is the mean
+    // number of events per datagram -- that is, what the batching bought.
+    [[nodiscard]] std::uint64_t batch_count() const { return batches_.load(std::memory_order_relaxed); }
+
+    // Largest batch the routing thread ever drained, against
+    // MarketDataRouterOptions::max_batch: equal to it means the cap, rather
+    // than the arrival rate, is what bounded the datagram size.
+    [[nodiscard]] std::size_t max_batch_observed() const { return max_batch_observed_.load(std::memory_order_relaxed); }
+
     // Empty unless MarketDataRouterOptions::measure_publish_cost was set.
     [[nodiscard]] PublishCostStats publish_cost() const;
 
@@ -168,10 +213,11 @@ private:
     void routing_loop(std::stop_token token);
     void publish_measured(const ExchangeEvent& event);
 
-    MarketDataSink downstream_;
+    MarketDataBatchSink downstream_;
     MarketDataPublisher publisher_;
     DroppingQueue<protocol::Event> queue_;
     std::chrono::milliseconds idle_timeout_;
+    std::size_t max_batch_;
     bool measure_publish_cost_;
 
     std::stop_source stop_source_;
@@ -180,6 +226,12 @@ private:
     std::condition_variable wake_cv_;
     std::atomic<std::uint64_t> routed_{0};
     std::atomic<std::uint64_t> cv_waits_{0};
+    std::atomic<std::uint64_t> batches_{0};
+    std::atomic<std::size_t> max_batch_observed_{0};
+
+    // Reused across drains so a batch costs no allocation. Routing-thread
+    // only; reserved to max_batch_ once, in the constructor.
+    std::vector<protocol::Event> batch_;
 
     // All matching-thread-written, all only when measure_publish_cost_.
     ProducerCounter events_seen_;

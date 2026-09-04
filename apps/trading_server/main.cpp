@@ -35,7 +35,6 @@
 // demo apps make. Everything is then torn down in dependency order: the UI
 // gateway first, since its sessions need the exchange gateway to still be
 // reachable, then the gateway itself.
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -157,9 +156,12 @@ int main(int argc, char** argv) {
     }
     std::uint64_t next_packet_sequence = 1;
     market_data::MarketDataRouter market_data_router{
-        [&](const protocol::Event& wire_event) {
-            const std::array<protocol::Event, 1> frames{wire_event};
-            auto datagram = net::pack_frames(next_packet_sequence++, std::span<const protocol::Event>(frames));
+        // One datagram per batch, not per event: the router hands over
+        // everything it could drain, and pack_frames takes the lot. Under
+        // load that divides the send syscalls by the batch size, and the
+        // fan-out below multiplies them, so it matters most here.
+        [&](std::span<const protocol::Event> wire_events) {
+            const auto datagram = net::pack_frames(next_packet_sequence++, wire_events);
             for (std::uint16_t port : args->market_data_ports) {
                 (void)market_data_socket.send_to(datagram, "127.0.0.1", port);
             }

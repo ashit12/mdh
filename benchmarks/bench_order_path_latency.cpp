@@ -13,7 +13,6 @@
 //
 // Release builds only. Debug/sanitizer numbers are not representative.
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -365,20 +364,25 @@ private:
 
 class MarketDataBenchSink {
 public:
-    void send(const protocol::Event& wire_event) {
-        const std::array<protocol::Event, 1> frames{wire_event};
-        auto datagram = net::pack_frames(next_packet_sequence_++, std::span<const protocol::Event>(frames));
+    // One datagram for the whole batch the router drained. Events and
+    // datagrams are no longer the same count, so both are tracked: their
+    // ratio is the batching this sink is getting.
+    void send(std::span<const protocol::Event> wire_events) {
+        const auto datagram = net::pack_frames(next_packet_sequence_++, wire_events);
         if (socket_.send_to(datagram, "127.0.0.1", 39'999)) {
-            published_.fetch_add(1, std::memory_order_relaxed);
+            datagrams_.fetch_add(1, std::memory_order_relaxed);
+            events_.fetch_add(wire_events.size(), std::memory_order_relaxed);
         }
     }
 
-    [[nodiscard]] std::uint64_t published() const { return published_.load(std::memory_order_relaxed); }
+    [[nodiscard]] std::uint64_t datagrams() const { return datagrams_.load(std::memory_order_relaxed); }
+    [[nodiscard]] std::uint64_t events() const { return events_.load(std::memory_order_relaxed); }
 
 private:
     net::UdpSocket socket_;
     std::uint64_t next_packet_sequence_ = 1;
-    std::atomic<std::uint64_t> published_{0};
+    std::atomic<std::uint64_t> datagrams_{0};
+    std::atomic<std::uint64_t> events_{0};
 };
 
 [[nodiscard]] std::unique_ptr<OrderEntryGateway> make_gateway(
@@ -827,7 +831,7 @@ int main(int argc, char** argv) {
     latency::ScopedEnable tracing(args.run_soak ? (1 << 22) : (1 << 20));
     MarketDataBenchSink market_data;
     exchange::market_data::MarketDataRouter market_data_router{
-        [&market_data](const protocol::Event& event) { market_data.send(event); },
+        [&market_data](std::span<const protocol::Event> events) { market_data.send(events); },
     };
     if (args.market_data) {
         market_data_router.start();
@@ -923,9 +927,14 @@ int main(int argc, char** argv) {
     gateway->stop();
     market_data_router.stop();
     if (args.market_data) {
-        std::printf("market_data_datagrams=%llu  queue_drops=%zu  queue_high_water=%zu\n",
-                    static_cast<unsigned long long>(market_data.published()), market_data_router.dropped_count(),
-                    market_data_router.queue_high_water_mark());
+        std::printf("market_data_datagrams=%llu  market_data_events=%llu  events_per_datagram=%.2f  "
+                    "queue_drops=%zu  queue_high_water=%zu\n",
+                    static_cast<unsigned long long>(market_data.datagrams()),
+                    static_cast<unsigned long long>(market_data.events()),
+                    market_data.datagrams() == 0
+                        ? 0.0
+                        : static_cast<double>(market_data.events()) / static_cast<double>(market_data.datagrams()),
+                    market_data_router.dropped_count(), market_data_router.queue_high_water_mark());
     }
     return EXIT_SUCCESS;
 }

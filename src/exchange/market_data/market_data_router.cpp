@@ -7,10 +7,15 @@
 
 namespace mdh::exchange::market_data {
 
-MarketDataRouter::MarketDataRouter(MarketDataSink downstream, MarketDataRouterOptions options,
+MarketDataRouter::MarketDataRouter(MarketDataBatchSink downstream, MarketDataRouterOptions options,
                                    MarketDataPublisherOptions publisher_options)
     : downstream_(std::move(downstream)), publisher_(std::move(publisher_options)), queue_(options.queue_capacity),
-      idle_timeout_(options.idle_timeout), measure_publish_cost_(options.measure_publish_cost) {}
+      idle_timeout_(options.idle_timeout), max_batch_(options.max_batch == 0 ? 1 : options.max_batch),
+      measure_publish_cost_(options.measure_publish_cost) {
+    // Reserved here rather than on the routing thread so that a drain never
+    // allocates, and so a batch of max_batch_ is not a reallocation.
+    batch_.reserve(max_batch_);
+}
 
 MarketDataRouter::~MarketDataRouter() { stop(); }
 
@@ -116,11 +121,32 @@ PublishCostStats MarketDataRouter::publish_cost() const {
 void MarketDataRouter::routing_loop(std::stop_token token) {
     set_calling_thread_name("mdh-md-router");
     while (true) {
-        if (auto event = queue_.try_pop()) {
-            downstream_(*event);
-            routed_.fetch_add(1, std::memory_order_relaxed);
+        // Take whatever is queued, up to the batch cap, and stop at the first
+        // empty pop rather than waiting for more. See the class comment: this
+        // is what keeps a quiet feed's latency identical to the unbatched
+        // path while still collapsing a busy one into far fewer datagrams.
+        batch_.clear();
+        while (batch_.size() < max_batch_) {
+            auto event = queue_.try_pop();
+            if (!event) {
+                break;
+            }
+            batch_.push_back(std::move(*event));
+        }
+
+        if (!batch_.empty()) {
+            downstream_(batch_);
+            routed_.fetch_add(batch_.size(), std::memory_order_relaxed);
+            batches_.fetch_add(1, std::memory_order_relaxed);
+            if (batch_.size() > max_batch_observed_.load(std::memory_order_relaxed)) {
+                max_batch_observed_.store(batch_.size(), std::memory_order_relaxed);
+            }
+            // Straight back round without considering sleep: the send that
+            // just happened took long enough that more events may well have
+            // arrived, and if the batch hit the cap there is certainly more.
             continue;
         }
+
         if (token.stop_requested()) {
             break; // queue was observed empty after stop: drain complete
         }

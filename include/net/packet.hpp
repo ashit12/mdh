@@ -30,6 +30,23 @@ inline constexpr std::uint32_t PACKET_MAGIC = 0x4D444831; // ASCII "MDH1"
 inline constexpr std::uint16_t PACKET_VERSION = 1;
 inline constexpr std::size_t PACKET_HEADER_SIZE = 20;
 
+// How much of a datagram is safe to fill: a typical 1500-byte Ethernet MTU
+// less the 20-byte IPv4 and 8-byte UDP headers. Past this a datagram is
+// fragmented, and since losing any one fragment loses the whole datagram,
+// fragmentation converts a packet-loss rate into a worse one.
+inline constexpr std::size_t MAX_DATAGRAM_PAYLOAD = 1472;
+
+// How many event frames a producer may batch into one datagram.
+//
+// Computed from the worst-case frame size rather than the average one, so the
+// bound holds for any mix of message types -- a batch of the largest message
+// type must fit just as well as a batch of the smallest. Receivers here
+// allocate 2048-byte buffers by default (net/udp_receiver.hpp), which this
+// also stays under; a datagram larger than the receive buffer is truncated
+// rather than fragmented, which is a decode failure rather than a slow path.
+inline constexpr std::size_t MAX_FRAMES_PER_DATAGRAM =
+    (MAX_DATAGRAM_PAYLOAD - PACKET_HEADER_SIZE) / protocol::MAX_FRAME_SIZE;
+
 struct PacketHeader {
     std::uint32_t magic;
     std::uint16_t version;
